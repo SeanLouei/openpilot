@@ -306,6 +306,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     sccVision @1;
     sccMap @2;
     speedLimitAssist @3;
+    navTurn @4;
   }
 
   struct E2eAlerts {
@@ -360,6 +361,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     e2eChime @23;
     laneChangeRoadEdge @24;
     bigModelReady @25;
+    navTurnSlowing @26;
   }
 }
 

@@ -114,6 +114,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop),
                   (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
+    # sunnypilot: the route turn may slow harder than the gentle cruise limit
+    if (nav_turn_accel := LongitudinalPlannerSP.nav_turn_accel(self)) is not None:
+      candidates.append((nav_turn_accel, LongitudinalPlanSource.cruise, False))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)

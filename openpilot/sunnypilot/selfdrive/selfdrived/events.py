@@ -205,6 +205,14 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.none, 1.),
   },
 
+  EventNameSP.navTurnSlowing: {
+    ET.WARNING: Alert(
+      "Slowing for Route Turn",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 4.),
+  },
+
   EventNameSP.speedLimitActive: {
     ET.WARNING: Alert(
       "Auto adjusting to speed limit",

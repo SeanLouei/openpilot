@@ -581,8 +581,22 @@
               "key": "NavTurnDesire",
               "widget": "toggle",
               "title": "Navigation Turn Desires",
-              "description": "With a route, signal for its next turn and the car plans that turn once the intersection is close, below 31 mph (50 km/h). That blinker never starts a nudgeless lane change, though a nudge still changes lanes.",
-              "details": "You control the speed: slow to turning speed yourself. The model chooses the opening to turn into, so stay ready to steer.",
+              "description": "With a route, signal for its next turn. When openpilot controls the speed, the car slows to turning speed; it plans the turn once the intersection is close, below 31 mph (50 km/h). That blinker never starts a nudgeless lane change, though a nudge still changes lanes.",
+              "details": "With the car's own cruise control, slow to turning speed yourself. The model chooses the opening to turn into, so stay ready to steer.",
+              "enablement": [
+                {
+                  "type": "param",
+                  "key": "NavigationEnabled",
+                  "equals": true
+                }
+              ]
+            },
+            {
+              "key": "NavAutoTurn",
+              "widget": "toggle",
+              "title": "Automatic Route Turns (Alpha)",
+              "description": "Slows for each route turn and turns without your blinker. Needs openpilot longitudinal (alpha); otherwise turns wait for your blinker. When the car cannot confirm it is in a lane it can turn from, it slows and waits for your blinker. The gas pedal or the opposite blinker calls a turn off.",
+              "details": "Turning without signaling is illegal in most places and gives pedestrians and other drivers no warning: signal yourself where you can. The model picks the opening and does not judge gaps in oncoming traffic, so watch every turn and be ready to take over.",
               "enablement": [
                 {
                   "type": "param",

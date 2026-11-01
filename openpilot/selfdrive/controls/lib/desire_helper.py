@@ -35,8 +35,7 @@ class DesireHelper:
   def get_lane_change_direction(CS):
     return LaneChangeDirection.left if CS.leftBlinker else LaneChangeDirection.right
 
-  def update(self, carstate, lateral_active, lane_change_prob, left_edge_detected=False, right_edge_detected=False,
-             nav_instruction=None, nav_age=0.):
+  def update(self, carstate, lateral_active, lane_change_prob, left_edge_detected=False, right_edge_detected=False, nav=None):
     self.alc.update_params()
     self.lane_turn_controller.update_params()
     self.nav_desire.update_params()
@@ -50,7 +49,7 @@ class DesireHelper:
     self.lane_turn_direction = self.lane_turn_controller.get_turn_direction()
 
     # A blinker for the route's next turn gets its turn desire once that intersection is close, and not before
-    self.nav_desire.update(carstate, lateral_active, nav_instruction, nav_age)
+    self.nav_desire.update(carstate, lateral_active, nav)
     if self.nav_desire.turn_direction != TurnDirection.none or self.nav_desire.route_turn_signal:
       self.lane_turn_direction = self.nav_desire.turn_direction
 
