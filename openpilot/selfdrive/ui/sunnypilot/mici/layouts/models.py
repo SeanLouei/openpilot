@@ -99,8 +99,15 @@ class ModelsLayoutMici(NavScroller):
                                            description=tr("Adds a gentle nudge toward lane center on top of the model's own steering, stronger when " +
                                                           "lane lines are clear. Yields around obstacles. Not available with the Default model."))
 
+    self.nav_turn_toggle = BigParamControl(tr("nav turn desires"), "NavTurnDesire",
+                                           description=tr("With a navigation route, signal for the route's next turn and the car plans that turn once " +
+                                                          "the intersection is close, below 31 mph. That blinker never starts a nudgeless lane change."))
+    self.nav_exit_toggle = BigParamControl(tr("nav exit desires (alpha)"), "NavExitDesire",
+                                           description=tr("Near a route exit or fork with lane guidance, a light steering nudge toward it, without the " +
+                                                          "opposite blinker, has the car keep to that side of the split."))
+
     self.main_items = [self.current_model_info, self.select_model_btn, self.cancel_download_btn, self.refresh_btn, self.clear_cache_btn,
-                       self.blendful_toggle]
+                       self.blendful_toggle, self.nav_turn_toggle, self.nav_exit_toggle]
     self._scroller.add_widgets(self.main_items)
 
   @property
@@ -213,6 +220,8 @@ class ModelsLayoutMici(NavScroller):
   def show_event(self):
     super().show_event()
     self.blendful_toggle.refresh()
+    self.nav_turn_toggle.refresh()
+    self.nav_exit_toggle.refresh()
 
   def _update_state(self):
     super()._update_state()

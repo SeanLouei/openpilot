@@ -571,6 +571,40 @@
               ]
             }
           ]
+        },
+        {
+          "id": "navigation",
+          "title": "Navigation",
+          "description": "Turn and exit desires confirmed against the navigation route, once Navigation (Alpha) is on in Developer",
+          "items": [
+            {
+              "key": "NavTurnDesire",
+              "widget": "toggle",
+              "title": "Navigation Turn Desires",
+              "description": "With a route, signal for its next turn and the car plans that turn once the intersection is close, below 31 mph (50 km/h). That blinker never starts a nudgeless lane change, though a nudge still changes lanes.",
+              "details": "You control the speed: slow to turning speed yourself. The model chooses the opening to turn into, so stay ready to steer.",
+              "enablement": [
+                {
+                  "type": "param",
+                  "key": "NavigationEnabled",
+                  "equals": true
+                }
+              ]
+            },
+            {
+              "key": "NavExitDesire",
+              "widget": "toggle",
+              "title": "Navigation Exit Desires (Alpha)",
+              "description": "Near a route exit or fork with lane guidance, a light steering nudge toward it, without the opposite blinker, has the car keep to that side of the split.",
+              "enablement": [
+                {
+                  "type": "param",
+                  "key": "NavigationEnabled",
+                  "equals": true
+                }
+              ]
+            }
+          ]
         }
       ]
     },
@@ -1834,7 +1868,7 @@
               "key": "NavigationEnabled",
               "widget": "toggle",
               "title": "Navigation (Alpha)",
-              "description": "Turn-by-turn navigation with a route map. Set a destination from comma connect.",
+              "description": "Turn-by-turn navigation with a route map. Set a destination from a phone on the device's network, at the device's IP address on port 8082.",
               "visibility": [
                 {
                   "type": "capability",

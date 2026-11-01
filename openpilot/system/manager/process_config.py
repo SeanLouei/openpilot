@@ -65,6 +65,10 @@ def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("NavigationEnabled")
 
+def navigation_web(started: bool, params: Params, CP: car.CarParams) -> bool:
+  # offroad too, so a destination can be set before the drive starts
+  return params.get_bool("NavigationEnabled")
+
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
@@ -179,6 +183,9 @@ procs += [
 
   # Backup
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
+
+  # navigation
+  PythonProcess("navweb", "openpilot.sunnypilot.navd.navweb", navigation_web),
 
   # mapd
   NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),

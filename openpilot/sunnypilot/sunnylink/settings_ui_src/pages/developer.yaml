@@ -52,7 +52,8 @@ sections:
   - key: NavigationEnabled
     widget: toggle
     title: Navigation (Alpha)
-    description: Turn-by-turn navigation with a route map. Set a destination from comma connect.
+    description: Turn-by-turn navigation with a route map. Set a destination from a phone on the device's network, at the
+      device's IP address on port 8082.
     visibility:
     - {type: capability, field: device_type, equals: mici}
     - $ref: '#/macros/release_branches_hide'

@@ -18,6 +18,10 @@ REROUTE_COUNTER_MIN = 3
 ROUTE_RESEND_PERIOD = 10  # updates (seconds); a restarted mapsd gets the route within this
 RECOMPUTE_HOLD = 10  # updates (seconds) between route requests
 
+# Mapbox lane indications as navInstruction lane directions
+LANE_DIRECTIONS = {'sharp left': 'left', 'left': 'left', 'slight left': 'slightLeft', 'straight': 'straight',
+                   'slight right': 'slightRight', 'right': 'right', 'sharp right': 'right'}
+
 
 def set_banner(instruction, banners, distance_to_maneuver):
   """Fill the banner fields from the banner to show now: the last one still ahead of the ego, else the first."""
@@ -31,6 +35,10 @@ def set_banner(instruction, banners, distance_to_maneuver):
   instruction.maneuverModifier = primary.get('modifier') or ''
   if banner.get('secondary') is not None:
     instruction.maneuverSecondaryText = banner['secondary']['text']
+  lanes = [c for c in (banner.get('sub') or {}).get('components', []) if c.get('type') == 'lane']
+  instruction.lanes = [{'directions': [LANE_DIRECTIONS.get(d, 'none') for d in lane.get('directions', [])],
+                        'active': bool(lane.get('active')),
+                        'activeDirection': LANE_DIRECTIONS.get(lane.get('active_direction'), 'none')} for lane in lanes]
 
 
 class RouteEngine:
@@ -50,9 +58,7 @@ class RouteEngine:
     self.recompute_hold = 0
     self.reroute_counter = 0
 
-    self.mapbox_token = os.environ.get("MAPBOX_TOKEN")
-    self.api = Api(self.params.get("DongleId")) if self.mapbox_token is None else None
-    self.mapbox_host = "https://api.mapbox.com" if self.mapbox_token is not None else API_HOST.rstrip('/') + '/v1/nav'
+    self.api = Api(self.params.get("DongleId")) if os.environ.get("MAPBOX_TOKEN") is None else None
 
   def update(self):
     self.sm.update(0)
@@ -92,6 +98,13 @@ class RouteEngine:
       self.calculate_route(new_destination)
       self.reroute_counter = 0
 
+  def directions_auth(self) -> tuple[str, str]:
+    """(host, access token) for directions: a personal Mapbox token when one is set, else the comma API with the device's token."""
+    token = os.environ.get("MAPBOX_TOKEN") or (self.params.get("MapboxToken") or '').strip()
+    if token:
+      return "https://api.mapbox.com", token
+    return API_HOST.rstrip('/') + '/v1/nav', self.api.get_token()
+
   def calculate_route(self, destination):
     assert self.last_position is not None
     cloudlog.warning(f"Calculating route {self.last_position} -> {destination}")
@@ -101,9 +114,7 @@ class RouteEngine:
     if lang is not None:
       lang = lang.replace('main_', '')
 
-    token = self.mapbox_token
-    if token is None:
-      token = self.api.get_token()
+    host, token = self.directions_auth()
 
     params = {
       'access_token': token,
@@ -118,7 +129,7 @@ class RouteEngine:
       params['bearings'] = f"{(self.last_bearing + 360) % 360:.0f},90;"
 
     coords_str = ';'.join(f'{lon},{lat}' for lon, lat in (self.last_position, destination))
-    url = self.mapbox_host + '/directions/v5/mapbox/driving-traffic/' + coords_str
+    url = host + '/directions/v5/mapbox/driving-traffic/' + coords_str
     try:
       resp = requests.get(url, params=params, timeout=10)
       if resp.status_code != 200:
@@ -134,8 +145,9 @@ class RouteEngine:
         cloudlog.warning("Got empty route response")
         self.clear_route()
 
-    except requests.exceptions.RequestException:
-      cloudlog.exception("failed to get route")
+    except requests.exceptions.RequestException as e:
+      # requests exceptions contain the URL, and with it the access token; keep it out of logs
+      cloudlog.error(f"failed to get route: {type(e).__name__}")
       self.clear_route()
 
   def send_instruction(self):

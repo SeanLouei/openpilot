@@ -3,6 +3,7 @@ from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeController, AutoLaneChangeMode
 from openpilot.sunnypilot.selfdrive.controls.lib.lane_turn_desire import LaneTurnController
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NavDesireController
 
 LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
@@ -28,14 +29,17 @@ class DesireHelper:
     self.alc = AutoLaneChangeController(self)
     self.lane_turn_controller = LaneTurnController(self)
     self.lane_turn_direction = TurnDirection.none
+    self.nav_desire = NavDesireController()
 
   @staticmethod
   def get_lane_change_direction(CS):
     return LaneChangeDirection.left if CS.leftBlinker else LaneChangeDirection.right
 
-  def update(self, carstate, lateral_active, lane_change_prob, left_edge_detected=False, right_edge_detected=False):
+  def update(self, carstate, lateral_active, lane_change_prob, left_edge_detected=False, right_edge_detected=False,
+             nav_instruction=None, nav_age=0.):
     self.alc.update_params()
     self.lane_turn_controller.update_params()
+    self.nav_desire.update_params()
     v_ego = carstate.vEgo
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
     below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
@@ -44,6 +48,11 @@ class DesireHelper:
     self.lane_turn_controller.update_lane_turn(blindspot_left=carstate.leftBlindspot, blindspot_right=carstate.rightBlindspot,
                                                left_blinker=carstate.leftBlinker, right_blinker=carstate.rightBlinker, v_ego=v_ego)
     self.lane_turn_direction = self.lane_turn_controller.get_turn_direction()
+
+    # A blinker for the route's next turn gets its turn desire once that intersection is close, and not before
+    self.nav_desire.update(carstate, lateral_active, nav_instruction, nav_age)
+    if self.nav_desire.turn_direction != TurnDirection.none or self.nav_desire.route_turn_signal:
+      self.lane_turn_direction = self.nav_desire.turn_direction
 
     if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX or self.alc.lane_change_set_timer == AutoLaneChangeMode.OFF:
       self.lane_change_state = LaneChangeState.off
@@ -72,11 +81,14 @@ class DesireHelper:
 
         self.alc.update_lane_change(blindspot_detected, edge_detected, carstate.brakePressed, torque_applied)
 
+        # A blinker for the route's next turn needs a nudge to change lanes, so it never starts a nudgeless one
+        auto_lane_change_allowed = self.alc.auto_lane_change_allowed and not self.nav_desire.route_turn_signal
+
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off
           self.lane_change_direction = LaneChangeDirection.none
           self.lane_change_timer = 0.0
-        elif (torque_applied or self.alc.auto_lane_change_allowed) and not self.alc.lane_change_blocked:
+        elif (torque_applied or auto_lane_change_allowed) and not self.alc.lane_change_blocked:
           self.lane_change_state = LaneChangeState.laneChangeStarting
           self.lane_change_timer = 0.0
 
@@ -103,5 +115,7 @@ class DesireHelper:
           self.desire = log.Desire.laneChangeLeft
         elif self.lane_change_direction == LaneChangeDirection.right:
           self.desire = log.Desire.laneChangeRight
+      elif self.lane_change_state == LaneChangeState.off:
+        self.desire = self.nav_desire.keep_desire
 
     self.alc.update_state()
