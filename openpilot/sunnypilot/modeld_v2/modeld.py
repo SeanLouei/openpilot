@@ -339,7 +339,7 @@ def main(demo=False):
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
-                  "carControl", "controlsState", "lateralDelay", "navInstruction"])
+                  "carControl", "controlsState", "lateralDelay", "navInstruction", "longitudinalPlanSP"])
 
   publish_state = PublishState()
   chestnut_state = ChestnutGpuState(pm, model.chestnut) if CHESTNUT else None
@@ -512,6 +512,7 @@ def main(demo=False):
       mdv2sp_send.valid = modelv2_send.valid
       mdv2sp_send.modelDataV2SP.laneTurnDirection = DH.lane_turn_direction
       mdv2sp_send.modelDataV2SP.navTurnSpeed = DH.nav_desire.speed_limit
+      mdv2sp_send.modelDataV2SP.navTurnAcross = 'turning' if DH.nav_desire.turn_across else 'signal' if DH.nav_desire.signal_prompt else 'none'
       mdv2sp_send.modelDataV2SP.blendfulCurvature = blendful.curvature
       mdv2sp_send.modelDataV2SP.blendfulTrust = float(blendful.trust)
       mdv2sp_send.modelDataV2SP.modelCurvature = float(blendful.model_curvature)

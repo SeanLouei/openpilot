@@ -84,6 +84,40 @@ NAV_TURN_LINEUP_MIN_SPEED = 0.05  # m/s
 OUTER_EDGE_DISTANCE = 2.6  # m from the car's center
 OUTER_LANE_TIME = 1.0  # s
 
+# A far side turn (left where traffic keeps right) crosses oncoming traffic, so it starts without the blinker only where the
+# car can confirm it is in a lane for that turn: a curb or median close beside it on the turn's side, with no lane line
+# beyond the car's own, surer than for a near side turn and over the last FAR_LANE_DISTANCE and FAR_LANE_TIME with no lane
+# change and no car in that blind spot, and the route's lane guidance not against that lane. On a two-way road the center
+# line has oncoming lanes beyond it, not a curb, so there it waits for the blinker. A car one lane over from the curb lane
+# has the curb a lane's width (2.7 m or more) beyond its own lane line, about 3.8 m or more from its center; the curb lane's
+# curb is 1.5-2.4 m from it.
+FAR_EDGE_MIN = 1.0  # m from the car's center; nearer, the edge would be under the car, a bad reading
+FAR_EDGE_DISTANCE = 2.6  # m from the car's center to the curb or median, at most
+FAR_EDGE_STD = 0.5  # m the model may be unsure of the edge's position; the near side's EDGE_PROB allows 0.65
+FAR_LANE_TIME = 1.5  # s of curb beside the car, so a brief misreading of the center line never counts
+FAR_LANE_DISTANCE = 10.  # m driven with the curb beside the car: slow, 1.5 s could be just a corner's or an island's nose
+# With no blinker, the driver first learns of a far side turn from its alert: it starts by itself only this long or more
+# before the car steers across oncoming traffic, else it waits for the blinker
+FAR_TURN_MIN_LEAD = 2.0  # s
+# Nor is it kept alive while the car waits: a stop close to the turn (a light, a stop sign, a queue, a gap in oncoming
+# traffic) is where only the driver can tell when to cross, so once the model's desire history no longer holds the turn,
+# the driver signals to go on with it
+FAR_STOP_RELEASE = 5.0  # s since the last pulse, the model's desire history
+# Faster oncoming traffic leaves no time to react, and such roads have protected arrows the car cannot see: no automatic far
+# side turn where the posted limit over the last AUTO_FAR_LIMIT_DISTANCE is unknown or above 45 mph (72 km/h passes,
+# 50 mph and 75 km/h do not)
+AUTO_FAR_ROAD_SPEED = 20.5  # m/s
+AUTO_FAR_LIMIT_DISTANCE = 150.  # m before the maneuver point
+POSTED_LIMIT_MAX_AGE = 0.5  # s plannerd's posted limit counts for; older, it is unknown
+# A far side turn that will not start by itself asks for the blinker this long before its start would come, so a blinker
+# given then still starts it on time, once its automatic start has been out of reach for FAR_PROMPT_DEBOUNCE: a reading
+# that comes and goes asks once, not on and off
+FAR_SIGNAL_LEAD = 2.0  # s
+FAR_PROMPT_DEBOUNCE = 0.5  # s
+# The Tesla switches the blinker off by itself as a lane change ends; a latched blinker going off later than this after one
+# is the driver calling the turn off
+FAR_CANCEL_TIME = 2.0  # s
+
 # A blinker switched on for the route's next turn within this distance is its turn signal, not a lane change, for as long
 # as it stays on; on a fast road from farther, from where the slowdown starts, so it has the room to get down to turn
 # speed. Only within this distance does it bring back what the driver called off: farther out it may yet be a lane change.
@@ -142,6 +176,9 @@ class NavInputs:
   right_hand_traffic: bool = True
   yaw_rate: float = 0.  # rad/s the car turns at, positive left
   accel: float = 0.  # m/s^2 the car speeds up at: the more of its measured and its commanded acceleration
+  far_lanes: tuple[bool, bool] = (False, False)  # whether a curb or median is surely close beside the car on its (left, right)
+  driver_alert: bool = False  # driver monitoring is warning
+  speed_limit: float = 0.  # m/s the posted limit plannerd found, 0 unknown
 
 
 def normalize_direction(modifier) -> str:
@@ -182,6 +219,34 @@ def outer_lanes(model) -> tuple[bool, bool]:
   return outermost(0, 0), outermost(1, 3)
 
 
+def far_lanes(model) -> tuple[bool, bool]:
+  """Whether the model surely sees a curb or median close beside the car on each side: on that side of the car and not
+  under it, with no lane line beyond the car's own. outer_lanes, with a surer edge whose side is checked."""
+  stds, probs, edges = model.roadEdgeStds, model.laneLineProbs, model.roadEdges
+  if len(stds) < 2 or len(probs) < 4 or len(edges) < 2 or not len(edges[0].y) or not len(edges[1].y):
+    return False, False
+
+  def curb(side: int, outer_line: int, sign: float) -> bool:
+    distance, std = sign * float(edges[side].y[0]), float(stds[side])  # NaN fails every comparison
+    return bool(FAR_EDGE_MIN < distance < FAR_EDGE_DISTANCE and 0. <= std < FAR_EDGE_STD and probs[outer_line] < NEARSIDE_PROB)
+
+  return curb(0, 0, -1.), curb(1, 3, 1.)
+
+
+def far_turn_lane(lanes, left: bool) -> bool:
+  """Whether the route's lane guidance lets the outermost lane on the turn's side, the one beside the curb or median, make
+  the turn: active, toward the turn's side. Without lane guidance it does. Only a veto: guidance tells which lanes may
+  turn, never which one the car is in."""
+  if not len(lanes):
+    return True
+  lane = lanes[0] if left else lanes[len(lanes) - 1]  # Mapbox lists the lanes left to right
+  side = LEFT_DIRECTIONS if left else RIGHT_DIRECTIONS
+  direction = str(lane.activeDirection)
+  if direction == 'none':  # navd also reads a U-turn as none, so a U-turn only lane vetoes
+    return bool(lane.active) and any(str(d) in side for d in lane.directions)
+  return bool(lane.active) and direction in side
+
+
 def yaw_rate(model) -> float:
   """The model's yaw rate now, positive left (the model's frame is forward, right, down), 0 without one."""
   rates = getattr(getattr(model, 'orientationRate', None), 'z', ())
@@ -195,13 +260,30 @@ def acceleration(sm) -> float:
   return max((accel for accel in accels if math.isfinite(accel)), default=0.)
 
 
+def posted_speed_limit(sm) -> float:
+  """The posted speed limit plannerd's resolver found, from the car or the map, in m/s; 0 without a recent, valid one. It
+  never raises, also when the SubMaster lacks the service: modeld calls it outside DesireHelper's guard."""
+  try:
+    if not sm.seen['longitudinalPlanSP'] or not sm.valid['longitudinalPlanSP']:
+      return 0.
+    if not 0. <= time.monotonic() - sm.recv_time['longitudinalPlanSP'] <= POSTED_LIMIT_MAX_AGE:
+      return 0.
+    resolver = sm['longitudinalPlanSP'].speedLimit.resolver
+    limit, valid = float(resolver.speedLimit), bool(resolver.speedLimitValid)
+  except Exception:
+    return 0.
+  return limit if valid and math.isfinite(limit) and limit > 0. else 0.
+
+
 def nav_inputs(sm, model, openpilot_longitudinal: bool) -> NavInputs:
   """Everything route desires need from modeld: its SubMaster, the model message just filled for this frame, and whether
   openpilot controls the car's speed, which carControl.longActive alone also reports for cruise button control."""
   instruction, age = fresh_nav_instruction(sm)
   long_active = openpilot_longitudinal and bool(sm['carControl'].longActive)
-  return NavInputs(instruction, age, long_active, outer_lanes(model), not sm['driverMonitoringState'].isRHD, yaw_rate(model),
-                   acceleration(sm))
+  dm = sm['driverMonitoringState']
+  return NavInputs(instruction, age, long_active, outer_lanes(model), not dm.isRHD, yaw_rate(model), acceleration(sm),
+                   far_lanes=far_lanes(model), driver_alert=dm.alertLevel != log.DriverMonitoringState.AlertLevel.none,
+                   speed_limit=posted_speed_limit(sm))
 
 
 def signal_distance(v_ego: float) -> float:
@@ -352,11 +434,18 @@ class NavDesireController:
   already and with the car's own cruise off or set no faster), or at a crawl short of the maneuver point (a near side turn
   short of the intersection). A car that cannot goes straight. With automatic turns on and openpilot in control of the
   speed, a near side turn (right, where traffic keeps right) also starts without the blinker, once the car has been in the
-  outermost lane for a second. Before the turn starts, the gas, the other blinker or disengaging calls off its automatic
+  outermost lane for a second. With automatic far side turns on too, so does a far side turn, across oncoming traffic, but
+  only from a lane the car can confirm: moving, 2 s or more before the steering point, with a curb or median surely beside
+  the car on the turn's side for the last 10 m and 1.5 s, the route's lane guidance not against that lane, no sharp turn
+  or T junction, the posted limit known and 45 mph or less, and driver monitoring not warning. A stop close before it, or
+  the driver switching its blinker off, leaves it to the blinker; one that will not start by itself asks for the blinker,
+  once, and then waits for it. Before the turn starts, the gas, the other blinker or disengaging calls off its automatic
   turn and its slowdown; signaling for it brings them back, within the signal distance. Once it starts, the model has the
   turn: the desire holds until the maneuver point, pulsing again every 4 s only to stay in the model's desire history
   (while the car is still lined up, and waits at a crawl short of the turn, or is still 2 s or more from the steering
   point), a blinker latched again pulses it again only the same way, and no other turn starts until the car is through it.
+  An automatic far side turn pulses again only while the car moves and driver monitoring is quiet, and at a stop it is
+  the driver's once the model's desire history no longer holds it.
   Slowing: the speed limit slows the car to turn speed by every route turn with automatic turns on, else by the turn the
   driver signals for, through a lane change too, and by a started turn until the car passes it. The turn's point is
   pinned on the odometer once it starts or the car is close: the slowdown keeps the nearest the point has been, and turn
@@ -369,6 +458,7 @@ class NavDesireController:
     self.param_read_counter = 0
     self.turn_enabled = False
     self.auto_enabled = False
+    self.far_enabled = False
     self.exit_enabled = False
     self.read_params()
 
@@ -377,6 +467,13 @@ class NavDesireController:
     self.odometer = 0.  # m driven
     self.gap = math.inf  # s since the last fresh route instruction
     self.outer_lane_time = [0., 0.]  # s the model has seen the car in the outermost lane on its (left, right)
+    # s and m a curb or median has surely been close beside the car on its (left, right), with no lane change and no car in
+    # that blind spot
+    self.far_lane_time = [0., 0.]
+    self.far_lane_distance = [0., 0.]
+    self.road_limit = 0.  # m/s the highest posted limit within AUTO_FAR_LIMIT_DISTANCE of the current maneuver, 0 unknown
+    self.was_lane_changing = False
+    self.lane_change_end: int | None = None  # the frame the last lane change ended
     self.blinker: bool | None = None  # the side (left) of the blinker on, and the frame it came on
     self.blinker_onset = 0
     self.passed_frame: int | None = None  # the frame the car passed the current maneuver's point
@@ -386,6 +483,8 @@ class NavDesireController:
     # the maneuver whose turn desire last went out, and the frame it did: the model has that turn, whatever reset() forgets
     self.pulsed_maneuver: int | None = None
     self.pulse_frame = 0
+    # the maneuver whose far side turn asked for the blinker: it waits for it, whatever reset() forgets
+    self.asked_maneuver: int | None = None
     self.reset()
 
   def reset(self) -> None:
@@ -405,10 +504,14 @@ class NavDesireController:
     self.started = False  # the current maneuver's turn desire went out to the model
     self.called_off = False  # the current maneuver's automatic turn and slowdown are off, until the driver signals for it
     self.auto_off = False  # the current maneuver's automatic turn is off, until the driver signals for it
+    self.signal_prompt = False  # a far side turn that will not start, or go on, by itself: signal for it
+    self.turn_across = False  # an automatic far side turn holds its desire
+    self.prompt_time = 0.  # s the current far side turn's automatic start has been out of reach, in its prompt's window
 
   def read_params(self) -> None:
     self.turn_enabled = self.params.get_bool("NavTurnDesire")
     self.auto_enabled = self.params.get_bool("NavAutoTurn")
+    self.far_enabled = self.auto_enabled and self.params.get_bool("NavAutoTurnFarSide")
     self.exit_enabled = self.params.get_bool("NavExitDesire")
 
   def update_params(self) -> None:
@@ -427,12 +530,18 @@ class NavDesireController:
     return self.turned < NAV_TURN_LINED_UP
 
   @property
+  def asked(self) -> bool:
+    """The current maneuver's far side turn asked for the blinker, so it never starts by itself."""
+    return self.asked_maneuver == self.maneuver_id
+
+  @property
   def route_active(self) -> bool:
     """Route turns are on and navd has a route: its instruction is fresh, or was within the grace."""
     return (self.turn_enabled or self.auto_enabled) and self.gap <= NAV_INSTRUCTION_GRACE
 
   def update(self, carstate, lateral_active: bool, nav: NavInputs | None, lane_changing: bool = False, lane_turning: bool = False) -> None:
-    """lane_changing: a lane change is under way, so no turn starts and the outermost lane counts again after it.
+    """lane_changing: a lane change is under way, so no turn starts and the outermost lane, and the curb beside the car,
+    count again after it.
     lane_turning: the lane turn desire already went out for this blinker, so the route does not take the blinker over,
     which would pulse again."""
     self.frame += 1
@@ -447,6 +556,14 @@ class NavDesireController:
     self.odometer += v_ego * DT_MDL
     self.gap = 0. if nav.instruction is not None else self.gap + DT_MDL
     self.outer_lane_time = [t + DT_MDL if outer and not lane_changing else 0. for t, outer in zip(self.outer_lane_time, nav.outer_lanes, strict=True)]
+    # a car in the blind spot beside the curb means a lane there after all, so the curb counts again once it is gone
+    blindspots = (carstate.leftBlindspot, carstate.rightBlindspot)
+    curbs = [far and not lane_changing and not blindspot for far, blindspot in zip(nav.far_lanes, blindspots, strict=True)]
+    self.far_lane_time = [t + DT_MDL if curb else 0. for t, curb in zip(self.far_lane_time, curbs, strict=True)]
+    self.far_lane_distance = [d + v_ego * DT_MDL if curb else 0. for d, curb in zip(self.far_lane_distance, curbs, strict=True)]
+    if self.was_lane_changing and not lane_changing:
+      self.lane_change_end = self.frame
+    self.was_lane_changing = lane_changing
     self.pins = {maneuver: pin for maneuver, pin in self.pins.items() if self.odometer <= pin[1] + NAV_TURN_HOLD}
 
     previous = self.tracker.maneuver
@@ -455,7 +572,7 @@ class NavDesireController:
       self.maneuver_id += 1
       self.started = self.called_off = self.auto_off = self.blinker_turned = self.slowing = False
       self.turning = self.route_blinker = None
-      self.passed_frame, self.turned = None, 0.
+      self.passed_frame, self.turned, self.road_limit, self.prompt_time = None, 0., 0., 0.
       # a blinker on since before the car passed the maneuver before was for that one, if that one went its way; as is any
       # blinker on when that one was never passed, or still on from one before it. One switched on after it is for this
       # one, as is one switched on before a maneuver that went straight on, or the other way.
@@ -467,6 +584,8 @@ class NavDesireController:
         self.stale_blinker = None
     if self.tracker.passed and self.passed_frame is None:
       self.passed_frame = self.frame
+    if self.tracker.distance <= AUTO_FAR_LIMIT_DISTANCE:
+      self.road_limit = max(self.road_limit, nav.speed_limit)
     if side != self.stale_blinker:
       self.stale_blinker = None
     turn = self.tracker.turn()
@@ -478,9 +597,15 @@ class NavDesireController:
 
     # a blinker switched on for the route's turn stays its signal until it goes off or over to the other side, steering
     # disengages or the maneuver changes, whatever the speed does. It brings back what the driver called off before it
-    # latched, once the car is within the signal distance with it still on.
+    # latched, once the car is within the signal distance with it still on. The driver switching it off before a far side
+    # turn starts also calls off that turn's automatic start, which only the blinker brings back; the Tesla switching it
+    # off by itself as a lane change ends, into a turn bay say, is not the driver.
+    car_cancel = self.lane_change_end is not None and (self.frame - self.lane_change_end) * DT_MDL <= FAR_CANCEL_TIME
+    blinker_off = self.route_blinker is not None and side is None and not lane_changing and not car_cancel
     if side is None or side != self.route_blinker or not lateral_active:
       self.route_blinker, self.reviving = None, False
+    if blinker_off and turn == nav.right_hand_traffic:
+      self.auto_off = True
     if (pending and lateral_active and self.route_blinker is None and side == turn and side != self.stale_blinker
         and nav.instruction is not None and not lane_turning and self.tracker.distance <= approach_distance(v_ego)):
       self.route_blinker, self.blinker_turned, self.reviving = side, False, True
@@ -489,18 +614,44 @@ class NavDesireController:
     self.route_turn_signal = self.route_blinker is not None
 
     # before the turn starts, the driver calls off its automatic turn, and its slowdown with the gas, the other blinker or
-    # disengaging the speed control
+    # disengaging the speed control. A stop close before a far side turn (a light, a stop sign, a queue, a gap in oncoming
+    # traffic) leaves its automatic turn to the driver, who alone can tell when to cross: the car keeps slowing for it, and
+    # turns once signaled. A far side turn that asked for the blinker waits for it.
+    stopped = bool(carstate.standstill) or v_ego <= NAV_TURN_CRAWL_SPEED
     if pending and not self.started and self.tracker.distance <= approach_distance(v_ego):
       other_blinker = side is not None and side != turn and side != self.stale_blinker
       if carstate.gasPressed or other_blinker or (self.auto_enabled and not nav.long_active):
         self.called_off, self.reviving = True, False
         self.pins.pop(self.maneuver_id, None)
-      self.auto_off |= self.called_off or not lateral_active
+      self.auto_off |= self.called_off or not lateral_active or (turn == nav.right_hand_traffic and stopped)
+    self.auto_off |= self.asked
 
     if self.turning is not None:
       self._hold_turn(carstate, nav, lateral_active, v_ego)
     elif pending and lateral_active and nav.instruction is not None:
       self._start_turn(carstate, nav, v_ego, turn, lane_changing)
+
+    # One prompt to signal, for a far side turn that will not start or go on by itself: while the car waits short of it,
+    # still lined up, or while it moves, from FAR_SIGNAL_LEAD before its start would come, once its automatic start has been
+    # out of reach for FAR_PROMPT_DEBOUNCE. It asks only while signaling can still start the turn, and once it asked, the
+    # turn waits for the blinker: a prompt is never followed by an automatic start.
+    asking = bool(self.far_enabled and pending and turn == nav.right_hand_traffic and self.turning is None and side is None
+                  and lateral_active and nav.long_active and not self.called_off and not lane_changing and nav.instruction is not None)
+    prompt = False
+    if not asking:
+      self.prompt_time = 0.
+    elif stopped:
+      prompt = self.lined_up and self.tracker.distance <= approach_distance(v_ego)
+    elif not self.started:
+      window = (self._time_to_steer(nav, self.tracker.distance, v_ego) <= NAV_TURN_TRIGGER_TIME + FAR_SIGNAL_LEAD
+                and self._can_make_turn(carstate, nav, v_ego, turn, NAV_TURN_MAX_SPEED))
+      out_of_reach = window and not self._far_auto_possible(carstate, nav, v_ego, turn)
+      self.prompt_time = self.prompt_time + DT_MDL if out_of_reach else 0.
+      prompt = window and (self.asked or self.prompt_time >= FAR_PROMPT_DEBOUNCE - 1e-6)
+    if prompt:
+      self.asked_maneuver = self.maneuver_id
+    self.signal_prompt = prompt
+    self.turn_across = self.turning is not None and not self.turn_by_blinker and self.turning == nav.right_hand_traffic
 
     self._update_speed_limit(carstate, pending, turn)
 
@@ -541,19 +692,32 @@ class NavDesireController:
       max_speed = min(max_speed, stock_speed)
     return v_ego <= max_speed
 
-  def _may_pulse_again(self, carstate, nav: NavInputs, v_ego: float, left: bool) -> bool:
+  def _may_pulse_again(self, carstate, nav: NavInputs, v_ego: float, left: bool, by_blinker: bool) -> bool:
     """Whether a started turn may pulse again, only to keep it in the model's desire history: NAV_TURN_REPULSE_TIME after
     its last pulse, while the car is still lined up with the approach and waits at a crawl short of the maneuver point (a
     near side turn short of the intersection), or is still far enough from the steering point to take it as a first
-    pulse. Never as it rolls into the turn, nor once it has turned in."""
+    pulse. Never as it rolls into the turn, nor once it has turned in. by_blinker: the blinker has the turn, else it is
+    an automatic one, and an automatic far side turn pulses again only while the car moves and driver monitoring is quiet:
+    at a stop only the driver can tell when to cross, and a driver monitoring warning means nobody may be watching."""
     blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
+    stopped = carstate.standstill or v_ego <= NAV_TURN_CRAWL_SPEED
     if ((self.frame - self.pulse_frame) * DT_MDL < NAV_TURN_REPULSE_TIME or blindspot or self.gap > NAV_INSTRUCTION_GRACE
-        or not self.lined_up):
+        or not self.lined_up or (self._far_automatic(nav, left, by_blinker) and (stopped or nav.driver_alert))):
       return False
     distance = self.tracker.nearest
-    if carstate.standstill or v_ego <= NAV_TURN_CRAWL_SPEED:
+    if stopped:
       return distance > self._crawl_room(nav, left)
     return distance > NAV_TURN_STEER_DISTANCE and self._time_to_steer(nav, distance, v_ego) >= NAV_TURN_REFRESH_LEAD
+
+  def _far_automatic(self, nav: NavInputs, left: bool, by_blinker: bool) -> bool:
+    """A turn across oncoming traffic that no blinker confirms."""
+    return not by_blinker and left == nav.right_hand_traffic
+
+  def _far_stop_released(self, carstate, nav: NavInputs, v_ego: float, left: bool, by_blinker: bool) -> bool:
+    """An automatic far side turn the car waits at, once the model's desire history no longer holds it: the driver's, then,
+    to signal for it."""
+    stopped = carstate.standstill or v_ego <= NAV_TURN_CRAWL_SPEED
+    return self._far_automatic(nav, left, by_blinker) and stopped and (self.frame - self.pulse_frame) * DT_MDL >= FAR_STOP_RELEASE
 
   def _start_turn(self, carstate, nav: NavInputs, v_ego: float, left: bool, lane_changing: bool) -> None:
     # never during a lane change, into the blind spot, or while another maneuver's turn is still under way
@@ -563,15 +727,15 @@ class NavDesireController:
     if self._time_to_steer(nav, self.tracker.distance, v_ego) > NAV_TURN_TRIGGER_TIME:
       return
     # the model already has this turn: a blinker latched again, or a start after reset(), only pulses it again as a
-    # keep-alive would. Else the latch stays, and with it the slowdown, but the desire does not resume: that would be a
-    # new rising edge, a second turn command.
-    if self.pulsed_maneuver == self.maneuver_id and not self._may_pulse_again(carstate, nav, v_ego, left):
+    # keep-alive would, the blinker's if it has the turn, else an automatic one's. Else the latch stays, and with it the
+    # slowdown, but the desire does not resume: that would be a new rising edge, a second turn command.
+    if self.pulsed_maneuver == self.maneuver_id and not self._may_pulse_again(carstate, nav, v_ego, left, self.route_blinker == left):
       return
 
     if self.route_blinker == left and not self.blinker_turned and self._can_make_turn(carstate, nav, v_ego, left, NAV_TURN_MAX_SPEED):
       self.turn_by_blinker = self.blinker_turned = True
     elif (self.auto_enabled and not (self.started or self.called_off or self.auto_off or carstate.leftBlinker or carstate.rightBlinker)
-          and self._auto_turn_allowed(nav, left) and self._can_make_turn(carstate, nav, v_ego, left, AUTO_TURN_MAX_SPEED)):
+          and self._auto_turn_allowed(carstate, nav, v_ego, left) and self._can_make_turn(carstate, nav, v_ego, left, AUTO_TURN_MAX_SPEED)):
       self.turn_by_blinker = False
     else:
       return
@@ -586,21 +750,44 @@ class NavDesireController:
     if self.turn_by_blinker:
       released = self.route_blinker != left  # the blinker went off, or over to the other side
     else:
-      released = carstate.gasPressed or carstate.leftBlinker or carstate.rightBlinker or not nav.long_active
+      released = (carstate.gasPressed or carstate.leftBlinker or carstate.rightBlinker or not nav.long_active
+                  or self._far_stop_released(carstate, nav, v_ego, left, False))
     # the model keeps its pulse, so letting go only ends the turn desire's reminders, and the alert
     if released or not lateral_active or self.tracker.passed:
       self.turning = None
       return
 
-    if self._may_pulse_again(carstate, nav, v_ego, left):
+    if self._may_pulse_again(carstate, nav, v_ego, left, self.turn_by_blinker):
       self.pulse_frame = self.frame + 1  # no desire for this frame, so the next one is a new rising edge
       return
     self.turn_direction = TurnDirection.turnLeft if left else TurnDirection.turnRight
 
-  def _auto_turn_allowed(self, nav: NavInputs, left: bool) -> bool:
-    # only a near side turn, from the outermost lane the model can see; a far side turn crosses oncoming traffic from a
-    # lane the model cannot tell apart from the others, so it waits for the blinker
-    return nav.long_active and left != nav.right_hand_traffic and self.outer_lane_time[0 if left else 1] >= OUTER_LANE_TIME - 1e-6
+  def _auto_turn_allowed(self, carstate, nav: NavInputs, v_ego: float, left: bool) -> bool:
+    side = 0 if left else 1
+    if left != nav.right_hand_traffic:  # a near side turn, from the outermost lane the model can see
+      return nav.long_active and self.outer_lane_time[side] >= OUTER_LANE_TIME - 1e-6
+    # a far side turn crosses oncoming traffic, so only from the lane beside a curb or median the model has surely seen
+    # for FAR_LANE_DISTANCE and FAR_LANE_TIME, and only where everything else lets it
+    return bool(self._far_gates(carstate, nav, v_ego, left)
+                and self.far_lane_time[side] >= FAR_LANE_TIME - 1e-6 and self.far_lane_distance[side] >= FAR_LANE_DISTANCE - 1e-6)
+
+  def _far_gates(self, carstate, nav: NavInputs, v_ego: float, left: bool) -> bool:
+    """Everything an automatic far side turn needs but the curb's run: the setting and openpilot's speed control, a plain
+    turn (not sharp, nor at the end of the road, a T junction that must yield both ways), the car moving and still
+    FAR_TURN_MIN_LEAD or more from the steering point, lane guidance not against the outermost lane, driver monitoring
+    quiet, and the posted limit known and no more than AUTO_FAR_ROAD_SPEED."""
+    maneuver = self.tracker.maneuver
+    return bool(self.far_enabled and nav.long_active and maneuver is not None and maneuver[0] != 'end of road'
+                and maneuver[1] in ('left', 'right') and not carstate.standstill and v_ego > NAV_TURN_CRAWL_SPEED
+                and self._time_to_steer(nav, self.tracker.nearest, v_ego) >= FAR_TURN_MIN_LEAD
+                and nav.instruction is not None and far_turn_lane(nav.instruction.lanes, left)
+                and not nav.driver_alert and 0. < self.road_limit <= AUTO_FAR_ROAD_SPEED)
+
+  def _far_auto_possible(self, carstate, nav: NavInputs, v_ego: float, left: bool) -> bool:
+    """Whether an automatic far side start can still come: nothing turned it off, the gates pass and the curb is beside the
+    car, though its run may not be long enough yet."""
+    blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
+    return bool(not self.auto_off and not blindspot and nav.far_lanes[0 if left else 1] and self._far_gates(carstate, nav, v_ego, left))
 
   def _pin(self) -> None:
     """Pin the current maneuver's point on the odometer, at the nearest and the farthest it has been: a distance pulled in

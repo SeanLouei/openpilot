@@ -301,15 +301,36 @@ sections:
     title: Automatic Route Turns (Alpha)
     description: Slows for each route turn, and turns right on its own (left where traffic keeps left) once slowed down and in the
       curb lane for a second, counted again after a lane change. Needs openpilot longitudinal (alpha). Turns across oncoming
-      traffic, and turns where the model cannot see the curb lane, slow and wait for your blinker. Before an automatic turn
-      starts, the gas pedal, the opposite blinker or disengaging calls it off until you signal for it; a turn you signaled for
-      is called off by switching the blinker off. Once a turn starts, steer to stop it (on a Tesla the brake also stops it,
-      since it turns steering off).
+      traffic wait for your blinker unless Automatic Left Turns is on; turns where the model cannot see the curb lane slow
+      and wait for your blinker. Before an automatic turn starts, the gas pedal, the opposite blinker or disengaging calls it
+      off until you signal for it; a turn you signaled for is called off by switching the blinker off. Once a turn starts,
+      steer to stop it (on a Tesla the brake also stops it, since it turns steering off).
     details: |-
       Turning without signaling is illegal in most places and gives pedestrians and other drivers no warning: signal yourself where you can. The curb-lane check cannot see a bike lane behind a curb or posts, and may take a narrow painted bike lane for the curb lane, so before every automatic turn, check for cyclists on the side you are turning to, or signal. The car does not watch for pedestrians, cyclists or cross traffic, and does not reliably stop for red lights or stop signs, so watch every turn and be ready to take over.
     enablement:
     - type: param
       key: NavigationEnabled
+      equals: true
+  - key: NavAutoTurnFarSide
+    widget: toggle
+    title: Automatic Left Turns (Alpha)
+    description: Needs Automatic Route Turns. Also turns left on its own (right where traffic keeps left), across oncoming
+      traffic, but only from the lane right beside a raised median or curb on that side, such as a curbed left-turn bay or
+      the left lane of a one-way street, and only where the posted speed limit is known and 45 mph (72 km/h) or less. The
+      model must have seen that curb right beside the car for the last 10 m (33 ft) and 1.5 seconds, with no lane change and
+      no car in that blind spot, and the route's lane guidance must not put the turn in another lane. The turn starts only
+      while the car is moving, at least 2 seconds before it steers across, and Turning Across Traffic chimes as it starts.
+      Everywhere else it slows and waits for your blinker, and shows Signal for Route Turn. Change it while parked (on the
+      comma 4 you can also switch it off while driving).
+    details: |-
+      Turning Across Traffic chimes at least 2 seconds before the car steers across oncoming traffic. The car does not see oncoming traffic, turn arrows, red lights or stop signs, and does not judge gaps: watch every automatic left turn and brake for oncoming traffic. On a Tesla, braking turns steering off as well as speed control, so finish the turn yourself. If the car stops within about 30 m (100 ft) of the turn before it starts, at a light, a stop sign or in a queue, the turn is left to you: the car keeps slowing for it, shows Signal for Route Turn, and turns once you signal. If it stops after the turn started, the turn is not repeated while it waits, and about 5 seconds after the turn started (or was last repeated) it is handed back to you the same way. Without the blinker, a turn it refuses or hands back means the car drives straight through the intersection at about 10 mph (16 km/h), also out of a left-turn-only lane, so signal or take over when Signal for Route Turn shows. It shows from about 5 seconds before the car would steer into the turn, or as soon as the turn can no longer start by itself after that, and once it has shown, that turn waits for your blinker. Painted turn lanes, center turn lanes and two-way streets have no curb beside the turn lane, so there the turn needs your blinker. The posted limit must be known, from the car or from map data, over the last 150 m (500 ft) before the turn, and driver monitoring must not be warning. On the approach, switching off a left blinker you had on for the turn, pressing the gas, or switching on the right blinker means no automatic left turn at that intersection; the car switching the blinker off by itself as an openpilot lane change into a turn bay ends still lets the turn start by itself once the curb has been beside the car for 10 m. Frontage roads, channelized islands, curbed bus lanes and median U-turn openings can look like a turn lane to the curb check, and on one-way streets cyclists may ride on the left: watch for them. Turning without signaling is illegal in most places: signal yourself where you can. This setting is not restored from a sunnylink backup. Changing the driving model can change how curbs are seen.
+    enablement:
+    - $ref: '#/macros/offroad'
+    - type: param
+      key: NavigationEnabled
+      equals: true
+    - type: param
+      key: NavAutoTurn
       equals: true
   - key: NavExitDesire
     widget: toggle

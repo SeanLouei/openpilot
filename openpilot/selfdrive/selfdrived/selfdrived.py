@@ -50,6 +50,7 @@ SafetyModel = car.CarParams.SafetyModel
 AlertLevel = log.DriverMonitoringState.AlertLevel
 MonitoringPolicy = log.DriverMonitoringState.MonitoringPolicy
 TurnDirection = custom.ModelDataV2SP.TurnDirection
+NavTurnAcross = custom.ModelDataV2SP.NavTurnAcross
 
 IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 
@@ -368,12 +369,18 @@ class SelfdriveD:
                                                     LaneChangeState.laneChangeFinishing):
       self.events.add(EventName.laneChange)
 
-    # Handle lane turn
+    # Handle lane turn: an automatic route turn across oncoming traffic has its own alert in place of the turn's, and one
+    # that will not start by itself asks for the blinker
     lane_turn_direction = self.sm['modelDataV2SP'].laneTurnDirection
-    if lane_turn_direction == TurnDirection.turnLeft:
+    nav_turn_across = self.sm['modelDataV2SP'].navTurnAcross
+    if nav_turn_across == NavTurnAcross.turning:
+      self.events_sp.add(custom.OnroadEventSP.EventName.navTurnAcross)
+    elif lane_turn_direction == TurnDirection.turnLeft:
       self.events_sp.add(custom.OnroadEventSP.EventName.laneTurnLeft)
     elif lane_turn_direction == TurnDirection.turnRight:
       self.events_sp.add(custom.OnroadEventSP.EventName.laneTurnRight)
+    if nav_turn_across == NavTurnAcross.signal:
+      self.events_sp.add(custom.OnroadEventSP.EventName.navTurnSignal)
 
     for i, pandaState in enumerate(self.sm['pandaStates']):
       # All pandas must match the list of safetyConfigs, and if outside this list, must be silent or noOutput

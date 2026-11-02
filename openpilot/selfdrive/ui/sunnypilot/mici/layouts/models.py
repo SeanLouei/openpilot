@@ -110,18 +110,27 @@ class ModelsLayoutMici(NavScroller):
                                                           "into a turn lane before you signal."))
     self.nav_auto_turn_toggle = BigParamControl(tr("auto route turns (alpha)"), "NavAutoTurn",
                                                 description=tr("With alpha longitudinal, slows for each route turn and turns right on its " +
-                                                               "own from the curb lane; left turns wait for your blinker. It can't see a " +
+                                                               "own from the curb lane; left turns wait for your blinker unless auto left " +
+                                                               "turns is on. It can't see a " +
                                                                "bike lane behind a curb or posts: check for cyclists on your right before " +
                                                                "every turn. Before an automatic turn starts, gas or the other blinker calls it off; " +
                                                                "after, steer (on a Tesla the brake also stops it: it turns steering off). " +
                                                                "Watch every turn."))
+    self.nav_far_turn_toggle = BigParamControl(tr("auto left turns (alpha)"), "NavAutoTurnFarSide",
+                                               description=tr("Needs auto route turns. Turns left on its own (right where traffic keeps " +
+                                                              "left) only from the lane right beside a raised median or curb on that side, " +
+                                                              "like a curbed left-turn bay or the left lane of a one-way street, on roads " +
+                                                              "with a known posted limit of 45 mph or less, and not after stopping near the " +
+                                                              "turn; elsewhere it slows and shows Signal for Route Turn. It can't see " +
+                                                              "oncoming traffic, arrows or red lights: watch and brake (on a Tesla, braking " +
+                                                              "turns steering off: finish the turn yourself). Turn it on while parked."))
     self.nav_exit_toggle = BigParamControl(tr("nav exit desires (alpha)"), "NavExitDesire",
                                            description=tr("Near a route exit or fork with lane guidance, a light steering nudge toward it has the car " +
                                                           "keep to that side of the split. Above 20 mph with your blinker on, a nudge " +
                                                           "changes lanes instead."))
 
     self.main_items = [self.current_model_info, self.select_model_btn, self.cancel_download_btn, self.refresh_btn, self.clear_cache_btn,
-                       self.blendful_toggle, self.nav_turn_toggle, self.nav_auto_turn_toggle, self.nav_exit_toggle]
+                       self.blendful_toggle, self.nav_turn_toggle, self.nav_auto_turn_toggle, self.nav_far_turn_toggle, self.nav_exit_toggle]
     self._scroller.add_widgets(self.main_items)
 
   @property
@@ -236,6 +245,7 @@ class ModelsLayoutMici(NavScroller):
     self.blendful_toggle.refresh()
     self.nav_turn_toggle.refresh()
     self.nav_auto_turn_toggle.refresh()
+    self.nav_far_turn_toggle.refresh()
     self.nav_exit_toggle.refresh()
 
   def _update_state(self):
@@ -256,6 +266,16 @@ class ModelsLayoutMici(NavScroller):
     blendful_value = "" if blendful_allowed else tr("custom model only")
     if self.blendful_toggle.value != blendful_value:
       self.blendful_toggle.set_value(blendful_value)
+
+    # automatic left turns work only with navigation and auto route turns on, and show as off without them, whatever the
+    # param says. They can be switched off while driving, but on only while parked.
+    navigation, auto_turns = ui_state.params.get_bool("NavigationEnabled"), ui_state.params.get_bool("NavAutoTurn")
+    far_checked = navigation and auto_turns and ui_state.params.get_bool("NavAutoTurnFarSide")
+    self.nav_far_turn_toggle.set_checked(far_checked)
+    self.nav_far_turn_toggle.set_enabled(navigation and auto_turns and (ui_state.is_offroad() or far_checked))
+    far_value = "" if navigation and auto_turns else tr("needs navigation") if not navigation else tr("needs auto route turns")
+    if self.nav_far_turn_toggle.value != far_value:
+      self.nav_far_turn_toggle.set_value(far_value)
 
     manager = self.model_manager
     self._download_frame += 1

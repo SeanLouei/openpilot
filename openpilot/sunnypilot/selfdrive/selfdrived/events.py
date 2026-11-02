@@ -213,6 +213,24 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 4.),
   },
 
+  # an automatic route turn across oncoming traffic: with no blinker, the driver's only notice before the car crosses
+  EventNameSP.navTurnAcross: {
+    ET.WARNING: Alert(
+      "Turning Across Traffic",
+      "Brake for oncoming traffic",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.MID, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 1.),
+  },
+
+  # a route turn across oncoming traffic that will not start, or go on, by itself: it waits for the blinker
+  EventNameSP.navTurnSignal: {
+    ET.WARNING: Alert(
+      "Signal for Route Turn",
+      "It won't turn by itself here",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.MID, VisualAlert.none, AudibleAlertSP.promptSingleLow, 1.),
+  },
+
   EventNameSP.speedLimitActive: {
     ET.WARNING: Alert(
       "Auto adjusting to speed limit",

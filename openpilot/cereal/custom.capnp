@@ -362,6 +362,8 @@ struct OnroadEventSP @0xda96579883444c35 {
     laneChangeRoadEdge @24;
     bigModelReady @25;
     navTurnSlowing @26;
+    navTurnAcross @27;
+    navTurnSignal @28;
   }
 }
 
@@ -478,11 +480,18 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulRightProb @8 :Float32;
   blendfulLaneWidth @9 :Float32;
   navTurnSpeed @10 :Float32;  # m/s the route's turn limits the speed to, 0 without one
+  navTurnAcross @11 :NavTurnAcross;  # an automatic route turn across oncoming traffic, or its prompt to signal
 
   enum TurnDirection {
     none @0;
     turnLeft @1;
     turnRight @2;
+  }
+
+  enum NavTurnAcross {
+    none @0;
+    turning @1;  # an automatic turn across oncoming traffic is under way
+    signal @2;  # a turn across oncoming traffic that will not start, or go on, by itself: signal for it
   }
 }
 
