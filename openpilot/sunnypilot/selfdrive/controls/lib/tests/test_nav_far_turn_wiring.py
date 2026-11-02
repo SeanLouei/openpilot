@@ -9,11 +9,15 @@ posted limit, selfdrived's alerts and their texts. Processes are read from their
 pieces.
 """
 import ast
+import dataclasses
 import json
 import re
 import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import numpy as np
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import custom, log
@@ -22,12 +26,21 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.parameterized import parameterized
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.test import OpenpilotTestCase
+from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
+from openpilot.selfdrive.selfdrived.events import Events
+from openpilot.selfdrive.ui import soundd
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NAV_TURN_STEER_DISTANCE
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_turn_speed import NavTurnSpeedController
+from openpilot.sunnypilot.selfdrive.controls.lib.tests.test_nav_desire import FakeSubMaster, car_state
+from openpilot.sunnypilot.selfdrive.controls.lib.tests.test_nav_far_turn import far_controller, far_nav
 from openpilot.sunnypilot.selfdrive.controls.lib.tests.test_nav_turn_speed import services, source
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EVENTS_SP, ET, Alert, EventsSP, Priority
 from openpilot.sunnypilot.sunnylink.tools.compile_settings_ui import DEFAULT_OUT
 
+EventName = log.OnroadEvent.EventName
 EventNameSP = custom.OnroadEventSP.EventName
 NavTurnAcross = custom.ModelDataV2SP.NavTurnAcross
+AudibleAlert = log.SelfdriveState.AudibleAlert
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
 VisualAlert = car.CarControl.HUDControl.VisualAlert
@@ -51,9 +64,15 @@ def top_level(function: ast.FunctionDef) -> str:
 
 class TestModeld(OpenpilotTestCase):
   def test_reads_the_posted_limit(self):
-    # a service a process reads without subscribing to it crashes that process
+    # a service a process reads without subscribing to it crashes that process: plannerd's posted limit, and the car's own
     for modeld in MODELDS:
-      assert 'longitudinalPlanSP' in services(source(modeld), 'SubMaster'), modeld
+      assert {'longitudinalPlanSP', 'carStateSP'} <= services(source(modeld), 'SubMaster'), modeld
+
+  def test_gives_the_route_the_cars_actuator_delay(self):
+    # the turn is judged on the speed the car still gains through its actuators' delay: the car's own, from CarParams
+    for modeld in MODELDS:
+      calls_ = [ast.unparse(call) for call in calls(source(modeld), 'nav_inputs')]
+      assert calls_ == ['nav_inputs(sm, modelv2_send.modelV2, CP.openpilotLongitudinalControl, CP.longitudinalActuatorDelay)'], modeld
 
   def test_publishes_the_turn_across(self):
     for modeld in MODELDS:
@@ -90,9 +109,9 @@ class TestPlannerd(OpenpilotTestCase):
 
 
 class TestSelfdrived(OpenpilotTestCase):
-  def lane_turn_events(self, nav_turn_across, lane_turn_direction) -> list[int]:
-    """Runs selfdrived's own lane turn block on a real modelDataV2SP message, with selfdrived's own module level names,
-    returning the events it adds."""
+  def lane_turn_events(self, nav_turn_across, lane_turn_direction, events=()) -> list[int]:
+    """Runs selfdrived's own lane turn block on a real modelDataV2SP message, with selfdrived's own module level names and
+    the events already raised, returning the events it leaves."""
     text = (Path(BASEDIR) / 'openpilot/selfdrive/selfdrived/selfdrived.py').read_text()
     block = text[text.index('    # Handle lane turn'):text.index("    for i, pandaState in enumerate(self.sm['pandaStates']):")]
     names = {'custom': custom}
@@ -102,6 +121,8 @@ class TestSelfdrived(OpenpilotTestCase):
     msg = messaging.new_message('modelDataV2SP').modelDataV2SP
     msg.navTurnAcross, msg.laneTurnDirection = nav_turn_across, lane_turn_direction
     selfdrived = SimpleNamespace(sm={'modelDataV2SP': msg}, events_sp=EventsSP())
+    for event in events:
+      selfdrived.events_sp.add(event)
     exec(textwrap.dedent(block), names | {'self': selfdrived})
     return selfdrived.events_sp.names
 
@@ -116,10 +137,17 @@ class TestSelfdrived(OpenpilotTestCase):
   def test_raises_the_alerts(self, nav_turn_across, lane_turn_direction, expected):
     assert self.lane_turn_events(nav_turn_across, lane_turn_direction) == expected
 
+  @parameterized.expand([('none', 'none', [EventNameSP.navTurnSlowing]), ('turning', 'turnLeft', [EventNameSP.navTurnAcross]),
+                         ('signal', 'none', [EventNameSP.navTurnSignal])])
+  def test_slowing_never_shows_over_them(self, nav_turn_across, lane_turn_direction, expected):
+    # Slowing for Route Turn, raised by plannerd as the car pulls away from a stop where it asked for the blinker, say,
+    # would show over them as the newer alert of the same priority: it is dropped while they show
+    assert self.lane_turn_events(nav_turn_across, lane_turn_direction, (EventNameSP.navTurnSlowing,)) == expected
+
 
 class TestEvents(OpenpilotTestCase):
   @parameterized.expand([
-    ('navTurnAcross', 27, "Turning Across Traffic", "Brake for oncoming traffic", AudibleAlertSP.promptSingleHigh),
+    ('navTurnAcross', 27, "Turning Across Traffic", "Brake for oncoming traffic", AudibleAlertSP.prompt),
     ('navTurnSignal', 28, "Signal for Route Turn", "It won't turn by itself here", AudibleAlertSP.promptSingleLow),
   ])
   def test_alert(self, name, number, text_1, text_2, sound):
@@ -127,11 +155,76 @@ class TestEvents(OpenpilotTestCase):
     assert event == number and list(EVENTS_SP[event]) == [ET.WARNING]
     alert = EVENTS_SP[event][ET.WARNING]
     assert (alert.alert_text_1, alert.alert_text_2, alert.alert_status, alert.alert_size, alert.priority, alert.visual_alert,
-            alert.audible_alert, alert.duration) == (text_1, text_2, AlertStatus.userPrompt, AlertSize.mid, Priority.MID, VisualAlert.none,
+            alert.audible_alert, alert.duration) == (text_1, text_2, AlertStatus.userPrompt, AlertSize.mid, Priority.LOW, VisualAlert.none,
                                                      sound, int(1. / DT_CTRL))
     events = EventsSP()
     events.add(event)
     assert [a.alert_type for a in events.create_alerts([ET.WARNING])] == [f'{name}/{ET.WARNING}']
+
+  def test_turn_across_has_its_own_sound(self):
+    # soundd plays a sound again only when the shown alert's sound changes: Turning Across Traffic's is none of the other
+    # route alerts' sounds, so it chimes also when it starts while one of them still shows
+    sound = {name: EVENTS_SP[getattr(EventNameSP, name)][ET.WARNING].audible_alert for name in ('navTurnSlowing', 'navTurnSignal', 'navTurnAcross')}
+    assert sound['navTurnAcross'] not in (sound['navTurnSlowing'], sound['navTurnSignal']) and sound['navTurnAcross'] in soundd.sound_list
+
+  @parameterized.expand([(12,), (16,), (20,), (30,)])
+  def test_turn_across_chimes_as_it_starts(self, mph):
+    # closed loop from 120 m at 12-30 mph: the far side controller (modeld), the slowdown and its Slowing for Route Turn
+    # (plannerd), selfdrived's alerts, and soundd's own rule for when a sound plays. As the automatic left turn starts,
+    # Turning Across Traffic shows, over Slowing for Route Turn when that still shows too, and its sound plays
+    c = far_controller()
+    turn_speed = NavTurnSpeedController(SimpleNamespace(openpilotLongitudinalControl=True))
+    manager, sound = AlertManager(), object.__new__(soundd.Soundd)
+    sound.current_alert, sound.current_sound_frame, sound.pending_stop = AudibleAlert.none, 0, False
+    sound.loaded_sounds = {k: np.zeros(int(0.4 * soundd.SAMPLE_RATE), dtype=np.float32) for k in soundd.sound_list}  # only their lengths matter
+    d, v, a_plan, plan_events, across, chimed = 120., mph * 0.44704, 0., [], None, None
+    for k in range(round(30. / DT_CTRL)):
+      if k % 5 == 0:  # modeld and plannerd at 20 Hz
+        c.update(car_state(vEgo=v), True, dataclasses.replace(far_nav(distance=d), accel=a_plan))
+        events = EventsSP()
+        model = FakeSubMaster(seen={'modelDataV2SP': True}, recv_time={'modelDataV2SP': time.monotonic()},
+                              data={'modelDataV2SP': SimpleNamespace(navTurnSpeed=c.speed_limit)})
+        turn_speed.update(model, True, False, v, a_plan, events)
+        plan_events = events.names
+      events = EventsSP()
+      for name in plan_events + ([EventNameSP.navTurnAcross] if c.turn_across else []) + ([EventNameSP.navTurnSignal] if c.signal_prompt else []):
+        events.add(name)
+      manager.add_many(k, events.create_alerts([ET.WARNING], [None, None, None, False, 0, None]))
+      manager.process_alerts(k, set())
+      shown = manager.current_alert
+      if k % 5 == 0:  # soundd at 20 Hz
+        before = (sound.current_alert, sound.current_sound_frame)
+        sound.update_alert(int(shown.audible_alert))
+        if across is None and shown.alert_type == f'navTurnAcross/{ET.WARNING}':
+          across = d
+          chimed = sound.current_alert == shown.audible_alert and sound.current_sound_frame == 0 and before != (sound.current_alert, 0)
+        sound.current_sound_frame += int(0.05 * soundd.SAMPLE_RATE)
+      if k % 5 == 0:  # the car follows the slowdown
+        a_plan = min(float(np.clip(mph * 0.44704 - v, -0.5, 1.)), turn_speed.a_target if turn_speed.active else 1.)
+      v = max(v + a_plan * DT_CTRL, 0.)
+      d -= v * DT_CTRL
+      if d < 0.:
+        break
+    assert across is not None and across > NAV_TURN_STEER_DISTANCE and chimed, (across, chimed)
+
+  @parameterized.expand([('navTurnSignal', 2.), ('navTurnSignal', 0.), ('navTurnAcross', 2.), ('navTurnAcross', 0.)])
+  def test_driver_monitoring_shows_over_route_alerts(self, name, dm_from):
+    # driver monitoring's warning, with its looping sound, shows over the route's turn alerts, whichever came first
+    manager, events, events_sp = AlertManager(), Events(), EventsSP()
+    for k in range(round(6. / DT_CTRL)):
+      t = k * DT_CTRL
+      events.clear()
+      events_sp.clear()
+      if t >= dm_from:
+        events.add(EventName.driverDistracted2)
+      if t >= 2. - dm_from:
+        events_sp.add(getattr(EventNameSP, name))
+      args = [None, None, None, False, 0, None]
+      manager.add_many(k, events.create_alerts([ET.PERMANENT, ET.WARNING], args) + events_sp.create_alerts([ET.PERMANENT, ET.WARNING], args))
+      manager.process_alerts(k, set())
+      if t >= 2.:
+        assert manager.current_alert.alert_type == f'driverDistracted2/{ET.PERMANENT}', (t, manager.current_alert.alert_type)
+        assert manager.current_alert.audible_alert == AudibleAlert.promptDistracted
 
   def test_turn_across_states(self):
     assert (NavTurnAcross.none, NavTurnAcross.turning, NavTurnAcross.signal) == (0, 1, 2)

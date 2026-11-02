@@ -381,6 +381,10 @@ class SelfdriveD:
       self.events_sp.add(custom.OnroadEventSP.EventName.laneTurnRight)
     if nav_turn_across == NavTurnAcross.signal:
       self.events_sp.add(custom.OnroadEventSP.EventName.navTurnSignal)
+    # both show over Slowing for Route Turn, of the same priority, also over one plannerd raises after them, pulling away
+    # from a stop: the newer alert would show, and that one only says the car slows
+    if nav_turn_across in (NavTurnAcross.turning, NavTurnAcross.signal):
+      self.events_sp.remove(custom.OnroadEventSP.EventName.navTurnSlowing)
 
     for i, pandaState in enumerate(self.sm['pandaStates']):
       # All pandas must match the list of safetyConfigs, and if outside this list, must be silent or noOutput

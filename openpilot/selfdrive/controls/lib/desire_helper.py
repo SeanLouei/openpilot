@@ -33,6 +33,7 @@ class DesireHelper:
     self.nav_desire = NavDesireController()
     self.nav_desire_failed = False
     self.route_blinker_side: bool | None = None  # the side (left) of a blinker a route turn has had, until it goes off
+    self.ahead_blinker_side: bool | None = None  # the side (left) of a blinker toward the route's next turn ahead, until it goes off
 
   @staticmethod
   def get_lane_change_direction(CS):
@@ -59,6 +60,8 @@ class DesireHelper:
     side = blinker_side(carstate)
     if side != self.route_blinker_side:
       self.route_blinker_side = None
+    if side != self.ahead_blinker_side:
+      self.ahead_blinker_side = None
     route_owned = self.nav_desire.owns_turn_desire or self.route_blinker_side is not None
     lane_turning = self.desire in (log.Desire.turnLeft, log.Desire.turnRight) and not route_owned
     failed = False
@@ -71,6 +74,8 @@ class DesireHelper:
       self.nav_desire.reset()
     if self.nav_desire.owns_turn_desire and side is not None:
       self.route_blinker_side = side
+    if self.nav_desire.turn_blinker_ahead and side is not None:
+      self.ahead_blinker_side = side
     route_turning = self.nav_desire.turning is not None
     if self.nav_desire.owns_turn_desire or self.route_blinker_side is not None:
       self.lane_turn_direction = self.nav_desire.turn_direction
@@ -111,9 +116,10 @@ class DesireHelper:
         self.alc.update_lane_change(blindspot_detected, edge_detected, carstate.brakePressed, torque_applied)
 
         # A blinker for the route's next turn needs a nudge to change lanes, so it never starts a nudgeless one, also once
-        # the route let go of it (a reroute, or navd moving on) while it stays on
+        # the route let go of it (a reroute, or navd moving on) while it stays on, nor does one toward the turn switched on
+        # before it latches, which may be the early signal the guide asks for on a fast road
         auto_lane_change_allowed = (self.alc.auto_lane_change_allowed and not self.nav_desire.route_turn_signal
-                                    and self.route_blinker_side is None)
+                                    and self.route_blinker_side is None and self.ahead_blinker_side is None)
 
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off

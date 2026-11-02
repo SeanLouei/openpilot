@@ -309,7 +309,7 @@ def main(demo=False):
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
-                  "carControl", "controlsState", "lateralDelay", "navInstruction", "longitudinalPlanSP"])
+                  "carControl", "controlsState", "lateralDelay", "navInstruction", "longitudinalPlanSP", "carStateSP"])
 
   publish_state = PublishState()
   params = Params()
@@ -461,7 +461,7 @@ def main(demo=False):
       r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       left_edge, right_edge = RELC.update_and_fill(modelv2_send.modelV2, mdv2sp_send.modelDataV2SP, v_ego)
-      nav = nav_inputs(sm, modelv2_send.modelV2, CP.openpilotLongitudinalControl)
+      nav = nav_inputs(sm, modelv2_send.modelV2, CP.openpilotLongitudinalControl, CP.longitudinalActuatorDelay)
       DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, left_edge, right_edge, nav)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction

@@ -13,12 +13,11 @@ from opendbc.car.interfaces import ACCEL_MAX
 from openpilot.cereal import custom
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
-from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NAV_TURN_DECEL, NAV_TURN_MAX_DECEL, NAV_TURN_SPEED
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NAV_TURN_DECEL, NAV_TURN_JERK, NAV_TURN_MAX_DECEL, NAV_TURN_SPEED
 
 EventNameSP = custom.OnroadEventSP.EventName
 
 NAV_TURN_LIMIT_MAX_AGE = 0.5  # s; modeld publishes the route turn's speed limit with every model frame
-NAV_TURN_JERK = 1.5  # m/s^3
 NAV_TURN_ALERT_DECEL = 0.3  # m/s^2 of slowing that counts as the slowdown taking over, and of speeding up as it letting go
 NAV_TURN_ALERT_MARGIN = 0.5  # m/s above turn speed
 NAV_TURN_ALERT_RESET = 5.  # s the limit lets go of the car, or is off, before the next slowdown alerts again

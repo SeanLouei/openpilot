@@ -94,11 +94,12 @@ def degrees(meters):
   return meters / METERS_PER_DEGREE
 
 
-def gps_fix(x, y, bearing, speed):
-  """A GPS fix at planar meters (x east, y north) near the equator, as navd reads it."""
+def gps_fix(x, y, bearing, speed, accuracy=0.):
+  """A GPS fix at planar meters (x east, y north) near the equator, as navd reads it, with the course accuracy the receiver
+  reports (0: none)."""
   msg = messaging.new_message('gpsLocationExternal', valid=True)
   msg.gpsLocationExternal = {'hasFix': True, 'longitude': float(degrees(x)), 'latitude': float(degrees(y)), 'bearingDeg': float(bearing % 360),
-                             'speed': float(speed)}
+                             'speed': float(speed), 'bearingAccuracyDeg': float(accuracy)}
   return messaging.log_from_bytes(msg.to_bytes()).gpsLocationExternal
 
 
@@ -251,10 +252,10 @@ class GpsSubMaster:
   def __getitem__(self, service):
     return self.fixes[service]
 
-  def fix(self, x, y, bearing, speed, age=0.):
+  def fix(self, x, y, bearing, speed, age=0., accuracy=0.):
     """A new fix, published age seconds ago."""
     now = time.monotonic()
-    self.fixes['gpsLocationExternal'] = gps_fix(x, y, bearing, speed)
+    self.fixes['gpsLocationExternal'] = gps_fix(x, y, bearing, speed, accuracy)
     self.recv_time['gpsLocationExternal'] = now
     self.logMonoTime['gpsLocationExternal'] = int((now - age) * 1e9)
 
@@ -317,13 +318,13 @@ class Drive:
         s += speed
     return records
 
-  def fixes(self, fixes):
-    """Feeds fixes of (x, y, bearing, speed), once a second, a stop or a turnaround too. Per fix: whether the instruction
-    was valid, and how many routes navd asked for so far."""
+  def fixes(self, fixes, accuracy=0.):
+    """Feeds fixes of (x, y, bearing, speed), once a second, a stop or a turnaround too, each reporting a course accuracy.
+    Per fix: whether the instruction was valid, and how many routes navd asked for so far."""
     records = []
     with patch('requests.get', return_value=MagicMock(status_code=200)) as get:
       for x, y, bearing, speed in fixes:
-        self.sm.fix(x, y, bearing, speed)
+        self.sm.fix(x, y, bearing, speed, accuracy=accuracy)
         self.pm.reset_mock()
         self.engine.update()
         msg = next(call.args[1] for call in self.pm.send.call_args_list if call.args[0] == 'navInstruction')
@@ -435,6 +436,20 @@ class TestSplits(OpenpilotTestCase):
       assert all(r['valid'] for r in records[:missed])
       assert records[-1]['rerouting'] and records[-1]['y'] - records[missed]['y'] <= 30.  # at the next update
 
+  def test_fork_straight_on(self):
+    # Just past a 25 degree exit the ramp forks, and the route keeps straight on along it: there the old road going on is the
+    # route itself, so the car on it is never missed, and the ramp's own maneuver comes before its end
+    a = math.radians(25.)
+    gore, ramp = np.array([0., 1000.]), np.array([math.sin(a), math.cos(a)])
+    fork, ramp_end = gore + 8. * ramp, gore + 408. * ramp
+    route = mapbox_route(([(0, 0), tuple(gore)], 'off ramp', 'slight right'), ([tuple(gore), tuple(fork)], 'fork', 'slight left'),
+                         ([tuple(fork), tuple(ramp_end)], 'end of road', 'right'), ([tuple(ramp_end), tuple(ramp_end + (300., 0.))], 'arrive', 'right'))
+    points = [(0., 600.), tuple(gore), tuple(ramp_end - 5. * ramp)]
+    for phase in PHASES:
+      records = Drive(route, points[0]).drive(points, 30., phase)
+      assert all(r['valid'] and not r['rerouting'] for r in records), phase
+      assert [r for r in records if r['type'] == 'end of road'], phase
+
   def test_gps_outlier_past_an_exit_not_taken(self):
     # One fix off toward the ramp, from multipath say, while the car stays on the freeway. The straight line navd checks
     # between two fixes then runs through the ramp's side of the road, where the car never was: the ramp's turn must
@@ -451,11 +466,13 @@ class TestSplits(OpenpilotTestCase):
 
 class TestServiceRoad(OpenpilotTestCase):
   """The route turns onto a short connector to a service road that runs beside the main road: a car staying on the main
-  road is as close to the route after the turn as one that took it, so navd waits until the car is clearly on one road."""
+  road is as close to the route after the turn as one that took it, so navd moves on only once the car's course turned
+  toward the service road and the car is clearly on it."""
 
-  def route(self, side):
-    return mapbox_route(([(0, 0), (0, 300)], 'turn', 'right'), ([(0, 300), (side, 300), (side, 600)], 'turn', 'right'),
-                        ([(side, 600), (side + 200, 600)], 'arrive', 'right'))
+  def route(self, side, turn=600.):
+    """The service road side m beside the main road, to its own right turn at y = turn."""
+    return mapbox_route(([(0, 0), (0, 300)], 'turn', 'right'), ([(0, 300), (side, 300), (side, turn)], 'turn', 'right'),
+                        ([(side, turn), (side + 200, turn)], 'arrive', 'right'))
 
   def test_staying_on_the_main_road(self):
     for side in (12., 15.):  # m between the roads' center lines
@@ -473,6 +490,64 @@ class TestServiceRoad(OpenpilotTestCase):
         assert all(r['valid'] and not r['rerouting'] for r in records)
         along = [r for r in records if r['y'] > 320.]
         assert along and all(r['step'] == 1 and abs(r['distance'] - (600. - r['y'])) < 0.5 for r in along), (side, phase)
+
+  def test_taking_an_angled_connector(self):
+    # a connector at 60 degrees, taken at different speeds: the course turns toward the service road, which is what counts
+    side = 15.
+    route = mapbox_route(([(0, 0), (0, 300)], 'turn', 'right'), ([(0, 300), (side, 300 + side / math.sqrt(3)), (side, 600)], 'turn', 'right'),
+                         ([(side, 600), (side + 200, 600)], 'arrive', 'right'))
+    points = [(1.8, 100.), (1.8, 297.), (side + 1.8, 297. + side / math.sqrt(3)), (side + 1.8, 590.)]
+    for speed in (4., 6., 8.):
+      for phase in PHASES:
+        records = Drive(route, points[0]).drive(points, speed, phase)
+        assert all(r['valid'] and not r['rerouting'] for r in records), (speed, phase)
+        assert [r for r in records if r['y'] > 340.] and all(r['step'] == 1 for r in records if r['y'] > 340.), (speed, phase)
+
+  def test_offset_intersection(self):
+    # The road goes on 12 m to the right across an intersection: a right turn, a short step, a left turn. The car drives it
+    # as one smooth S over 40 m, its course never more than 24 degrees off, which is enough to have turned toward it
+    route = mapbox_route(([(0, -400), (0, 0)], 'turn', 'right'), ([(0, 0), (12, 0)], 'turn', 'left'), ([(12, 0), (12, 400)], 'turn', 'right'),
+                         ([(12, 400), (212, 400)], 'arrive', 'right'))
+    s_curve = [(12. * (3 * u * u - 2 * u ** 3), -15. + 40. * u) for u in np.linspace(0., 1., 21)]
+    points = [(0., -200.)] + s_curve + [(12., 300.)]
+    for speed in (8., 12.):
+      for phase in PHASES:
+        records = Drive(route, points[0]).drive(points, speed, phase)
+        assert all(r['valid'] and not r['rerouting'] for r in records), (speed, phase)
+        assert all(r['step'] == 2 for r in records if r['y'] > 60.), (speed, phase)
+
+  def test_staying_in_the_curb_lane(self):
+    # In the main road's curb lane the car is no farther from a service road 12-18 m beside than from its own road's line, so
+    # no distance tells that it stayed: its course never turned toward the connector, so it missed it. Also where the service
+    # road runs on for 800 m, past the 300 m of the main road's straight continuation that are compared.
+    for side, lane in ((12., 3.6), (12., 5.4), (15., 5.4), (15., 9.), (18., 9.)):
+      for turn in (600., 1100.):
+        for speed in (8., 12., 16.):
+          for phase in PHASES:
+            records = Drive(self.route(side, turn), (lane, 100.)).drive([(lane, 100.), (lane, turn + 100.)], speed, phase)
+            assert all(r['step'] == 0 for r in records[:-1]), (side, lane, turn, speed, phase)  # never onto the service road's turn
+            assert records[-1]['rerouting'] and records[-1]['y'] <= 340. + 2. * speed, (side, lane, turn, speed, phase)
+
+  def test_gps_error_toward_the_service_road(self):
+    # A GPS error of 6-8 m toward the service road for seconds, from multipath say, while the car stays in the curb lane: the
+    # fixes are on the service road, but the course never turned, so its turn never comes to the car on the main road
+    for error in (6.5, 8.):
+      for phase in (0., 0.5):
+        fixes = [(5.4 + (error if 320. <= y <= 400. else 0.), y, 0., 12.) for y in np.arange(100. + 12. * phase, 700., 12.)]
+        records = Drive(self.route(12.), (5.4, 100.)).fixes(fixes)
+        assert not [r for r in records if r['step'] == 1], (error, phase)
+        assert records[-1]['requests'] > 0
+
+  def test_road_beside_past_the_old_roads_continuation(self):
+    # A slight turn onto a road 8 m beside that runs on for 800 m: past the 300 m of the old road's straight continuation
+    # that are compared, the distance to it grows on either road, which must not move a car still on the old road onto
+    # the new one
+    route = mapbox_route(([(0, 0), (0, 300)], 'turn', 'slight right'), ([(0, 300), (8., 300), (8., 1100)], 'turn', 'right'),
+                         ([(8., 1100), (208., 1100)], 'arrive', 'right'))
+    for phase in PHASES:
+      records = Drive(route, (1.8, 100.)).drive([(1.8, 100.), (1.8, 1200.)], 12., phase)
+      assert all(r['step'] == 0 for r in records[:-1]), phase
+      assert records[-1]['rerouting'] and records[-1]['y'] < 630., phase
 
 
 class TestShortSteps(OpenpilotTestCase):
@@ -587,6 +662,88 @@ class TestLeavingTheRoute(OpenpilotTestCase):
           assert not any(r['rerouting'] for r in records)
           after = [r for r in records if r['y'] > start + length + 2. * speed]  # two fixes after it
           assert after and all(r['valid'] for r in after), (speed, length, before, phase)
+
+  def test_median_end(self):
+    # Where a raised median ends, the map's one-way line along each carriageway rejoins the road's centerline over a few tens
+    # of meters: under a car in the curb lane the step's line heads off the car's course and moves away from it, while the
+    # car stays on the route. The lanes may shift after the median's end, before it, or not at all.
+    for lanes in (2, 3):
+      # with a 3 m median, m right of the road's centerline: the carriageway's line, and the curb lane while beside the median
+      line, curb = 1.5 + 1.8 * lanes, 3.6 * lanes - 0.3
+      for rejoin in (15., 30.):
+        turn = 300. + rejoin + 70.
+        route = mapbox_route(([(line, 0), (line, 300), (0, 300 + rejoin), (0, turn)], 'turn', 'right'),
+                             ([(0, turn), (300, turn)], 'turn', 'left'), ([(300, turn), (300, turn + 300)], 'arrive', ''))
+        for lane_shift in ([(curb, 300.), (curb - 1.5, 300. + min(3. * rejoin, 48.))], [], [(curb, 270.), (curb - 1.5, 300.)]):
+          points = [(curb, 100.)] + lane_shift + [(curb - 1.5 if lane_shift else curb, turn - 10.)]
+          for speed in (8., 11.):
+            for phase in PHASES:
+              records = Drive(route, points[0]).drive(points, speed, phase)
+              assert all(r['valid'] and not r['rerouting'] for r in records), (lanes, rejoin, lane_shift, speed, phase)
+
+  def test_boulevard(self):
+    # A boulevard the map draws as one-way carriageway lines along the 100 m around each intersection, where a raised median
+    # is, and as one centerline between them: the car keeps its curb lane past every one without the route being recalculated
+    line, curb = 6.9, 9.  # 3+3 lanes, a 3 m median
+    centerline, lanes = [(0., 0.)], [(curb, 0.)]
+    for y in (100., 350., 600.):
+      centerline += [(0., y - 20.), (line, y), (line, y + 100.), (0., y + 120.)]
+      lanes += [(curb, y - 45.), (curb + 1.5, y), (curb + 1.5, y + 100.), (curb, y + 145.)]
+    route = mapbox_route((centerline + [(0., 900.)], 'turn', 'right'), ([(0., 900.), (300., 900.)], 'turn', 'left'),
+                         ([(300., 900.), (300., 1200.)], 'arrive', ''))
+    for speed in (6., 9.):
+      for phase in (0., 0.5):
+        records = Drive(route, lanes[0]).drive(lanes + [(curb, 890.)], speed, phase)
+        assert all(r['valid'] and not r['rerouting'] for r in records), (speed, phase)
+
+  def test_branch_where_the_route_bends(self):
+    # the route's road bends left at a map vertex while a branch goes on straight there: the car on it leaves the route
+    for theta in (15., 25., 40.):
+      a = math.radians(theta)
+      turn = (-70. * math.sin(a), 300. + 70. * math.cos(a))  # the route's right turn, 70 m on along the bend
+      left = (turn[0] + 300. * math.cos(a), turn[1] + 300. * math.sin(a))
+      route = mapbox_route(([(0, 0), (0, 300), turn], 'turn', 'right'), ([turn, left], 'turn', 'left'),
+                           ([left, (left[0] - 300. * math.sin(a), left[1] + 300. * math.cos(a))], 'arrive', ''))
+      for phase in PHASES:
+        records = Drive(route, (1.8, 150.)).drive([(1.8, 150.), (1.8, 450.)], 11., phase)
+        past = [r for r in records if r['y'] > 300.]
+        gone = next(i for i, r in enumerate(past) if not r['valid'])
+        assert past[gone]['y'] - 300. < 35. and not any(r['valid'] for r in past[gone:]), (theta, phase)
+        assert records[-1]['rerouting']
+
+  def test_branch_before_the_route_bends_toward_it(self):
+    # a branch leaves 40-60 m before the route's road bends right by as much, so it cuts the bend and runs beside the route
+    # past it: the car on it leaves the route all the same
+    for theta in (15., 30.):
+      a = math.radians(theta)
+      turn = (100. * math.sin(a), 300. + 100. * math.cos(a))  # the route's right turn, 100 m on along the bend
+      left = (turn[0] + 300. * math.cos(a), turn[1] - 300. * math.sin(a))
+      route = mapbox_route(([(0, 0), (0, 300), turn], 'turn', 'right'), ([turn, left], 'turn', 'left'),
+                           ([left, (left[0] + 300. * math.sin(a), left[1] + 300. * math.cos(a))], 'arrive', ''))
+      for before in (40., 60.):
+        branch = 300. - before
+        points = [(1.8, 150.), (1.8, branch), (1.8 + 300. * math.sin(a), branch + 300. * math.cos(a))]
+        for phase in PHASES:
+          records = Drive(route, points[0]).drive(points, 11., phase)
+          on_branch = [r for r in records if r['y'] > branch]
+          gone = next(i for i, r in enumerate(on_branch) if not r['valid'])
+          assert on_branch[gone]['s'] - (branch - 150.) < 35. and not any(r['valid'] for r in on_branch[gone:]), (theta, before, phase)
+          assert records[-1]['rerouting']
+
+  def test_course_accuracy(self):
+    # At a crawl, a fix's position drifts 6 m to the right over 5 s while its course reads 15 degrees right: a car taking a
+    # shallow branch, or the GPS error of a receiver that rates its course to 8 degrees at that speed, as in slow traffic.
+    # A course rated that poor doesn't take the car off the route; a better one does, and so does one the receiver doesn't
+    # rate (0, or 180 from qcomgpsd).
+    fixes = [(1.8 + 1.2 * min(max(i - 30, 0), 5), 150. + 3.5 * i, 15. if 30 < i <= 35 else 0., 3.5) for i in range(45)]
+    for accuracy, leaves in ((0., True), (2., True), (4.8, True), (8., False), (20., False), (180., True)):
+      records = Drive(self.route(), fixes[0][:2]).fixes(fixes, accuracy=accuracy)
+      assert any(not r['valid'] for r in records) == leaves, accuracy
+      assert (records[-1]['requests'] > 0) == leaves, accuracy
+    # once one fix heads off by more than that course's error can, the fixes after it only need to stay off
+    fixes[31] = (fixes[31][0], fixes[31][1], 22., 3.5)
+    records = Drive(self.route(), fixes[0][:2]).fixes(fixes, accuracy=8.)
+    assert any(not r['valid'] for r in records) and records[-1]['requests'] > 0
 
 
 class TestArrival(OpenpilotTestCase):

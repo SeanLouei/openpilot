@@ -134,23 +134,29 @@ def slowed_trigger_distance(v_ego):
 
 
 def closed_loop(target, start, v_set, seconds, inputs=auto_nav, carstate=None, lateral_active=True, navd_period=1., model_speed=None,
-                lane_change_prob=1.0, v0=None, **kwargs):
+                lane_change_prob=1.0, v0=None, accel_max=1., delay=0., gas=None, **kwargs):
   """Drive toward the maneuver from `start` meters at a set speed, the car slowing for the route turn's speed limit as
-  plannerd does (the profile's deceleration and a correction toward it, at most NAV_TURN_MAX_DECEL, through a 0.3 s lag)
-  while openpilot controls the speed, and for a driving model that wants slower (model_speed of the distance). navd
-  reports once per navd_period, and modeld adds the car's acceleration, the more of the measured and the planned one.
-  carstate(distance, v) gives the car's state, lane_change_prob the model's lane change probability, or a function of
-  the distance, lateral_active whether steering is on, or a function of the distance. The car starts at v0, or the set
-  speed. Returns each frame's (output, distance, speed, speed limit): the turn direction of a controller, or the desire
-  of a DesireHelper."""
+  plannerd does (the profile's deceleration and a correction toward it, at most NAV_TURN_MAX_DECEL, more braking only at
+  its jerk limit from the planner's last output, through `delay` s of actuator delay and a 0.3 s lag) while openpilot
+  controls the speed, and for a driving model that wants slower (model_speed of the distance), speeding up at accel_max
+  at most. navd reports once per navd_period, and modeld adds the car's acceleration, the more of the measured and the
+  planned one. carstate(distance, v) gives the car's state, lane_change_prob the model's lane change probability, or a
+  function of the distance, lateral_active whether steering is on, or a function of the distance, gas(distance, v) the
+  driver's acceleration on the gas pedal, or None: openpilot does not control the speed meanwhile. The car starts at v0,
+  or the set speed. Returns each frame's (output, distance, speed, speed limit): the turn direction of a controller, or
+  the desire of a DesireHelper."""
   c = target.nav_desire if isinstance(target, DesireHelper) else target
   frames, distance, v, a, a_plan = [], start, v_set if v0 is None else v0, 0., 0.
   message, sent = None, 0.
+  commands = [0.] * (round(delay / DT_MDL) + 1)  # the planned accelerations the actuators still have to apply
   for i in range(round(seconds / DT_MDL)):
     t = i * DT_MDL
     if i % max(round(navd_period / DT_MDL), 1) == 0:
       message, sent = inputs(distance=distance, **kwargs), t
+    driver = gas(distance, v) if gas is not None else None
     nav_now = dataclasses.replace(message, age=t - sent, accel=max(a, a_plan))
+    if driver is not None:
+      nav_now = dataclasses.replace(nav_now, long_active=False)
     carstate_now = carstate(distance, v) if carstate is not None else car(vEgo=v)
     active = lateral_active(distance) if callable(lateral_active) else lateral_active
     if isinstance(target, DesireHelper):
@@ -160,14 +166,15 @@ def closed_loop(target, start, v_set, seconds, inputs=auto_nav, carstate=None, l
     else:
       target.update(carstate_now, active, nav_now)
       frames.append((target.turn_direction, distance, v, c.speed_limit))
-    wanted = [float(np.clip(v_set - v, -0.5, 1.))]
+    wanted = [float(np.clip(v_set - v, -0.5, accel_max))]
     if model_speed is not None:
-      wanted.append(float(np.clip(model_speed(distance) - v, -2., 1.)))
+      wanted.append(float(np.clip(model_speed(distance) - v, -2., accel_max)))
     if nav_now.long_active and c.speed_limit > 0.:
       decel = NAV_TURN_DECEL if c.speed_limit > NAV_TURN_SPEED else 0.
-      wanted.append(max(float(np.clip(c.speed_limit - v - decel, -NAV_TURN_MAX_DECEL, 1.)), a_plan - 1.5 * DT_MDL))
-    a_plan = min(wanted)
-    a += (a_plan - a) * DT_MDL / 0.3
+      wanted.append(max(float(np.clip(c.speed_limit - v - decel, -NAV_TURN_MAX_DECEL, accel_max)), a_plan - 1.5 * DT_MDL))
+    a_plan = min(wanted) if driver is None else a  # on the gas, the planner starts again from the car's acceleration
+    commands = [*commands[1:], driver if driver is not None else a_plan]
+    a += (commands[0] - a) * DT_MDL / 0.3
     v = max(v + a * DT_MDL, 0.)
     distance -= v * DT_MDL
   return frames
@@ -199,6 +206,13 @@ def car_state(**fields):
   msg = messaging.new_message('carState').carState
   for name, value in fields.items():
     setattr(msg, name, value)
+  return msg
+
+
+def engaged_car(**fields):
+  """Like car_state, with the car's cruise on and set to 30 mph, as it is while openpilot longitudinal is engaged."""
+  msg = car_state(**fields)
+  msg.cruiseState.enabled, msg.cruiseState.speed = True, 13.4
   return msg
 
 
@@ -637,6 +651,46 @@ class TestLateStarts(OpenpilotTestCase):
       at_steering_point = next(v for _, d, v, _ in frames if d <= NAV_TURN_STEER_DISTANCE)
       assert len(edges) <= 1 and (not edges or at_steering_point <= NAV_TURN_SPEED + 0.5), (signal_at, edges, at_steering_point)
 
+  @parameterized.expand([(1.5,), (2.0,)])
+  def test_late_signal_while_pulling_away(self, launch):
+    # stopped 20-26 m before the turn, then pulling away at 1.5-2 m/s^2 (Tesla allows 2), the driver signals 10-24 m out:
+    # below turn speed still, but openpilot still speeds the car up, and its slowdown eases that out at its jerk limit,
+    # through the actuators' delay and lag, while the car gains speed. So the turn is judged on that speed too: it starts
+    # only if the car can still be at turn speed by the steering point, else it goes straight
+    turns = 0
+    for stop in (20., 22., 24., 26.):
+      for signal_at in range(10, int(stop) - 1):
+        frames = closed_loop(controller(), stop, 13.4, 12., v0=0., accel_max=launch, delay=0.15, inputs=route, long_active=True,
+                             carstate=lambda d, v, at=signal_at: engaged_car(vEgo=v, standstill=v < 0.01, rightBlinker=d <= at))
+        edges = edge_frames(frames)
+        at_steering_point = next(v for _, d, v, _ in frames if d <= NAV_TURN_STEER_DISTANCE)
+        assert len(edges) <= 1 and (not edges or at_steering_point <= NAV_TURN_SPEED + 1.), (stop, signal_at, edges, at_steering_point)
+        turns += len(edges)
+    assert turns  # the earlier signals still turn
+
+  @parameterized.expand([(1.0,), (1.5,), (2.0,)])
+  def test_signaled_at_the_stop_then_the_gas(self, launch):
+    # as the guide asks, signaled while stopped 14-30 m before the turn; then the gas to pull away, which calls off the
+    # slowdown, let go at 3-4.9 m/s, where openpilot speeds the car on toward 30 mph. It is judged on the speed the car still
+    # gains, so it turns only where it can still be at turn speed by the steering point; without the gas it turns
+    for stop in (14., 18., 22., 26., 30.):
+      for v_release in (3., 3.5, 4., 4.5, 4.9):
+        state = {'released': False}
+
+        def gas(d, v, state=state, v_release=v_release):
+          state['released'] |= v >= v_release
+          return None if state['released'] else 2.
+
+        frames = closed_loop(controller(), stop, 13.4, 12., v0=0., accel_max=launch, delay=0.15, inputs=route, long_active=True, gas=gas,
+                             carstate=lambda d, v, state=state: engaged_car(vEgo=v, standstill=v < 0.01, rightBlinker=True,
+                                                                            gasPressed=not state['released']))
+        edges = edge_frames(frames)
+        at_steering_point = next(v for _, d, v, _ in frames if d <= NAV_TURN_STEER_DISTANCE)
+        assert len(edges) <= 1 and (not edges or at_steering_point <= NAV_TURN_SPEED + 0.5), (stop, v_release, edges, at_steering_point)
+      frames = closed_loop(controller(), stop, 13.4, 12., v0=0., accel_max=launch, delay=0.15, inputs=route, long_active=True,
+                           carstate=lambda d, v: engaged_car(vEgo=v, standstill=v < 0.01, rightBlinker=True))
+      assert len(edge_frames(frames)) == 1, stop
+
   def test_gas_with_the_blinker_on(self):
     # signaled 100 m ahead, then a second of gas 30-40 m out, which calls off the slowdown: openpilot speeds the car back
     # up, so the turn waits until it stops speeding up, and starts only if the car can still make it, else goes straight
@@ -723,13 +777,58 @@ class TestLateStarts(OpenpilotTestCase):
 
   @parameterized.expand([(26.8,), (29.1,)])
   def test_signaled_early_on_a_fast_road(self, v_set):
-    # signaled 15 s ahead at 60 or 65 mph: the slowdown needs more than the 250 m a signal latched within, so the blinker
-    # is the turn's signal from where the slowdown starts, and the car is down to turn speed in time to turn
-    frames = closed_loop(controller(), 600., v_set, 45., inputs=route, long_active=True,
+    # signaled 15 s ahead at 60 or 65 mph from the curb lane: the slowdown needs more than the 250 m a signal latched
+    # within, so there the blinker is the turn's signal from where the slowdown starts, and the car is down to turn speed in
+    # time to turn
+    frames = closed_loop(controller(), 600., v_set, 45., inputs=route, long_active=True, outer_lanes=(False, True),
                          carstate=lambda d, v: car_state(vEgo=v, rightBlinker=d <= 15. * v_set))
     edges = edge_frames(frames)
     assert len(edges) == 1 and edges[0][1] > NAV_TURN_STEER_DISTANCE
     assert next(v for _, d, v, _ in frames if d <= NAV_TURN_STEER_DISTANCE) <= NAV_TURN_SPEED + 0.5
+
+  @parameterized.expand([(24.6, 4.), (26.8, 4.), (29.1, 4.), (29.1, 2.)])
+  def test_lane_change_toward_the_turn_on_a_fast_road(self, v_set, seconds):
+    # at 55-65 mph, a lane change toward the turn's side 380-500 m before it, from a lane that is not the curb lane: there
+    # the blinker is a lane change, not yet the turn's signal, so the car neither slows nor alerts for it, and the nudge
+    # changes lanes. In the curb lane, from where the slowdown starts, it would be the turn's signal
+    for start_at in (380., 450., 500.):
+      dh = desire_helper()
+      frames = closed_loop(dh, 600., v_set, 600. / v_set - 10., inputs=route, long_active=True, lane_change_prob=lambda d, s=start_at: float(d > s - 60.),
+                           carstate=lambda d, v, s=start_at: car_state(vEgo=v, rightBlinker=s >= d > s - seconds * v_set,
+                                                                        **(nudge() if s >= d > s - 1. * v_set else {})))
+      assert any(desire == log.Desire.laneChangeRight for desire, *_ in frames), start_at
+      assert all(limit == 0. and v >= v_set - 0.1 for _, d, v, limit in frames), start_at
+      assert not dh.nav_desire.called_off and not dh.nav_desire.route_turn_signal
+
+  def test_automatic_turn_keeps_slowing_through_a_far_lane_change(self):
+    # with automatic turns on at 65 mph, the slowdown already runs when a lane change toward the turn's side 400 m out,
+    # from the middle lane into the curb lane, puts the blinker on: it keeps slowing through it, and the automatic turn
+    # comes at turning speed
+    frames = closed_loop(controller(turns=False, auto=True), 700., 29.1, 60., inputs=lambda distance, **kw: auto_route(
+      distance=distance, outer_lanes=(False, distance <= 360.)), carstate=lambda d, v: car_state(vEgo=v, rightBlinker=400. >= d > 360.))
+    limits = [limit for _, d, _, limit in frames if 400. >= d > 360.]
+    assert limits and all(0. < limit <= turn_speed_limit(d) + 1e-6 for _, d, _, limit in frames if 400. >= d > 360.)
+    edges = edge_frames(frames)
+    assert len(edges) == 1 and next(v for _, d, v, _ in frames if d <= NAV_TURN_STEER_DISTANCE) <= NAV_TURN_SPEED + 0.5
+
+  @parameterized.expand([((False, True),), ((False, False),)])
+  def test_gas_after_an_early_signal(self, outer_lanes):
+    # signaled at 65 mph 500 m before the turn, from the curb lane, where the slowdown starts, or from another lane, then the
+    # gas 430-410 m out with the blinker still on: that calls the slowdown off, and it stays off, also within the signal
+    # distance, where the blinker from another lane latches only then. Only signaling again brings it back: the blinker
+    # never went off
+    c = controller()
+    lanes = {'long_active': True, 'outer_lanes': outer_lanes}
+    drive_limits(c, 530., 29.1, 30. / 29.1, inputs=route, carstate=car_state(vEgo=29.1), **lanes)
+    signaled = drive_limits(c, 500., 29.1, 70. / 29.1, inputs=route, carstate=car_state(vEgo=29.1, rightBlinker=True), **lanes)
+    gas = drive_limits(c, 430., 29.1, 20. / 29.1, inputs=route, carstate=car_state(vEgo=29.1, rightBlinker=True, gasPressed=True),
+                       outer_lanes=outer_lanes)
+    after = drive_limits(c, 410., 29.1, 400. / 29.1, inputs=route, carstate=car_state(vEgo=29.1, rightBlinker=True), **lanes)
+    assert all((limit > 0.) == outer_lanes[1] for limit, _ in signaled) and c.called_off and c.route_turn_signal
+    assert all(limit == 0. for limit, _ in gas + after) and after[-1][1] < 15.
+    again = drive_limits(c, 10., 4.5, 0.2, inputs=route, carstate=car_state(vEgo=4.5), **lanes)
+    again += drive_limits(c, 9., 4.5, 0.5, inputs=route, carstate=car_state(vEgo=4.5, rightBlinker=True), **lanes)
+    assert again[-1][0] > 0. and not c.called_off  # off and on again: signaled for it, so it brings the slowdown back
 
   def test_far_lane_change_blinker_keeps_a_call_off(self):
     # at 65 mph the turn's blinker latches from 530 m, where the slowdown starts. The gas called the automatic turn off at
@@ -821,20 +920,24 @@ class TestKeepAlive(OpenpilotTestCase):
       c.update(car(vEgo=0., standstill=True, **blinker), True, NavInputs())
       assert c.turn_direction == TurnDirection.turnRight or c.gap <= NAV_INSTRUCTION_GRACE
 
-  @parameterized.expand([(0.3, False), (0.45, False), (0.3, True)])
-  def test_inching_through_the_turn(self, v_inch, brake):
+  @parameterized.expand([(0.3, False, 'right'), (0.45, False, 'right'), (0.3, True, 'right'), (0.3, False, 'left'), (0.45, True, 'left')])
+  def test_inching_through_the_turn(self, v_inch, brake, modifier):
     # pedestrians in the side street's crosswalk: the car inches through the first 45 deg of the turn below 0.5 m/s, then
     # waits there. Its heading counts at a creep too, so no turn command goes out once it has turned 25 deg in, with
-    # steering held, nor after a brake (steering off) and re-engaging stopped
+    # steering held, nor after a brake (steering off) and re-engaging stopped. A left turn may still pulse again at a crawl
+    # within 5 m of its point, so there only the heading holds it back
     c = controller()
-    blinker = {'rightBlinker': True}
-    frames = drive(c, 40., 4.5, 32. / 4.5, inputs=route, carstate=car_state(vEgo=4.5, **blinker))  # the pulse at 21.5 m
+    left = modifier == 'left'
+    blinker = {'leftBlinker': left, 'rightBlinker': not left}
+    frames = drive(c, 40., 4.5, 32. / 4.5, inputs=route, modifier=modifier, carstate=car_state(vEgo=4.5, **blinker))  # the pulse at 21.5 m
     seconds = 6. / v_inch
-    frames += drive(c, 8., v_inch, seconds, inputs=route, carstate=car_state(vEgo=v_inch, **blinker), yaw_rate=-math.radians(45.) / seconds)
+    frames += drive(c, 8., v_inch, seconds, inputs=route, modifier=modifier, carstate=car_state(vEgo=v_inch, **blinker),
+                    yaw_rate=math.radians(45. if left else -45.) / seconds)
+    assert c.turned > NAV_TURN_LINED_UP
     stopped = car_state(vEgo=0., standstill=True, **blinker)
     if brake:
-      frames += drive(c, 2., 0., 2., inputs=route, carstate=stopped, lateral_active=False)
-    frames += drive(c, 2., 0., 8., inputs=route, carstate=stopped)
+      frames += drive(c, 2., 0., 2., inputs=route, modifier=modifier, carstate=stopped, lateral_active=False)
+    frames += drive(c, 2., 0., 8., inputs=route, modifier=modifier, carstate=stopped)
 
     def heading(d):  # deg into the turn d m before the maneuver point
       return 45. * min(max(8. - d, 0.), 6.) / 6.
@@ -892,6 +995,67 @@ class TestKeepAlive(OpenpilotTestCase):
       assert not c.tracker.passed
     frames = approach + waiting + drive(c, 10., 3., 2., inputs=route, carstate=car_state(vEgo=3., **blinker))
     assert len(pulses(waiting, before=approach[-1][0])) >= 14 and in_history(frames, NAV_TURN_STEER_DISTANCE)
+
+  def test_red_light_wait_while_the_gps_wanders_to_the_end(self):
+    # as above, but the GPS still wanders as the light turns green, its last readings 2 m past the corner, and the car
+    # creeps away at 1 m/s: what navd said while the car stood still never counts, so the turn is neither passed nor
+    # dropped early, and the model still has it as the car comes up to the corner
+    c = controller()
+    blinker = {'rightBlinker': True}
+    approach = drive(c, 40., 5., 6., inputs=route, carstate=car_state(vEgo=5., **blinker))  # the pulse at 23 m, to 10 m
+    stopped, waiting = car_state(vEgo=0., standstill=True, **blinker), []
+    for reported in [10., 14., 6., -2., -2., 12., 4., 16.] * 7 + [12., 4., -2., -2.]:  # navd once a second
+      message = route(distance=reported)
+      for _ in range(round(1. / DT_MDL)):
+        c.update(stopped, True, message)
+        waiting.append((c.turn_direction, 10.))
+    frames, d = approach + waiting, 10.
+    for i in range(round(9. / DT_MDL)):  # still reading 2 m past the corner for its first second
+      c.update(car_state(vEgo=1., **blinker), True, message if i < round(1. / DT_MDL) else route(distance=d))
+      frames.append((c.turn_direction, d))
+      assert not c.tracker.passed or d < 1., d
+      d -= 1. * DT_MDL
+    assert in_history(frames, 5.)
+
+  @parameterized.expand([(False,), (True,)])
+  def test_red_light_wait_after_a_gps_pull_in(self, brake):
+    # the turn pulsed at 23 m; as the car brakes for its red light, the GPS reads 7 m ahead from 24 m to 15 m out, which
+    # pulls the started turn's distance in, then right again before the car stops at its line 10.6 m out. Standing still,
+    # the distance stays where the GPS error left it, under 5 m, while navd puts the car back where it is: so what navd
+    # lately pulled in is taken back for the keep-alive, and the turn stays in the model's history for the whole wait. Also
+    # when the driver braked (steering off on this Tesla) and re-engages at the line with the blinker still on
+    c = controller()
+    blinker = {'rightBlinker': True}
+    frames, d, v, message = [], 40., 5., None
+    for i in range(round(15. / DT_MDL)):
+      v = 5. if d > 20. else max(v - 25. / 19. * DT_MDL, 0.)  # braking from 20 m to the line
+      if i % round(1. / DT_MDL) == 0:
+        message = route(distance=d - (7. if 15. < d <= 24. else 0.))
+      c.update(car_state(vEgo=v, standstill=v == 0., **blinker), not (brake and d <= 20.), message)
+      frames.append((c.turn_direction, d))
+      d -= v * DT_MDL
+      if v == 0.:
+        break
+    assert d > NAV_TURN_NEAR_CRAWL_DISTANCE + 5. and c.tracker.nearest < NAV_TURN_NEAR_CRAWL_DISTANCE
+    waiting = drive(c, d, 0., 12., inputs=route, carstate=car_state(vEgo=0., standstill=True, **blinker))
+    outputs = [f[0] for f in frames + waiting]
+    rises = [i for i, (out, prev) in enumerate(zip(outputs, [None, *outputs[:-1]], strict=True)) if out in TURN_DIRECTIONS and out != prev]
+    # the model's history holds a turn pulse at every moment of the wait
+    assert len(rises) >= 3 and all(i - max(r for r in rises if r <= i) < round(5. / DT_MDL) for i in range(len(frames), len(outputs)))
+
+  def test_no_keep_alive_inside_with_the_gps_behind(self):
+    # the turn pulsed at the stop line, 6 m out; the car then creeps on into the intersection behind a car, to 3 m, while
+    # the GPS reads 8 m behind it. navd's longer distance never pulled the turn's distance in, so it takes nothing back:
+    # from inside the intersection the turn gets no fresh pulse
+    c = controller()
+    blinker = {'rightBlinker': True}
+
+    def behind(distance, **kwargs):
+      return route(distance=distance + 8.)
+    frames = drive(c, 6., 0., 1., inputs=route, carstate=car_state(vEgo=0., standstill=True, **blinker))
+    frames += drive(c, 6., 0.5, 6., inputs=behind, carstate=car_state(vEgo=0.5, **blinker))
+    frames += drive(c, 3., 0., 12., inputs=behind, carstate=car_state(vEgo=0., standstill=True, **blinker))
+    assert pulses(frames) == [6.] and c.tracker.residual > NAV_PUSH_DEADBAND
 
   def test_no_keep_alive_inside_the_intersection(self):
     # the turn pulsed at the stop line, 6 m out; the car then creeps on into the intersection behind a car, still lined up:
@@ -1021,6 +1185,34 @@ class TestAutoTurns(OpenpilotTestCase):
     edges = pulses(frames)
     assert len(edges) == 1 and NAV_TURN_STEER_DISTANCE < edges[0] <= ended - 4.5 * OUTER_LANE_TIME + 1e-6
 
+  @parameterized.expand([(60.,), (45.,), (35.,)])
+  def test_blinker_switched_off_calls_the_turn_off(self, off_at):
+    # with automatic turns on, signaled for the right turn 70 m out from the curb lane, then the blinker switched off again
+    # (a cyclist, a blocked street, a change of mind): that calls the turn off, its automatic start too, as the guide says.
+    # The car still slows for it, as for every route turn, and signaling again brings the turn back
+    for again in (False, True):
+      c, frames, d = controller(auto=True), [], 120.
+      for _ in range(round(100. / 5. / DT_MDL)):
+        blinker = 70. >= d > off_at or (again and d <= 30.)
+        c.update(car_state(vEgo=5., rightBlinker=blinker), True, auto_route(distance=d))
+        frames.append((c.turn_direction, d, c.speed_limit))
+        d -= 5. * DT_MDL
+      edges = pulses(frames)
+      assert all(limit > 0. for _, d, limit in frames if 0. < d <= 60.)
+      assert len(edges) == int(again) and (not again or (c.turn_by_blinker and edges[0] <= 30.)), (off_at, again, edges)
+
+  def test_blinker_switched_off_after_a_lane_change(self):
+    # signaled for the turn and nudged into the curb lane, the blinker kept on after the lane change: switched off by hand
+    # 3 s after it ended, that is the driver calling the turn off, not the car cancelling the signal as a lane change ends
+    c = controller(auto=True)
+    frames = []
+    for i in range(round(14. / DT_MDL)):
+      d = 80. - 4.5 * DT_MDL * i
+      c.update(car_state(vEgo=4.5, rightBlinker=80. >= d > 60. - 3 * 4.5), True, auto_route(distance=d, outer_lanes=(False, d <= 60.)),
+               lane_changing=70. >= d > 60.)
+      frames.append((c.turn_direction, d))
+    assert not pulses(frames) and c.speed_limit > 0.
+
   @parameterized.expand([
     ('auto turns off', {}, {}, False),
     ("gas pressed, or the car's own cruise control", {}, {'long_active': False}, True),
@@ -1108,6 +1300,17 @@ class TestAutoTurns(OpenpilotTestCase):
       c.update(car(vEgo=5.), True, auto_nav(distance=1.5))
       frames.append((c.turn_direction, 1.5))
     assert not pulses(frames) and c.speed_limit == 0.
+
+  def test_re_engaging_with_the_blinker_on(self):
+    # with automatic turns on, signaled for the turn 70 m out, then the brake 50-40 m out: on this Tesla steering and speed
+    # control go off, which calls the turn off. Re-engaged with the blinker still on, the blinker latches again, and brings
+    # the turn and its slowdown back, which only a gas pressed with the blinker on would not
+    c = controller(auto=True)
+    signaled = drive_limits(c, 70., 5., 4., carstate=car_state(vEgo=5., rightBlinker=True))
+    braked = drive_limits(c, 50., 5., 2., carstate=car_state(vEgo=5., rightBlinker=True), lateral_active=False, long_active=False)
+    assert all(limit > 0. for limit, _ in signaled) and c.called_off and all(limit == 0. for limit, _ in braked[1:])
+    frames = drive(c, 40., 5., 5., inputs=auto_nav, carstate=car_state(vEgo=5., rightBlinker=True))
+    assert not c.called_off and c.speed_limit > 0. and len(pulses(frames)) == 1 and c.turn_by_blinker
 
   def test_re_engaging_at_a_stop_with_the_blinker_on(self):
     c = controller()
@@ -1287,6 +1490,22 @@ class TestNavSpeedLimit(OpenpilotTestCase):
     frames = closed_loop(c, 150., 13.4, 40., inputs=lambda distance, **kw: auto_route(distance=distance - (20. if distance <= 18. else 0.)))
     assert len(pulses(frames)) == 1 and all(limit == NAV_TURN_SPEED for _, d, _, limit in frames if -15. <= d <= 0.)
 
+  @parameterized.expand([('the gas before the corner', 12., {'gasPressed': True}, 0.), ('the gas close to it', 4., {'gasPressed': True}, 0.),
+                         ('the other blinker before the corner', 10., {'leftBlinker': True, 'rightBlinker': False}, 0.),
+                         ('the gas past the corner', -2., {'gasPressed': True}, NAV_TURN_SPEED)])
+  def test_hold_of_a_turn_that_never_started(self, _name, at, fields, held):
+    # signaled, but a cyclist in the blind spot holds the turn back to the end: the car goes straight, at turn speed to 20 m
+    # past the corner. Half a second of the gas, or of the other blinker, before the corner ends that hold for good, and the
+    # car speeds up again; past the corner the gas overrides it only while pressed
+    c = controller()
+    held_back = {'rightBlinker': True, 'rightBlindspot': True}
+    drive_limits(c, 60., 4.5, (60. - at) / 4.5, inputs=route, long_active=True, carstate=car_state(vEgo=4.5, **held_back))
+    assert not c.started and c.speed_limit == NAV_TURN_SPEED
+    drive_limits(c, at, 4.5, 0.5, inputs=route, long_active='gasPressed' not in fields, carstate=car_state(vEgo=4.5, **(held_back | fields)))
+    after_fields = held_back if 'gasPressed' in fields else {'rightBlindspot': True}  # the other blinker, then none
+    after = drive_limits(c, at - 2.25, 4.5, 2., inputs=route, long_active=True, carstate=car_state(vEgo=4.5, **after_fields))
+    assert all(limit == held for limit, _ in after)
+
   def test_hold_outlasts_navd_moving_on(self):
     c = controller(auto=True)
     drive_limits(c, 30., NAV_TURN_SPEED, 40. / NAV_TURN_SPEED, position=1100.)  # to 10 m past the turn
@@ -1405,6 +1624,36 @@ class TestDesireHelperNavigation(OpenpilotTestCase):
       dh.update(car(vEgo=9.2, rightBlinker=True), True, 1.0, False, False, NavInputs())
       assert dh.lane_change_state != LaneChangeState.laneChangeStarting
     assert all(desire != log.Desire.laneChangeRight for desire, _ in frames)
+
+  @parameterized.expand([(mode, mph, modifier) for mode in (AutoLaneChangeMode.NUDGELESS, AutoLaneChangeMode.ONE_SECOND)
+                         for mph in (45, 50, 55) for modifier in ('right', 'left')])
+  def test_early_signal_never_starts_a_nudgeless_lane_change(self, mode, mph, modifier):
+    # on a fast road the guide asks for the signal about 15 s ahead from the lane the car will turn from, often farther out
+    # than it latches as the turn's signal: it never starts an automatic lane change there, also from 400 m, and the turn
+    # comes once
+    v_set, left = mph * 0.44704, modifier == 'left'
+    for signal_at in (400., 15. * v_set):
+      dh = desire_helper(lane_change=mode)
+      frames = closed_loop(dh, 500., v_set, 60., inputs=route, long_active=True, modifier=modifier,
+                           outer_lanes=(left, not left), carstate=lambda d, v, at=signal_at: car_state(vEgo=v, leftBlinker=left and d <= at,
+                                                                                                    rightBlinker=not left and d <= at))
+      assert not any(desire in (log.Desire.laneChangeLeft, log.Desire.laneChangeRight) for desire, *_ in frames), signal_at
+      edges = edge_frames(frames)
+      assert len(edges) == 1 and edges[0][0] == (log.Desire.turnLeft if left else log.Desire.turnRight), signal_at
+      assert next(v for _, d, v, _ in frames if d <= NAV_TURN_STEER_DISTANCE) <= NAV_TURN_SPEED + 0.5
+
+  def test_far_blinker_toward_the_turn_needs_a_nudge(self):
+    # at 50 mph from a middle lane, a blinker toward the route's turn 350 m before it is not yet its signal, but may be the
+    # early signal the guide asks for: no automatic lane change, though a nudge still changes lanes. One the other way, or
+    # toward the turn much farther out, changes lanes as set
+    v = 22.4
+    for blinker, start, nudged, changes in ((True, 350., False, False), (True, 350., True, True), (False, 350., False, True),
+                                            (True, 600., False, True)):
+      dh = desire_helper(lane_change=AutoLaneChangeMode.NUDGELESS)
+      frames = drive(dh, start, v, 2., inputs=route, carstate=car_state(vEgo=v, rightBlinker=blinker, leftBlinker=not blinker,
+                                                                        **(nudge(right=blinker) if nudged else {})))
+      assert any(desire in (log.Desire.laneChangeLeft, log.Desire.laneChangeRight) for desire, _ in frames) == changes, (blinker, start, nudged)
+      assert not dh.nav_desire.route_turn_signal and dh.nav_desire.speed_limit == 0.
 
   def test_nudge_changes_lanes_before_the_turn(self):
     dh = desire_helper()

@@ -28,6 +28,10 @@ REACHED_DISTANCE = 15.  # m before the maneuver point
 REACHED_TIME = 1.5  # s at the car's speed, so that a 1 Hz fix lands within it
 HEADING_MIN_SPEED = 2.  # m/s; slower, the GPS bearing is noise, so the step waits
 HEADING_TOLERANCE = 45.  # deg
+# The receiver's course comes from its velocity, so its error grows as the car slows: in slow traffic it alone can look like
+# heading off the road. Where it would start a decision, a course must also be off, or turned, by this many times the
+# course accuracy the receiver reports. One that doesn't rate its course (0, or 180 from qcomgpsd) is taken at its word.
+COURSE_ACCURACY = 2.5
 
 # At a split the old road goes on straight beside the route's branch at first: an exit, a fork, or a turn within the heading
 # tolerance, which a car going straight on would pass. Past it, the car is on whichever road it is clearly closer to. Moving
@@ -44,6 +48,16 @@ DIRECTION_LENGTH = 20.  # m of road a direction at a maneuver is measured over
 # going straight on stays as close to the route ahead as one that took the turn
 BESIDE_DISTANCE = (SPLIT_MARGIN, REROUTE_DISTANCE)  # m from the old road's straight continuation
 BESIDE_SPACING = 2.  # m between the spots of the route ahead that are checked
+# A car in the old road's curb lane is no farther from a road 10-25 m beside it than from its own road's line, so distances
+# neither tell that it stayed nor keep a GPS error from moving it onto the new road. Its course does, which a position error
+# doesn't move: such a turn is taken only by a car whose course turned toward the new road near the maneuver point, and it is
+# missed once the car is past that without having turned.
+BESIDE_TURNED = 15.  # deg off the old road's bearing toward the new road, at least, and at most half the turn
+BESIDE_WINDOW = (-40., 20.)  # m to the maneuver point, negative past it, where the course counts
+# Past the end of the old road's straight continuation the distance to it grows on either road. Where the route ahead still
+# runs beside it there, nothing tells the two roads apart any longer, and a split still undecided is missed. A route ahead
+# that goes straight on along it is the old road itself, and one that has gone its own way is far from it.
+ALONG_DISTANCE = 4.  # m from the end of the old road's continuation, at most, for the route ahead to go straight on along it
 
 # navd samples once a second, and at highway speed a short step is driven past between two fixes
 REPLAY_SPACING = 2.  # m between the spots checked along the straight line from the previous fix
@@ -63,6 +77,12 @@ LEAVING_FIXES = 2  # consecutive
 BACK_COURSE = 6.  # deg off the step's direction, at most
 BACK_OFFSET = 4.  # m from the offset it had before it moved away, at most: a lane change and some GPS error
 BACK_FIXES = 2  # consecutive
+# Where a mapped median ends, the carriageway's own line rejoins the road's over a few tens of meters: for a fix or two the
+# step's nearest segment heads off the course of a car that stays in its lane, and moves away from it. Such a car keeps to
+# the route's direction both behind its spot on the step and ahead of it, while one going off along another road is off
+# one of the two, whether the route goes on straight, bends away from it, or bends toward it farther on.
+ROUTE_DIRECTION_SPAN = (10., 40.)  # m behind and ahead of the car's spot on the step the route's direction is measured over
+ROUTE_DIRECTION_MIN = 5.  # m between the ends of the step's line there, at least, for a direction: none near the step's ends
 
 # Mapbox lane indications as navInstruction lane directions
 LANE_DIRECTIONS = {'sharp left': 'left', 'left': 'left', 'slight left': 'slightLeft', 'straight': 'straight',
@@ -107,10 +127,24 @@ class RouteAhead:
   split: bool  # the old road goes on straight beside the route's branch at first
   maneuver: np.ndarray  # (longitude, latitude) of the maneuver point
   continuation: np.ndarray  # east/north meters from the maneuver point to the end of the old road's straight continuation
+  turned: float | None = None  # deg the car's course turns toward the branch on a split decided by it (BESIDE_TURNED)
+  old_bearing: float = 0.  # deg of the old road at the maneuver point
+  side: float = 0.  # 1 for a turn to the right, -1 to the left
+  ends_beside: bool = False  # the route ahead still runs beside the old road where its straight continuation ends
 
   def continuation_distance(self, position) -> float:
     """m from a (longitude, latitude) position to the old road's straight continuation."""
     return nearest_segment(np.zeros((1, 2)), self.continuation[None], local_meters(position, self.maneuver))[2]
+
+  def past_continuation(self, position) -> bool:
+    """Whether a (longitude, latitude) position is past the end of the old road's straight continuation."""
+    c = self.continuation
+    return bool(c @ c > 1e-6 and local_meters(position, self.maneuver) @ c >= c @ c)
+
+  def apart_at_continuation_end(self) -> float:
+    """m from the end of the old road's straight continuation to the route ahead."""
+    local = local_meters(self.path, self.maneuver)
+    return nearest_segment(local[:-1], local[1:], self.continuation)[2]
 
   def comes_back_beside(self) -> bool:
     """Whether the route ahead, past its first DIRECTION_LENGTH, runs BESIDE_DISTANCE from the old road's straight
@@ -142,6 +176,7 @@ class RouteEngine:
 
     self.last_position = None  # (longitude, latitude)
     self.last_bearing = None
+    self.last_bearing_accuracy = 0.  # deg the receiver reports for its course, 0 when it reports none
     self.last_speed = 0.  # m/s
     self.fix_time = None  # monotonic s the last fix was published
 
@@ -163,6 +198,7 @@ class RouteEngine:
     """Forget the car's progress, for a new route or none."""
     self.missed_maneuver = False  # the car went past the maneuver point without taking it
     self.reached = False  # the car came up to the current step's maneuver point
+    self.turned_in = False  # the car's course turned toward the current step's split decided by it (BESIDE_TURNED)
     self.previous_position = None  # the last fix the steps were followed at
     self.wrong_heading_fixes = 0  # consecutive fixes heading away from the step's direction, far from its maneuver
     self.arrived = False  # the car came near the destination on the route's last road: navigation ends once it leaves
@@ -187,6 +223,7 @@ class RouteEngine:
     if source is not None:
       gps = self.sm[source]
       self.last_position, self.last_bearing, self.last_speed = (gps.longitude, gps.latitude), gps.bearingDeg, gps.speed
+      self.last_bearing_accuracy = gps.bearingAccuracyDeg
       self.fix_time = self.sm.logMonoTime[source] * 1e-9
     # without a fresh fix the distance to the maneuver is frozen, so the instruction is not valid for steering on
     self.gps_ok = source is not None
@@ -305,7 +342,7 @@ class RouteEngine:
     course_off = angle_between(self.last_bearing, direction)
     course_counts = self.last_speed >= WRONG_HEADING_SPEED and distance_to_maneuver > WRONG_HEADING_DISTANCE
     self.wrong_heading_fixes = self.wrong_heading_fixes + 1 if course_counts and course_off > HEADING_TOLERANCE else 0
-    self.follow_leaving(off_route, course_off, course_counts)
+    self.follow_leaving(along, off_route, course_off, course_counts)
     msg.valid = not self.missed_maneuver and not self.wrong_way and not self.left_route and off_route <= REROUTE_DISTANCE
 
     # Banner instructions are for the following maneuver step, don't use empty last step
@@ -337,11 +374,15 @@ class RouteEngine:
     elif not road_ahead and distance_to_maneuver < -MANEUVER_TRANSITION_THRESHOLD and self.step_idx + 1 < len(self.route):
       self.next_step()
 
-  def follow_leaving(self, offset: float, course_off: float, course_counts: bool) -> None:
-    """Whether the car went off along another road: heading LEAVING_COURSE off the step's direction and moving away from it,
-    fix after fix, while its course counts. Back along the step about where it was before, it is on the route again."""
+  def follow_leaving(self, along: float, offset: float, course_off: float, course_counts: bool) -> None:
+    """Whether the car went off along another road: heading LEAVING_COURSE off the step's direction there and along the route
+    behind or ahead of it, and moving away from the step, fix after fix, while its course counts. The first of those fixes
+    must be off by more than a poor course's own error, too: a car taking another road keeps heading off it, while an error
+    rarely goes that far and then stays off. Back along the step about where it was before, it is on the route again."""
     previous, self.previous_offset = self.previous_offset, offset
-    moving_away = course_counts and course_off > LEAVING_COURSE and offset - previous >= LEAVING_GROWTH
+    threshold = LEAVING_COURSE if self.leaving_fixes else self.course_threshold(LEAVING_COURSE)
+    moving_away = (course_counts and course_off > threshold and offset - previous >= LEAVING_GROWTH and
+                   not self.keeps_route_direction(along, threshold))
     if moving_away and self.leaving_fixes == 0:
       self.offset_before = previous
     self.leaving_fixes = self.leaving_fixes + 1 if moving_away else 0
@@ -351,6 +392,24 @@ class RouteEngine:
       back = course_off <= BACK_COURSE and abs(offset - self.offset_before) <= BACK_OFFSET
       self.back_fixes = self.back_fixes + 1 if back else 0
       self.left_route = self.back_fixes < BACK_FIXES
+
+  def keeps_route_direction(self, along: float, tolerance: float) -> bool:
+    """Whether the car's course is within tolerance of the step's direction both behind its spot on the step and ahead of it,
+    each the chord over ROUTE_DIRECTION_SPAN of the step: the step's line moved sideways under the car, not the car off it."""
+    assert self.route_geometry is not None and self.step_idx is not None
+    path = self.route_geometry[self.step_idx]
+    length = float(cumulative_distance(path)[-1])
+    near, far = ROUTE_DIRECTION_SPAN
+    for start, end in ((along - far, along - near), (along + near, along + far)):
+      chord = local_meters(point_along(path, float(np.clip(end, 0., length))), point_along(path, float(np.clip(start, 0., length))))
+      if np.linalg.norm(chord) < ROUTE_DIRECTION_MIN or angle_between(self.last_bearing, bearing(*chord)) > tolerance:
+        return False
+    return True
+
+  def course_threshold(self, angle: float) -> float:
+    """An angle the course must be off, or turned, by: wider for a course the receiver rates as poor (COURSE_ACCURACY)."""
+    accuracy = self.last_bearing_accuracy
+    return max(angle, COURSE_ACCURACY * accuracy) if 0. < accuracy < 180. else angle
 
   def near_end(self) -> bool:
     """Whether the car is within REROUTE_DISTANCE of the destination, or of the route's end, where Mapbox put it on the road."""
@@ -369,7 +428,7 @@ class RouteEngine:
   def next_step(self) -> None:
     assert self.step_idx is not None
     self.step_idx += 1
-    self.reached = False
+    self.reached = self.turned_in = False
     self.recompute_hold = 0
     self.reset_leaving()
 
@@ -395,10 +454,22 @@ class RouteEngine:
           self.reached = self.route[self.step_idx]['distance'] - along <= max(REACHED_DISTANCE, self.last_speed * REACHED_TIME)
         if not at_fix and self.route_ahead(self.step_idx).split:
           break
+        if at_fix:
+          self.follow_turn_in(spot)
         if not self.took_maneuver(spot):
           break
         self.next_step()
     self.previous_position = position
+
+  def follow_turn_in(self, position) -> None:
+    """Whether the car's course, at a fix, turned toward the branch of a split decided by it, near the maneuver point."""
+    assert self.route is not None and self.route_geometry is not None and self.step_idx is not None and self.last_bearing is not None
+    ahead = self.route_ahead(self.step_idx)
+    if ahead.turned is None or self.turned_in or self.last_speed < HEADING_MIN_SPEED:
+      return
+    distance_to_maneuver = self.route[self.step_idx]['distance'] - project_onto_path(self.route_geometry[self.step_idx], position, extend=True)[0]
+    turned = ((self.last_bearing - ahead.old_bearing + 180.) % 360. - 180.) * ahead.side
+    self.turned_in = BESIDE_WINDOW[0] <= distance_to_maneuver <= BESIDE_WINDOW[1] and turned >= self.course_threshold(ahead.turned)
 
   def route_ahead(self, idx: int) -> RouteAhead:
     """The route after step idx's maneuver, kept until the route changes."""
@@ -423,8 +494,13 @@ class RouteEngine:
       if min(np.linalg.norm(old), np.linalg.norm(new)) > 1e-3 and modifier != 'straight':
         # a maneuver straight on, or a merge, stays on the road: no other road goes on beside it
         turn = kind != 'merge' and modifier != ''
-        slight = turn and angle_between(bearing(*old), bearing(*new)) <= SPLIT_ANGLE
-        ahead.split = kind in SPLIT_TYPES or slight or (turn and ahead.comes_back_beside())
+        angle = (bearing(*new) - bearing(*old) + 180.) % 360. - 180.  # to the right of the old road's bearing
+        beside = turn and kind not in SPLIT_TYPES and ahead.comes_back_beside()
+        ahead.split = kind in SPLIT_TYPES or (turn and abs(angle) <= SPLIT_ANGLE) or beside
+        if beside:
+          ahead.turned, ahead.old_bearing, ahead.side = min(BESIDE_TURNED, abs(angle) / 2), bearing(*old), 1. if angle > 0. else -1.
+        elif ahead.split:
+          ahead.ends_beside = ALONG_DISTANCE < ahead.apart_at_continuation_end() <= BESIDE_DISTANCE[1]
       cache[idx] = ahead
     return cache[idx]
 
@@ -446,13 +522,16 @@ class RouteEngine:
   def took_maneuver(self, position) -> bool:
     """Whether the car took the current step's maneuver: it reached the maneuver point, and drives along the next step.
     Past a split it must instead be on the route and clearly closer to it than to the old road going on, measured along the
-    following steps too, as the car may be past a short next step before it is clearly apart from the old road."""
+    following steps too, as the car may be past a short next step before it is clearly apart from the old road. On a split
+    decided by the course, only once the course turned in; past where the roads can be told apart, never."""
     if not self.reached:
       return False
     ahead, along, lateral, heading = self.along_route_ahead(position)
     if not heading:
       return False
     if ahead.split:
+      if (ahead.turned is not None and not self.turned_in) or (ahead.ends_beside and ahead.past_continuation(position)):
+        return False
       return (along >= min(MANEUVER_TRANSITION_THRESHOLD, ahead.next_length / 2) and lateral <= SPLIT_NEAR and
               ahead.continuation_distance(position) - lateral >= SPLIT_MARGIN)
     return self.on_next_step(ahead, position)
@@ -462,8 +541,15 @@ class RouteEngine:
     ahead, _, lateral, heading = self.along_route_ahead(self.last_position)
     if ahead.split:
       # past a split, until the car is clearly on one road, the step stays: its maneuver is behind the car, so nothing
-      # turns or slows for it
-      return distance_to_maneuver < 0. and lateral >= SPLIT_MISSED and lateral - ahead.continuation_distance(self.last_position) >= SPLIT_MISSED_MARGIN
+      # turns or slows for it. A car whose course never turned toward a split decided by the course stayed on the old road,
+      # and one still undecided past where the two roads can be told apart has gone past it as far as navd can tell.
+      if distance_to_maneuver >= 0.:
+        return False
+      if ahead.turned is not None and not self.turned_in and distance_to_maneuver < BESIDE_WINDOW[0]:
+        return True
+      if ahead.ends_beside and ahead.past_continuation(self.last_position):
+        return True
+      return lateral >= SPLIT_MISSED and lateral - ahead.continuation_distance(self.last_position) >= SPLIT_MISSED_MARGIN
     # on the next step but too slow to tell its heading, it waits
     return distance_to_maneuver < -MANEUVER_TRANSITION_THRESHOLD and not (self.on_next_step(ahead, self.last_position) and heading is not False)
 

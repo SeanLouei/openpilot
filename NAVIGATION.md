@@ -7,14 +7,20 @@ by default; with them off, the car drives like plain sunnypilot.
 ## What it does
 
 - **Turns with your blinker** (*nav turn desires*): with a destination set, **signal for the route's next turn about
-  8 seconds ahead** (about 100 m / 330 ft at 30 mph). On roads faster than about 45 mph (70 km/h), **signal earlier, about
-  15 seconds or a quarter mile (400 m) ahead**, so the car has room to slow down: there, a signal 8 seconds ahead can be too
-  late, and then the turn is skipped; above about 55 mph (90 km/h) there is no turn without an early signal. About
-  3 seconds before the car starts steering into the turn, the car gives the driving model its "turn" desire, and the screen
-  shows **Turning Left / Turning Right**. It does this only if the car can still be down to turning speed by then:
-  - with alpha longitudinal, which slows the car for the turn (see below): under 20 mph (32 km/h), slow enough to get down
-    to turning speed in time, and not still speeding up above about 11 mph (18 km/h), as when it pulls away from a light.
-    Then the turn waits until the slowdown has taken hold, so a late signal while pulling away can mean no turn;
+  8 seconds ahead** (about 100 m / 330 ft at 30 mph). On roads faster than about 45 mph (70 km/h), **first move into the
+  lane you'll turn from, then signal earlier, about 15 seconds ahead** (about a quarter mile, 400 m, at 60 mph), so the car
+  has room to slow down: there, a signal 8 seconds ahead can be too late, and then the turn is skipped. Farther out than
+  about 250 m (800 ft), your blinker counts as the turn signal, and slows the car, only once the model has seen the car in
+  the outermost lane on the turn's side (the curb lane, for a right turn) for a second; from another lane it's a lane
+  change. So above about 55 mph (90 km/h), if **Slowing for Route Turn** doesn't show soon after you signal (from another
+  lane, or where the model doesn't see the curb lane, past a wide shoulder for example), slow the car yourself (lower the
+  set speed, or brake), or the turn is skipped. About 3 seconds before the car starts steering into the turn, the car gives
+  the driving model its "turn" desire, and the screen shows **Turning Left / Turning Right**. It does this only if the car
+  can still be down to turning speed by then:
+  - with alpha longitudinal, which slows the car for the turn (see below): under 20 mph (32 km/h), and slow enough to get
+    down to turning speed in time, counting the speed the car still gains while openpilot is speeding it up (pulling away
+    from a light, or after the gas): openpilot takes a moment to stop speeding up. So signal before you pull away: a signal
+    given while the car is already pulling away close to the turn often means no turn;
   - without alpha longitudinal, never while the car's own cruise control is on: it speeds back up toward its set speed
     (18 mph or more on a Tesla) as soon as the car ahead moves on, and would take the turn far too fast. With the cruise
     control off, and you driving the speed, the turn starts under about 12 mph (20 km/h) for a right turn, or 15 mph
@@ -28,21 +34,26 @@ by default; with them off, the car drives like plain sunnypilot.
 - **Waiting at a turn:** if you stop short of the turn, at a red light or waiting for a gap in traffic, the car repeats the
   desire every 4 seconds while it still faces straight ahead (for a right turn, only while it is short of the intersection),
   so the model still knows about the turn when you go. Once the car has begun turning, it doesn't repeat it. After a long
-  stop in the middle of a turn, the model may have forgotten the turn, so be ready to steer the rest yourself. An automatic
-  left turn is never repeated while the car waits: see *Automatic left turns* below.
-- **Lane changes:** while your blinker is on for the route's next turn, openpilot won't start an *automatic* (nudgeless) lane
-  change, however much you slow down, until you switch the blinker off (also after a missed turn). A nudge changes lanes only
-  above 20 mph (32 km/h), as without navigation, and once you signal for a route turn with alpha longitudinal, the slowdown
-  has the car below 20 mph about 50 m (165 ft) before the turn. So move into a turn lane before you signal for the turn, or
-  steer into it yourself (on a Tesla, a firm steer turns openpilot off completely; see Tesla notes). The turn waits for a
-  lane change to end, and the slowdown keeps going through it. If you also use *Lane Turn Desire*, it stays quiet while route
-  turns are on and a route is set: the route gives the turn desires.
-- **Slowing for turns:** when openpilot controls the speed (alpha longitudinal), the car slows to about 10 mph by the turn and
-  holds that speed through it. The screen shows **Slowing for Route Turn** with a chime as it starts slowing for a turn. With
-  blinker turns, this starts once you signal for the turn. **Slowing for Route Turn** doesn't by itself mean the turn will
-  start. It brakes gently (at most about 0.15 g), so after a late signal, or for a turn right after a freeway exit, it may
-  not get down to turning speed in time. Then there is no turn: the car goes straight, at turning speed to about 20 m
-  (65 ft) past the corner; the gas overrides that only while you press it.
+  stop in the middle of a turn, the model may have forgotten the turn, so be ready to steer the rest yourself. A GPS error
+  can still end the repeating early while **Turning…** shows, so be ready to steer when you go. An automatic left turn is
+  never repeated while the car waits: see *Automatic left turns* below.
+- **Lane changes:** while your blinker is on for the route's next turn, openpilot won't start an *automatic* (nudgeless)
+  lane change, however much you slow down, until you switch the blinker off (also after a missed turn). That holds for any
+  blinker toward the turn from about 20 seconds before it, even before it counts as the turn signal; one the other way, or
+  farther out, changes lanes as you set it to. A nudge changes lanes only above 20 mph (32 km/h), as without navigation, and
+  once you signal for a route turn with alpha longitudinal, the slowdown has the car below 20 mph about 50 m (165 ft) before
+  the turn. So move into a turn lane before you signal for the turn, or steer into it yourself (on a Tesla, a firm steer
+  turns openpilot off completely; see Tesla notes). A lane change toward the turn within about 250 m (800 ft) of it counts
+  as the turn signal, and slows the car. The turn waits for a lane change to end, and the slowdown keeps going through it.
+  If you also use *Lane Turn Desire*, it stays quiet while route turns are on and a route is set: the route gives the turn
+  desires.
+- **Slowing for turns:** when openpilot controls the speed (alpha longitudinal), the car slows to about 10 mph by the turn
+  and holds that speed through it. The screen shows **Slowing for Route Turn** with a chime as it starts slowing for a turn.
+  With blinker turns, this starts once you signal for the turn. **Slowing for Route Turn** doesn't by itself mean the turn
+  will start. It brakes gently (at most about 0.15 g), so after a late signal, or for a turn right after a freeway exit, it
+  may not get down to turning speed in time. Then there is no turn: the car goes straight, at turning speed to about 20 m
+  (65 ft) past the corner. Pressing the gas before the corner ends that, and the car speeds up through the intersection;
+  past the corner, the gas overrides it only while you press it.
 - **Automatic turns** (*auto route turns (alpha)*): the car slows for **every** route turn, and turns **right** without your
   blinker (left where traffic keeps left). This needs alpha longitudinal. With it, openpilot's driving model also brakes on
   its own and tries to stop for red lights and stop signs, though not reliably. It only turns on its own when:
@@ -63,31 +74,39 @@ by default; with them off, the car drives like plain sunnypilot.
 **Calling a turn off:** do it before **Turning…** shows. How depends on the kind of turn:
 - **An automatic turn** (no blinker): press the gas, switch on the other blinker, or disengage. The turn and its slowdown
   then stay off until you signal for that turn.
-- **A turn you signaled for:** switch the blinker off, or over to the other side. The gas only ends the slowdown: the car
-  speeds up again, and if it is still slow enough near the corner, behind slower traffic for example, the turn starts
-  anyway. Disengaging calls it off only until you engage again with the blinker still on.
+- **A turn you signaled for:** switch the blinker off, or over to the other side. With automatic turns on, switching it off
+  also means the car won't take that turn by itself (it still slows for it): signal again if you want it. The gas only ends
+  the slowdown: the car speeds up again, which usually means no turn; if it is still slow enough near the corner and no
+  longer speeding up, behind slower traffic for example, the turn starts anyway. Disengaging calls it off only until you
+  engage again with the blinker still on.
 
-A signaled turn and its slowdown last only while the blinker stays on, also when the car switches it off by itself: if the
-blinker stops before **Turning…** shows, there is no turn, so signal again (with automatic turns on, the car still slows,
-and a turn it may take by itself can still start). Within the last 15 m (50 ft) before the turn the car already holds
-turning speed to about 20 m past the corner, whatever the blinker does. Once **Turning…** shows, the model has been told
-to turn, and nothing takes that back, not even switching the blinker off: steer to stop it, or brake (on a Tesla, either
-one turns openpilot off completely; see Tesla notes). With alpha longitudinal, while openpilot stays engaged, the car
-stays at turning speed through the intersection, to about 20 m past the corner; the gas overrides that only while you
-press it.
+A signaled turn and its slowdown last only while the blinker stays on: if the blinker stops before **Turning…** shows, there
+is no turn, so signal again. That includes a short signal that stops by itself after a few flashes: it counts as switching
+the blinker off. Only when the car switches the blinker off by itself as an openpilot lane change ends (within about
+2 seconds) is the turn not called off: with automatic turns on, the car still slows and a turn it may take by itself can still
+start; with blinker turns only, there is no turn until you signal again. Within the last 15 m (50 ft) before the turn the
+car already holds turning speed to about 20 m past the corner, also if the blinker goes off; switching it to the other side,
+or pressing the gas, before the corner ends that hold, and the car speeds up again. Once **Turning…** shows, the model has
+been told to turn, and nothing takes that back, not even switching the blinker off: steer to stop it, or brake (on a Tesla,
+either one turns openpilot off completely; see Tesla notes). With alpha longitudinal, while openpilot stays engaged, the car
+stays at turning speed through the intersection, to about 20 m past the corner; the gas overrides that only while you press
+it.
 
-**Missed turns:** if the car goes straight past a route turn it was slowing for, it keeps turning speed to about 20 m past the
-corner; the gas overrides that only while you press it. Nothing acts on the next turn from the wrong road: the route pauses
-until it is recalculated. The route moves on to the next turn only once the car is on the next road and heading along it.
-Past a freeway exit or fork, or a turn onto a road that soon runs right beside the one you're on (a service road, for
-example), it moves on only once the car is clearly on the new road; if you stay on the old one, nothing slows or turns for
-the new road, and the route is recalculated. A blinker left on from the last turn doesn't count for the next one: switch it
-off and on.
+**Missed turns:** if the car goes straight past a route turn it was slowing for, it keeps turning speed to about 20 m past
+the corner. Pressing the gas, or switching on the other blinker, before the corner ends that, and the car speeds up through
+the intersection; past the corner, the gas overrides it only while you press it. Nothing acts on the next turn from the
+wrong road: the route pauses until it is recalculated. The route moves on to the next turn only once the car is on the next
+road and heading along it. Past a freeway exit or fork, or a turn onto a road that soon runs right beside the one you're on
+(a service road, for example), it moves on only once the car is clearly on the new road; if you stay on the old one, nothing
+slows or turns for the new road, and the route is recalculated. A blinker left on from the last turn doesn't count for the
+next one: switch it off and on.
 
-**Leaving the route:** if the car leaves the route's road before a turn, onto a road that branches off at a shallow angle for
-example, the route's next turn stops counting as soon as the car is clearly heading away along the other road: nothing slows
-or turns for it, and the route is recalculated. A road that leaves at a very shallow angle (under about 12°), or one taken
-within about 40 m (130 ft) of the turn, can still get that turn, so watch for **Turning…** and call it off before it shows.
+**Leaving the route:** if the car leaves the route's road before a turn, onto a road that branches off at a shallow angle
+for example, the route's next turn stops counting as soon as the car is clearly heading away along the other road: nothing
+slows or turns for it, and the route is recalculated. A road that leaves at a very shallow angle (under about 12°, or
+somewhat more in slow traffic when the GPS reports a poor heading), or one taken within about 40 m (130 ft) of the turn, can
+still get that turn, so watch for **Turning…** and call it off before it shows. Where a very wide median (about 20 m across)
+ends gradually, within about 70 m (230 ft) of a turn, that turn can still be dropped and the route recalculated.
 
 **GPS:** route turns need a GPS fix. A turn that has started keeps its turn desire and its slowdown through a gap in the GPS
 (in a tunnel, for example), going by the distance driven, but without a fix the desire isn't repeated: after a stop of more
@@ -105,9 +124,10 @@ over.
 *auto left turns (alpha)* is a second, separate setting on top of *auto route turns (alpha)*. With both on, the car also
 turns **left** by itself (right where traffic keeps left), across oncoming traffic, without your blinker, but only where it
 can confirm it is in a lane for that turn. Everywhere else it slows and waits for your blinker, as without the setting,
-and asks you to signal. It is off by default, does nothing without *auto route turns* and alpha longitudinal, and can be
-switched on only while parked (on the comma 4 you can switch it off while driving). It is not restored from a sunnylink
-backup.
+and asks you to signal. It is off by default, does nothing without *auto route turns* and alpha longitudinal, and comes on
+only while the car is parked or stopped: switched on while driving (or *auto route turns* switched on while driving with
+it already set), it waits until the car next stands still. It can be switched off at any time (on the comma 4, also while
+driving). It is not restored from a sunnylink backup.
 
 **Where it turns by itself:** only from the lane right beside a raised median or curb on the left: a curbed left-turn bay,
 the lane beside a raised median, or the left lane of a one-way street. All of these must hold:
@@ -116,8 +136,8 @@ the lane beside a raised median, or the left lane of a one-way street. All of th
   blind spot, starts the 10 m again;
 - the route's lane guidance, where it has any, doesn't put the left turn in another lane;
 - it is a plain left turn: not a sharp one, and not the end of a road (a T junction, where you yield both ways);
-- the posted speed limit is known, from the car or from map data, and is 45 mph (72 km/h) or less over the last 150 m
-  (500 ft) before the turn;
+- the posted speed limit is known, from map data or the car, and is 45 mph (72 km/h) or less over the last 150 m (500 ft)
+  before the turn; where the car's own reading (a Tesla's) is higher than the map's, the higher one counts;
 - driver monitoring isn't warning;
 - the car is moving, and the turn starts at least 2 seconds before the car steers across;
 - everything an automatic right turn needs: alpha longitudinal engaged, slowed to turning speed, about 3 seconds ahead.
@@ -126,13 +146,19 @@ the lane beside a raised median, or the left lane of a one-way street. All of th
 turn lane), and anywhere one of the above isn't met.
 
 **The two alerts:**
-- **Turning Across Traffic** (*Brake for oncoming traffic*), with a chime, as an automatic left turn starts, at least
-  2 seconds before the car steers across. It shows in place of **Turning Left**, and what this guide says about
-  **Turning…** applies to it: once it shows, the model has been told to turn.
+- **Turning Across Traffic** (*Brake for oncoming traffic*), with its own chime (a different sound from the other route
+  alerts), as an automatic left turn starts, at least 2 seconds before the car steers across. It shows in place of
+  **Turning Left**, and what this guide says about **Turning…** applies to it: once it shows, the model has been told to
+  turn. It goes away once the turn is handed back to you (see *Stops*).
 - **Signal for Route Turn** (*It won't turn by itself here*), with a chime, when a left turn won't start by itself: from
-  about 5 seconds before the car would steer into the turn, or as soon as it can no longer start by itself after that, and
-  while the car waits short of it. Once it has shown, that turn waits for your blinker, even if the curb shows up after. A
-  blinker given as soon as it first shows still starts the turn on time.
+  about 5 seconds before the car would steer into the turn, or as soon as it can no longer start by itself after that (half
+  a second after a lane change into the bay ends, for example, when the curb can't be seen for long enough before the
+  turn), and while the car waits short of it. Once it has shown, that turn waits for your blinker, even if the curb shows
+  up after. Signal as soon as it shows: shown about 5 seconds ahead, a blinker then still starts the turn on time; shown
+  later, the turn starts later, and too late it doesn't.
+
+Driver monitoring's **Driver Distracted** and **Driver Unresponsive** warnings show over both alerts. sunnypilot's *Quiet
+Mode* silences their chimes, and those of the other route alerts, so with it on, watch the screen.
 
 **What it can't see:** oncoming traffic, turn arrows, red lights and stop signs; it doesn't judge gaps, and doesn't watch
 for pedestrians or cyclists. Frontage roads, channelized islands, curbed bus lanes and median U-turn openings can look like
@@ -141,13 +167,17 @@ how curbs are seen.
 
 **Stops:** if the car stops (about 3 mph or slower) within about 30 m (100 ft) of the turn before it starts, at a light, a
 stop sign or in a queue, the turn is left to you: the car keeps slowing for it, shows **Signal for Route Turn**, and turns
-once you signal. If it stops after the turn started, the turn isn't repeated while it waits, and about 5 seconds after it
-started (or was last repeated) it is handed back to you the same way. Nor is it repeated while driver monitoring warns.
+once you signal. After the turn started, it isn't repeated while the car waits or creeps (about 3 mph or slower), nor while
+driver monitoring warns, nor in the last 2 seconds before the car steers across. About 5 seconds after it started (or was
+last repeated), when the model may have forgotten it, it is handed back to you, also if the car is moving again by then:
+**Turning Across Traffic** goes away and, while your blinker can still start it again, **Signal for Route Turn** shows.
+Handed back closer to the turn than that, the car goes straight.
 
-**Calling it off:** on the approach, switching off a left blinker you had on for the turn, pressing the gas, or switching
-on the right blinker means no automatic left turn at that intersection: signal for it if you still want it. When the car
-switches the blinker off by itself as an openpilot lane change into a turn bay ends (within about 2 seconds), the turn can
-still start by itself, once the curb has been beside the car for 10 m.
+**Calling it off:** on the approach, switching off a left blinker you had on for the turn (a short signal that stops by
+itself counts too), pressing the gas, or switching on the right blinker means no automatic left turn at that intersection:
+signal for it if you still want it. When the car switches the blinker off by itself as an openpilot lane change into a
+turn bay ends (within about 2 seconds), the turn can still start by itself, once the curb has been beside the car for
+10 m.
 
 **Brake for oncoming traffic.** On a Tesla, braking turns steering off as well as speed control, also in the middle of the
 turn: then finish the turn yourself.
@@ -227,15 +257,18 @@ could join it and change your destination.
 - **Turn signal.** A blinker turn and its slowdown end if the blinker goes off before **Turning…** shows, also when it
   switches itself off, for example after a short signal that only flashes a few times, or when the car cancels the signal
   after a lane change. If that happens, signal again. Within the last 15 m (50 ft) before the turn, the car still holds
-  turning speed to about 20 m past the corner. With *auto left turns*, a left turn from a curbed bay can still start by
-  itself after the car cancels the signal at the end of a lane change into it (see *Automatic left turns*).
+  turning speed to about 20 m past the corner. With *auto route turns*, the car keeps slowing, but a short signal that
+  stops by itself counts as switching the blinker off: the car won't take that turn by itself either. Only when the car
+  cancels the signal at the end of an openpilot lane change into the curb lane, or with *auto left turns* into a curbed
+  bay, can the turn still start by itself (see *Automatic left turns*).
 
 ## First drives
 
 1. Start in an empty parking lot or on quiet streets, at low speed, hands on the wheel.
 2. With alpha longitudinal on, begin with **blinker turns only**. Set a destination around the block,
-   signal for each turn about 8 seconds ahead (about 15 seconds on roads faster than 45 mph), and check when
-   **Slowing for Route Turn** and **Turning…** appear and whether the car picks the right opening.
+   signal for each turn about 8 seconds ahead (on roads faster than 45 mph, about 15 seconds ahead, from the lane
+   you'll turn from), and check when **Slowing for Route Turn** and **Turning…** appear and whether the car picks the
+   right opening.
 3. Only after that, try **auto route turns**, still on quiet streets. Signal yourself anyway where you
    can: it's the law, and it warns pedestrians and cyclists.
 4. Only after automatic right turns work well, try **auto left turns**, on quiet streets with curbed left-turn
@@ -248,11 +281,12 @@ could join it and change your destination.
 | --- | --- |
 | Page won't load | navigation (alpha) is on; the IP is right; your phone and the comma 4 are on the same Wi-Fi network (the page doesn't answer over the comma's cellular data) |
 | "Route: waiting" | the device has internet; the car is on and has a GPS fix; a Mapbox token is saved; the car is on the route's road and heading along it, not in a parking lot beside it; after a missed turn, or after leaving the route, the new route can take up to about 10 seconds |
-| No "Turning…" | your blinker matches the turn, you switched it on after the last turn, and it stayed on; you signaled about 8 seconds ahead (about 15 seconds on roads faster than 45 mph), so the car could get down to turning speed before the corner; the car wasn't still speeding up, as when pulling away from a light; Tesla's cruise control is off (route turns don't start while it's on: use alpha longitudinal); no blind-spot warning; no lane change ending close to the corner; the car hadn't stopped inside the intersection; the turn isn't less than about 30 m after the last one; the car is still on the route's road; steering is engaged; nav turn desires is on |
-| No slowdown | alpha longitudinal is on and engaged; with blinker turns, you signaled for the turn (a blinker on since the last turn doesn't count) and the blinker is still on; you didn't press the gas or disengage on the approach; the car is still on the route's road |
+| No "Turning…" | your blinker matches the turn, you switched it on after the last turn, and it stayed on; you signaled about 8 seconds ahead (about 15 seconds on roads faster than 45 mph, from the lane you turn from), so the car could get down to turning speed before the corner; you signaled before pulling away, not while openpilot was still speeding the car up, as when pulling away from a light or after the gas; Tesla's cruise control is off (route turns don't start while it's on: use alpha longitudinal); no blind-spot warning; no lane change ending close to the corner; the car hadn't stopped inside the intersection; the turn isn't less than about 30 m after the last one; the car is still on the route's road; steering is engaged; nav turn desires is on |
+| No slowdown | alpha longitudinal is on and engaged; with blinker turns, you signaled for the turn (a blinker on since the last turn doesn't count) and the blinker is still on; farther out than about 250 m (800 ft), the car is in the curb lane on the turn's side, which the model has seen for a second (else it waits until 250 m: above about 55 mph, slow down yourself first); you didn't press the gas or disengage on the approach; the car is still on the route's road |
 | Nudge doesn't change lanes | the car is above 20 mph: once you signal for a route turn, the slowdown has it below that about 50 m before the turn, so move over before you signal |
-| Auto turn waits for the blinker | it's a left turn (those wait unless auto left turns is on: see the next row); alpha longitudinal is engaged and you didn't press the gas or disengage on the approach; the car is at 16 mph or less; no blind-spot warning; the model has seen the car in the curb lane for a full second, after any lane change |
-| Signal for Route Turn / auto left turn waits | auto route turns and auto left turns are both on; the car is in the lane right beside a raised median or curb on the left, not a painted turn lane, a center turn lane or a two-way street; the model has seen that curb for the last 10 m and 1.5 s, with no lane change and no car in the left blind spot since; the route's lane guidance doesn't put the turn in another lane; it's a plain left turn, not a sharp one or the end of a road; the posted limit is known and 45 mph or less over the last 150 m; driver monitoring isn't warning; the car didn't stop within about 30 m of the turn; you didn't switch off a left blinker, press the gas or signal right on the approach; the turn could start at least 2 seconds before the car steers across. Once **Signal for Route Turn** has shown, that turn waits for your blinker |
+| No automatic lane change toward the turn | from about 20 seconds before the route's next turn, a blinker toward it never starts an automatic (nudgeless) lane change, even before it counts as the turn signal: nudge to change lanes |
+| Auto turn waits for the blinker | it's a left turn (those wait unless auto left turns is on: see the next row); alpha longitudinal is engaged and you didn't press the gas, disengage, or switch off a blinker you had on for the turn on the approach (a short signal that stops by itself counts too); the car is at 16 mph or less; no blind-spot warning; the model has seen the car in the curb lane for a full second, after any lane change |
+| Signal for Route Turn / auto left turn waits | auto route turns and auto left turns are both on, and were on while the car last stood still; the car is in the lane right beside a raised median or curb on the left, not a painted turn lane, a center turn lane or a two-way street; the model has seen that curb for the last 10 m and 1.5 s, with no lane change and no car in the left blind spot since; the route's lane guidance doesn't put the turn in another lane; it's a plain left turn, not a sharp one or the end of a road; the posted limit is known and 45 mph or less over the last 150 m; driver monitoring isn't warning; the car didn't stop within about 30 m of the turn; you didn't switch off a left blinker, press the gas or signal right on the approach; no hazard lights; the turn could start at least 2 seconds before the car steers across, with the curb seen for the last 10 m by then. Once **Signal for Route Turn** has shown, that turn waits for your blinker; it also shows when a started left turn is handed back to you |
 | Navigation goes on after you arrived | the car came within about 25 m (80 ft) of the destination; if you stopped farther away, clear the destination on the page |
 
 ## For developers
@@ -262,12 +296,21 @@ could join it and change your destination.
   exit desires, what calls a turn off, and the route turn's speed limit, which modeld publishes as
   `modelDataV2SP.navTurnSpeed`. A turn starts only while the car can still make it and is still lined up with the approach
   (from the model's yaw rate): moving, before the steering point (8 m plus 0.3 s of travel), slow enough to reach turn
-  speed by it and, under openpilot longitudinal, not still accelerating above 5 m/s; or at a crawl, a near side turn only
-  more than 5 m short of the maneuver point. Without openpilot longitudinal, none starts while the car's own cruise is
-  engaged. On faster roads the turn signal latches from the slowdown's approach distance. A turn pulses again only to stay
-  in the model's desire history, and it pins its turn point on the odometer, so its turn speed holds to 20 m past the point
-  even once navd moves on; no other turn starts until then. While route turns are on and a route is set, the lane turn
-  desire stays quiet. `ManeuverTracker` dead reckons the distance to each maneuver and corrects it by the median of navd's
+  speed by it and, under openpilot longitudinal, both at its speed and at the speed it still gains while plannerd eases out
+  its acceleration (`v + a * (NAV_TURN_LAG + CarParams.longitudinalActuatorDelay) + a^2 / (2 * NAV_TURN_JERK)`, with
+  `NavInputs.accel` the more of `aEgo` and the commanded accel), never while that is above 5 m/s and the car accelerates;
+  or at a crawl, a near side turn only more than 5 m short of the maneuver point. Without openpilot longitudinal, none
+  starts while the car's own cruise is engaged. Beyond the signal distance (15 m + 12 s, at most 250 m) the turn's blinker
+  latches only from the outermost lane on its side (`outer_lane_time`), from the slowdown's start (with a 0.5 m/s margin on
+  the speed); with automatic turns, an unlatched blinker toward the turn keeps the slowdown going. From 20 s before the
+  turn (or its approach distance) a blinker toward it never starts a nudgeless lane change (`turn_blinker_ahead`, held by
+  `DesireHelper.ahead_blinker_side` until it goes off). The driver switching a latched blinker off before the start (not
+  within `FAR_CANCEL_TIME` of a lane change ending) sets `auto_off`, either side. A turn pulses again only to stay in the
+  model's desire history (at a crawl judged with `ManeuverTracker.taken_back`, what navd lately pulled in as far as navd's
+  distance now disagrees past the 3 m deadband, also for a re-latch), and it pins its turn point on the odometer, so its
+  turn speed holds to 20 m past the point even once navd moves on; no other turn starts until then. While route turns are
+  on and a route is set, the lane turn desire stays quiet. `ManeuverTracker` dead reckons the distance to each maneuver and
+  corrects it by the median of navd's
   last three residuals: in at up to 5 m/s, out at 1 m/s past a 3 m deadband, or out at once when navd's distance is over
   15 m longer (within 60 m of the maneuver, only by what navd pulled in lately). Once the turn started, it only comes in,
   and no turn starts while navd's distance is more than 8 m longer. A maneuver is its type, direction and distance to the
@@ -279,16 +322,23 @@ could join it and change your destination.
   logs. Progress along a step is measured on its nearest segment, so the car's offset beside the road counts for nothing,
   and the published distances count the car's travel since the fix (up to 1.5 s). The step moves on once the car has come
   within 15 m (or 1.5 s) of the maneuver point and heads along the route after it, checked every 2 m between fixes so that
-  short steps at speed are followed; past a split, only once the car is clearly on the branch, judged at a fix, never on
-  the line between two. A split is an exit or fork, a turn within 45° of the old road, or a turn whose route comes back
-  10-25 m beside the old road's straight continuation (a connector to a service road). Going past a maneuver without taking
-  it, being off the route, heading against the step far from its maneuver, going off along another road (two fixes in a row
-  more than 12° off the step's direction, each 1 m or more farther from it, while the maneuver is over 25 m ahead; back after
-  two fixes within 6° and within 4 m of the earlier offset, or on a new step), or having no fresh GPS fix makes the
-  instruction invalid, and all but no fix count toward a reroute; a missed maneuver reroutes right away. A new destination
-  gets its route at once; a reroute waits 10 s after the last request. Arrival latches within 25 m of the destination or the
-  route's end, on the route's last road step or past it; from then on there is no reroute, and once the car is more than
-  25 m from both, navigation ends: the destination is removed, unless the driver set another one meanwhile.
+  short steps at speed are followed; past a split, only once the car is clearly on the branch, judged at a fix, never on the
+  line between two. A split is an exit or fork, a turn within 45° of the old road, or a turn whose route comes back 10-25 m
+  beside the old road's straight continuation (a connector to a service road). Such a turn is decided by the car's course,
+  which a GPS position error doesn't move: it is taken only after a fix, from 20 m before to 40 m past the maneuver point,
+  whose course turned toward the new road by 15° (at most half the turn), and is missed 40 m past the point without one. Any
+  other split still undecided where the old road's 300 m straight continuation ends, with the route ahead 4–25 m from it
+  there, is missed. Going past a maneuver without taking it, being off the route, heading against the step far from its
+  maneuver, going off along another road (two fixes in a row more than 12° off the step's direction and as far off the
+  route's direction over 10–40 m behind or ahead of the car, which a map line rejoining the centerline at a median's end is
+  not, each 1 m or more farther from it, while the maneuver is over 25 m ahead; back after two fixes within 6° and within
+  4 m of the earlier offset, or on a new step), or having no fresh GPS fix makes the instruction invalid, and all but no fix
+  count toward a reroute; a missed maneuver reroutes right away. A new destination gets its route at once; a reroute waits
+  10 s after the last request. Arrival latches within 25 m of the destination or the route's end, on the route's last road
+  step or past it; from then on there is no reroute, and once the car is more than 25 m from both, navigation ends: the
+  destination is removed, unless the driver set another one meanwhile. Where the receiver rates its course
+  (`bearingAccuracyDeg` above 0 and below 180), the first leaving fix and a split's turn-in must also exceed 2.5 times that
+  accuracy.
 - `openpilot/sunnypilot/navd/navweb.py`: the destination page (process `navweb`), with no authentication: it relies on a
   private Wi-Fi network. It answers only connections that arrive at 127.0.0.1 or at `wlan0`'s current IPv4 address, so
   never over the cellular link (a machine without `wlan0` answers on every address). At most 12 connections at a time,
@@ -296,19 +346,23 @@ could join it and change your destination.
 - Automatic far side turns (`NavAutoTurnFarSide`, read only with `NavAutoTurn`): `nav_inputs` adds `far_lanes` (a
   sign-checked road edge 1.0-2.6 m beside the car with std under 0.5 m and no lane line beyond the car's own), the driver
   monitoring alert, and the posted limit from `longitudinalPlanSP.speedLimit.resolver` (`posted_speed_limit`: 0 unless seen,
-  valid, at most 0.5 s old and positive; both modelds now subscribe to `longitudinalPlanSP`, and modeld checks none of its
-  services). `NavDesireController._auto_turn_allowed` keeps the near side rule as it was; a far side turn needs `_far_gates`
+  valid, at most 0.5 s old and positive; where a recent `carStateSP.speedLimit` is higher, that one, never making an unknown
+  limit known; both modelds now subscribe to `longitudinalPlanSP` and `carStateSP`, and modeld checks none of its
+  services). The setting comes on only at a standstill, or as modeld starts with the drive (`read_params`), and goes off at
+  any time. `NavDesireController._auto_turn_allowed` keeps the near side rule as it was; a far side turn needs `_far_gates`
   (setting, openpilot longitudinal, a plain 'left' or 'right' modifier, not 'end of road', moving, 2 s or more to the
   steering point on the nearer distance, `far_turn_lane` not vetoing the outermost lane, no driver monitoring alert, the
   highest posted limit within 150 m known and at most 20.5 m/s) and the curb's run (`FAR_LANE_TIME`, `FAR_LANE_DISTANCE`,
   restarted by a lane change or that side's blind spot), through the same single start as every other turn. A stop within
-  the approach distance before the start, or the driver switching the latched blinker off (not within `FAR_CANCEL_TIME` of a
-  lane change ending), sets `auto_off`. `_may_pulse_again`, shared by keep-alives and a re-latched blinker, never pulses an
-  automatic far side turn again while the car waits at a crawl or driver monitoring warns, and `_hold_turn` releases it
-  `FAR_STOP_RELEASE` after its last pulse at a stop. `signal_prompt` asks from `FAR_SIGNAL_LEAD` before the trigger once
-  `_far_auto_possible` has been false for `FAR_PROMPT_DEBOUNCE`, or while stopped short of the turn; once shown it latches
-  for the maneuver (kept through `reset()`). modeld publishes `modelDataV2SP.navTurnAcross` (`turning` while an automatic
-  far side turn is held, `signal` for the prompt), and selfdrived raises `navTurnAcross` in place of the lane turn alert,
-  or `navTurnSignal`.
+  the approach distance before the start sets `auto_off`. `_may_pulse_again`, shared by keep-alives and a re-latched
+  blinker, never pulses an automatic far side turn again while the car waits at a crawl or driver monitoring warns, and
+  `_hold_turn` releases it `FAR_STOP_RELEASE` after its last pulse, at any speed (`handed_back`). `signal_prompt` asks from
+  `FAR_SIGNAL_LEAD` before the trigger once `_far_auto_possible` (also false with a blinker or hazards on, above
+  `AUTO_TURN_MAX_SPEED`, or when the rest of the curb's run, timed along the slowdown, cannot end `FAR_TURN_MIN_LEAD`
+  before the steering point) has been false for `FAR_PROMPT_DEBOUNCE`, while stopped short of the turn, or after a hand-back
+  on the move while the blinker could start it again as a keep-alive; once shown it latches for the maneuver (kept through
+  `reset()`). modeld publishes `modelDataV2SP.navTurnAcross` (`turning` while an automatic far side turn is held, `signal`
+  for the prompt), and selfdrived raises `navTurnAcross` in place of the lane turn alert, or `navTurnSignal`; both are low
+  priority, under driver monitoring's, and `navTurnAcross` has its own sound (`AudibleAlertSP.prompt`).
 - Params: `NavTurnDesire`, `NavAutoTurn`, `NavAutoTurnFarSide` (not backed up), `NavExitDesire`, `MapboxToken` (not logged).
   Events: `navTurnSlowing`, `navTurnAcross`, `navTurnSignal`.

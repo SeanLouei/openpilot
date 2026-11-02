@@ -213,22 +213,26 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 4.),
   },
 
-  # an automatic route turn across oncoming traffic: with no blinker, the driver's only notice before the car crosses
+  # an automatic route turn across oncoming traffic: with no blinker, the driver's only notice before the car crosses. Its
+  # sound is its own: soundd plays a sound again only when it changes, and Slowing for Route Turn may still show as it
+  # starts. Low priority: newer than the slowdown's alert, it shows over that, but never over driver monitoring's Driver
+  # Distracted and Driver Unresponsive warnings.
   EventNameSP.navTurnAcross: {
     ET.WARNING: Alert(
       "Turning Across Traffic",
       "Brake for oncoming traffic",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.MID, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 1.),
+      Priority.LOW, VisualAlert.none, AudibleAlertSP.prompt, 1.),
   },
 
-  # a route turn across oncoming traffic that will not start, or go on, by itself: it waits for the blinker
+  # a route turn across oncoming traffic that will not start, or go on, by itself: it waits for the blinker. Low priority, as
+  # Turning Across Traffic
   EventNameSP.navTurnSignal: {
     ET.WARNING: Alert(
       "Signal for Route Turn",
       "It won't turn by itself here",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.MID, VisualAlert.none, AudibleAlertSP.promptSingleLow, 1.),
+      Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleLow, 1.),
   },
 
   EventNameSP.speedLimitActive: {

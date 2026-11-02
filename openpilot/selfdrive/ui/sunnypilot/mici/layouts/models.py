@@ -100,21 +100,25 @@ class ModelsLayoutMici(NavScroller):
                                                           "lane lines are clear. Yields around obstacles. Not available with the Default model."))
 
     self.nav_turn_toggle = BigParamControl(tr("nav turn desires"), "NavTurnDesire",
-                                           description=tr("With a navigation route, signal for the route's next turn about 8 s ahead, or " +
-                                                          "about 15 s (a quarter mile) ahead above 45 mph. About 3 s before it, the car plans " +
-                                                          "the turn if it can still slow to turning speed, else it goes straight. Use alpha " +
-                                                          "longitudinal, which slows for the turn: route turns never start while the car's own " +
-                                                          "cruise control is on. Keep the blinker on until the turn starts; to call it off, " +
-                                                          "switch the blinker off (gas only ends the slowdown). While it is on, openpilot never " +
-                                                          "starts an automatic lane change, and a nudge changes lanes only above 20 mph: move " +
-                                                          "into a turn lane before you signal."))
+                                           description=tr("With a navigation route, signal for the route's next turn about 8 s ahead; above " +
+                                                          "45 mph, from the lane you'll turn from, about 15 s ahead. Past 250 m it counts only " +
+                                                          "in the outermost lane: above 55 mph, if Slowing for Route Turn doesn't show, slow " +
+                                                          "down yourself. About 3 s before the turn, the car plans it if it can still slow to " +
+                                                          "turning speed, else it goes straight, so signal before you pull away. Use alpha " +
+                                                          "longitudinal, which slows " +
+                                                          "for the turn: route turns never start while the car's own cruise control is on. " +
+                                                          "Keep the blinker on until the turn starts; to call it off, switch the blinker off " +
+                                                          "(gas only ends the slowdown). A blinker toward the turn never starts an automatic " +
+                                                          "lane change, and a nudge changes lanes only above 20 mph: move into a turn lane " +
+                                                          "before you signal."))
     self.nav_auto_turn_toggle = BigParamControl(tr("auto route turns (alpha)"), "NavAutoTurn",
                                                 description=tr("With alpha longitudinal, slows for each route turn and turns right on its " +
                                                                "own from the curb lane; left turns wait for your blinker unless auto left " +
                                                                "turns is on. It can't see a " +
                                                                "bike lane behind a curb or posts: check for cyclists on your right before " +
-                                                               "every turn. Before an automatic turn starts, gas or the other blinker calls it off; " +
-                                                               "after, steer (on a Tesla the brake also stops it: it turns steering off). " +
+                                                               "every turn. Before an automatic turn starts, gas or the other blinker calls it off, " +
+                                                               "and so does switching off your blinker for it; after, steer (on a Tesla the brake " +
+                                                               "also stops it: it turns steering off). " +
                                                                "Watch every turn."))
     self.nav_far_turn_toggle = BigParamControl(tr("auto left turns (alpha)"), "NavAutoTurnFarSide",
                                                description=tr("Needs auto route turns. Turns left on its own (right where traffic keeps " +
@@ -123,7 +127,8 @@ class ModelsLayoutMici(NavScroller):
                                                               "with a known posted limit of 45 mph or less, and not after stopping near the " +
                                                               "turn; elsewhere it slows and shows Signal for Route Turn. It can't see " +
                                                               "oncoming traffic, arrows or red lights: watch and brake (on a Tesla, braking " +
-                                                              "turns steering off: finish the turn yourself). Turn it on while parked."))
+                                                              "turns steering off: finish the turn yourself). Turn it on while parked; with auto " +
+                                                              "route turns switched on while driving, it comes on at the next stop."))
     self.nav_exit_toggle = BigParamControl(tr("nav exit desires (alpha)"), "NavExitDesire",
                                            description=tr("Near a route exit or fork with lane guidance, a light steering nudge toward it has the car " +
                                                           "keep to that side of the split. Above 20 mph with your blinker on, a nudge " +

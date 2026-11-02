@@ -11,6 +11,8 @@ import dataclasses
 import math
 import time
 
+import numpy as np
+
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.common.parameterized import parameterized
@@ -19,8 +21,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import AUTO_FAR_LIMIT_DISTANCE, FAR_LANE_DISTANCE, FAR_PROMPT_DEBOUNCE, \
-  FAR_SIGNAL_LEAD, FAR_TURN_MIN_LEAD, NAV_TURN_STEER_DISTANCE, NAV_TURN_TRIGGER_TIME, NavDesireController, NavInputs, far_lanes, \
-  far_turn_lane, nav_inputs, posted_speed_limit, time_to_steer
+  FAR_SIGNAL_LEAD, FAR_TURN_MIN_LEAD, NAV_TURN_DECEL, NAV_TURN_MAX_DECEL, NAV_TURN_REFRESH_LEAD, NAV_TURN_SPEED, NAV_TURN_STEER_DISTANCE, \
+  NAV_TURN_TRIGGER_TIME, NavDesireController, NavInputs, far_lanes, far_turn_lane, nav_inputs, posted_speed_limit, time_to_steer
 from openpilot.sunnypilot.selfdrive.controls.lib.tests.test_nav_desire import TURN_DESIRES, TURN_DIRECTIONS, FakeSubMaster, car_state, \
   closed_loop, in_history, nudge, pulses, slowed_trigger_distance
 
@@ -174,6 +176,31 @@ class TestFarInputs(OpenpilotTestCase):
     ]:
       assert posted_speed_limit(sm) == 0., why
 
+  def test_posted_speed_limit_with_the_cars_own(self):
+    # the resolver prefers map data, which can be stale or wrong: the car's own reading (a Tesla's fused limit) counts too
+    # where it is higher, so a far side turn never starts on a faster road for it. It never makes an unknown limit known
+    def submaster(resolver, car_limit, car_age=0.02, car_valid=True):
+      sm = plan_submaster(plan_message(resolver, valid=not resolver <= 0.))  # a NaN limit flagged valid
+      car_state_sp = messaging.new_message('carStateSP').carStateSP
+      car_state_sp.speedLimit = car_limit
+      sm.seen['carStateSP'], sm.valid['carStateSP'], sm.recv_time['carStateSP'] = True, car_valid, time.monotonic() - car_age
+      sm.data['carStateSP'] = car_state_sp
+      return sm
+    for resolver, car_limit, kwargs, expected, why in [
+      (MPH35, MPH50, {}, MPH50, 'the car reads higher: a stale map limit'),
+      (MPH50, MPH35, {}, MPH50, 'the car reads lower'),
+      (MPH35, 0., {}, MPH35, 'the car reads none'),
+      (MPH35, math.nan, {}, MPH35, 'the car reads NaN'),
+      (MPH35, MPH50, {'car_age': 1.}, MPH35, "the car's reading is stale"),
+      (MPH35, MPH50, {'car_valid': False}, MPH35, "the car's message is invalid"),
+      (0., MPH35, {}, 0., 'the resolver has none: still unknown'),
+      (math.nan, MPH35, {}, 0., 'the resolver reads NaN: still unknown'),
+    ]:
+      assert math.isclose(posted_speed_limit(submaster(resolver, car_limit, **kwargs)), expected, rel_tol=1e-6, abs_tol=1e-9), why
+    # a far side turn waits for the blinker where the car reads 50 mph, whatever the map says
+    frames = run(far_controller(), 60., 4.5, 12., speed_limit=posted_speed_limit(submaster(MPH35, MPH50)))
+    assert not pulses(frames) and any(f[2] for f in frames)
+
   def test_nav_inputs(self):
     # real messages, so a renamed or retired field fails here rather than in modeld
     now = time.monotonic()
@@ -226,6 +253,7 @@ class TestFarStarts(OpenpilotTestCase):
     ('lane guidance puts the turn in another lane', {}, {}, {'lanes': guidance((('straight',), None), (('left',), 'left'))}, True),
     ('no curb: a two-way road', {}, {}, {'far_lanes': (False, False)}, True),
     ('a car in the blind spot', {}, {'leftBlindspot': True}, {}, True),
+    ('hazards: no start, and no blinker to latch', {}, {'leftBlinker': True, 'rightBlinker': True}, {}, True),
     ("the car's own cruise control: called off", {}, {}, {'long_active': False}, False),
     ('the right blinker: called off', {}, {'rightBlinker': True}, {}, False),
     ('the gas: called off', {}, {'gasPressed': True}, {'long_active': False}, False),
@@ -238,6 +266,35 @@ class TestFarStarts(OpenpilotTestCase):
 
   def test_posted_72_kph_turns(self):
     assert len(pulses(run(far_controller(), 60., 4.5, 12., speed_limit=72 * KPH))) == 1
+
+  def test_switched_on_only_at_a_standstill(self):
+    # automatic left turns set, automatic route turns off, then switched on while driving: the left turns come on only once
+    # the car stands still, never mid-drive. Switched off, they go off at once, also while driving
+    params = Params()
+    for key, value in (('NavTurnDesire', True), ('NavAutoTurn', False), ('NavAutoTurnFarSide', True), ('NavExitDesire', False)):
+      params.put_bool(key, value)
+    dh = DesireHelper()
+    assert not dh.nav_desire.far_enabled
+
+    def frames(seconds, v):
+      for _ in range(round(seconds / DT_MDL)):
+        dh.update(car_state(vEgo=v, standstill=v == 0.), True, 1.0, False, False, None)
+    frames(3., 20.)
+    params.put_bool('NavAutoTurn', True)
+    frames(10., 20.)
+    assert dh.nav_desire.auto_enabled and not dh.nav_desire.far_enabled
+    frames(3., 0.)
+    assert dh.nav_desire.far_enabled
+    frames(3., 20.)
+    assert dh.nav_desire.far_enabled
+    params.put_bool('NavAutoTurnFarSide', False)
+    frames(3., 20.)
+    assert not dh.nav_desire.far_enabled
+    params.put_bool('NavAutoTurnFarSide', True)
+    frames(10., 20.)
+    assert not dh.nav_desire.far_enabled
+    # as the drive starts, from parked, the settings count as they are
+    assert DesireHelper().nav_desire.far_enabled
 
   def test_needs_automatic_turns(self):
     # NavAutoTurnFarSide alone does nothing: the controller reads it only with NavAutoTurn on
@@ -404,12 +461,45 @@ class TestFarStops(OpenpilotTestCase):
       assert len(pulses(approach)) == 1 and len(pulses(signaled, before=waiting[-1][0])) == 1 and c.turn_by_blinker, stop_at
       assert not signaled[-1][2] and not signaled[-1][3]
 
-  def test_brief_stop_keeps_the_turn(self):
-    # the model yields for 2 s 10 m out after the automatic pulse, then goes on: still its one turn, held throughout
+  def test_brief_stop_hands_the_turn_back(self):
+    # the model yields for 2 s 10 m out after the automatic pulse, then goes on. 5 s after the pulse the model's desire
+    # history no longer holds the turn, also on the move: from then on Turning Across Traffic no longer shows, and too close
+    # by then for the blinker to start it again, it does not ask for it either. The car goes straight
     c = far_controller()
     frames = run(c, 40., 4.5, 30. / 4.5) + run(c, 10., 0., 2.) + run(c, 10., 3., 2.)
-    assert len(pulses(frames)) == 1 and all(f[0] in TURN_DIRECTIONS for f in frames if f[1] <= 21.)
-    assert not any(f[2] for f in frames)
+    edges = pulses(frames)
+    held = sum(1 for f in frames if f[0] in TURN_DIRECTIONS) * DT_MDL
+    assert len(edges) == 1 and abs(held - 5.) < 2 * DT_MDL and c.turning is None, held
+    assert all(f[3] == (f[0] in TURN_DIRECTIONS) for f in frames) and not any(f[2] for f in frames)
+
+  def test_handed_back_on_the_move(self):
+    # after the automatic pulse the car slows to a walk behind a cyclist, and gets no keep-alive while driver monitoring
+    # warns. 5 s after the pulse the model's desire history no longer holds the turn: Turning Across Traffic ends then and,
+    # still 2 s or more from the steering point, it asks for the blinker. A blinker then pulses the turn again, once, only
+    # after the first pulse has left the model's history
+    for signal in (False, True):
+      c = far_controller()
+      approach = run(c, 40., 4.5, (40. - 20.5) / 4.5)  # the pulse at about 21.5 m
+      frames, first, d = [], None, 20.5
+      for _ in range(round(6. / DT_MDL)):
+        blinker = signal and first is not None and d <= first - 1.6 * 0.5  # half a second after it asks
+        c.update(car_state(vEgo=1.6, leftBlinker=blinker), True, far_nav(distance=d, driver_alert=True))
+        frames.append((c.turn_direction, d, c.signal_prompt, c.turn_across))
+        first = d if c.signal_prompt and first is None else first
+        d -= 1.6 * DT_MDL
+      edges = pulses(approach + frames)
+      assert first is not None and time_to_steer(first, 1.6, True) >= NAV_TURN_REFRESH_LEAD, first
+      assert not any(f[3] for f in frames if f[1] <= first) and rises([f[2] for f in frames]) == 1
+      assert len(edges) == 1 + signal and (not signal or (edges[0] - edges[1] >= 1.6 * 5. - 0.5 and c.turn_by_blinker)), edges
+
+  def test_no_prompt_after_the_gas_ends_the_automatic_turn(self):
+    # after the automatic pulse the driver presses the gas for a moment, which ends the turn's reminders: that is the
+    # driver's choice, so it does not then ask for the blinker
+    c = far_controller()
+    frames = run(c, 40., 4.5, (40. - 18.) / 4.5)
+    frames += run(c, 18., 2., 0.5, carstate=car_state(vEgo=2., gasPressed=True), long_active=False)
+    frames += run(c, 17., 2., 3.)
+    assert len(pulses(frames)) == 1 and c.turning is None and not any(f[2] for f in frames)
 
   def test_keep_alive_only_while_driver_monitoring_is_quiet(self):
     # after the automatic pulse the car slows to a walk behind a cyclist, still 2 s or more from the steering point when
@@ -461,19 +551,57 @@ class TestFarPrompt(OpenpilotTestCase):
     frames = run(c, 60., 4.5, 2.) + run(c, 51., 4.5, 0.5, carstate=car_state(vEgo=4.5, **car_fields), **inputs) + run(c, 48.75, 4.5, 10.)
     assert not pulses(frames) and not any(f[2] for f in frames) and c.called_off
 
+  @parameterized.expand([('hazard lights on', 4.5, {'leftBlinker': True, 'rightBlinker': True}), ('too fast to turn by itself', 8., {})])
+  def test_asks_early_when_it_cannot_start_by_itself(self, _name, v, car_fields):
+    # it can't start by itself with hazard lights on, nor above automatic turn speed (7 m/s), so it asks for the blinker as
+    # soon as the start's window opens, not only once the latest start has passed
+    frames = run(far_controller(), 60., v, 60. / v, carstate=car_state(vEgo=v, **car_fields))
+    prompted = [f[1] for f in frames if f[2]]
+    assert not pulses(frames) and prompted and time_to_steer(max(prompted), v, True) >= NAV_TURN_TRIGGER_TIME, prompted[:1]
+
   def test_asks_while_a_car_is_in_the_blind_spot(self):
     # a car beside on the left through the start's window: there is a lane there, so it won't turn by itself here
     frames = run(far_controller(), 60., 4.5, 13., carstate=lambda d: car_state(vEgo=4.5, leftBlindspot=d <= 32.))
     assert not pulses(frames) and rises([f[2] for f in frames]) == 1 and max(f[1] for f in frames if f[2]) >= 28.
 
   def test_debounced(self):
-    # a curb read on and off, 0.3 s missing out of every second: never a run long enough to turn, and no prompt until the
-    # start is out of reach for good, FAR_TURN_MIN_LEAD before the steering point
+    # a curb read on and off, 0.3 s missing out of every second: never a run long enough to turn. A dropout alone asks
+    # nothing; it asks once, as soon as even a whole run of the curb from then on could not end before the latest start,
+    # FAR_TURN_MIN_LEAD before the steering point: early enough for a blinker to start the turn on time
     v = 4.5
     frames = run(far_controller(), 60., v, 13., inputs=lambda distance, **kw: far_nav(distance=distance, far_lanes=((60. - distance) / v % 1. < 0.7, False)))
     prompted = [f[1] for f in frames if f[2]]
     assert not pulses(frames) and rises([f[2] for f in frames]) == 1
-    assert time_to_steer(max(prompted), v, True) <= FAR_TURN_MIN_LEAD - FAR_PROMPT_DEBOUNCE + 0.06
+    lead = time_to_steer(max(prompted), v, True)
+    assert NAV_TURN_TRIGGER_TIME <= lead <= FAR_TURN_MIN_LEAD + FAR_LANE_DISTANCE / v + 0.3 - FAR_PROMPT_DEBOUNCE + 0.06, lead
+
+  @parameterized.expand([(27.,), (26.,), (24.,), (22.,)])
+  def test_prompt_after_a_late_lane_change(self, end_at):
+    # changing lanes into a curbed bay with the blinker from 30 mph, which the car cancels as the lane change ends 22-27 m
+    # out: the curb is beside the car from then, but too late for its run to end before the latest start. It asks half a
+    # second after the lane change ends, not only once the latest start has passed, and a blinker 1 s after that starts the
+    # turn, once; never an automatic start after the prompt
+    c = far_controller(turns=True)
+    d, v, a, a_plan, frames, prompted, end_lead = 200., 13.4, 0., 0., [], None, None
+    while d > 0.:
+      changing = end_at < d <= end_at + 15.
+      signaled = end_at < d <= end_at + 25. or (prompted is not None and d <= prompted[0] - v * 1.)
+      nav = dataclasses.replace(far_nav(distance=d, far_lanes=(d <= end_at, False), outer_lanes=(d <= end_at, False)), accel=max(a, a_plan))
+      c.update(car_state(vEgo=v, leftBlinker=signaled), True, nav, lane_changing=changing)
+      frames.append((c.turn_direction, d))
+      end_lead = time_to_steer(d, v, True) if end_lead is None and d <= end_at else end_lead
+      prompted = (d, time_to_steer(d, v, True)) if c.signal_prompt and prompted is None else prompted
+      planned = [float(np.clip(13.4 - v, -0.5, 1.))]  # the car follows the slowdown, as plannerd has it
+      if c.speed_limit > 0.:
+        decel = NAV_TURN_DECEL if c.speed_limit > NAV_TURN_SPEED else 0.
+        planned.append(max(float(np.clip(c.speed_limit - v - decel, -NAV_TURN_MAX_DECEL, 1.)), a_plan - 1.5 * DT_MDL))
+      a_plan = min(planned)
+      a += (a_plan - a) * DT_MDL / 0.3
+      v = max(v + a * DT_MDL, 0.)
+      d -= v * DT_MDL
+    assert prompted is not None and prompted[1] >= end_lead - FAR_PROMPT_DEBOUNCE - 0.15, (prompted, end_lead)
+    edges = pulses(frames)
+    assert len(edges) == 1 and edges[0] < prompted[0] and c.turn_by_blinker, edges
 
   def test_prompt_survives_a_reset(self):
     # it asked, then the controller failed for a few frames (DesireHelper resets it), then the curb shows up: it still
@@ -576,7 +704,8 @@ class TestFarUnchanged(OpenpilotTestCase):
     ('right turn waiting at the line', {}, RIGHT, [(40., 4.5, 30. / 4.5, {}, None), (10., 0., 10., {}, None), (10., 2., 6., {}, None)], 4),
     ('right turn with a blind spot blip', {}, RIGHT, [(60., 4.5, 14., lambda d: {'rightBlindspot': 30. < d <= 31.}, None)], 1),
     ('right turn after a lane change', {}, RIGHT, [(70., 4.5, 15., lambda d: {'rightBlinker': 40. < d <= 65.}, (55., 40.))], 1),
-    ('right blinker on and off on the approach', {}, RIGHT, [(70., 4.5, 15., lambda d: {'rightBlinker': 45. < d <= 60.}, None)], 1),
+    # switching the turn's blinker off calls the automatic turn off
+    ('right blinker on and off on the approach', {}, RIGHT, [(70., 4.5, 15., lambda d: {'rightBlinker': 45. < d <= 60.}, None)], 0),
     ('right turn called off with the gas', {}, RIGHT, [(60., 4.5, 4., {}, None), (42., 4.5, 1., {'gasPressed': True}, None),
                                                        (37.5, 4.5, 8., {}, None)], 0),
     ('left-hand traffic left turn', {}, {'modifier': 'left', 'lanes': (), 'outer_lanes': (True, False), 'far_lanes': (True, False),
