@@ -9,16 +9,17 @@ import time
 from types import SimpleNamespace
 
 import openpilot.cereal.messaging as messaging
+from opendbc.car.interfaces import ACCEL_MAX
 from openpilot.cereal import custom
-from openpilot.common.params import Params
+from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
-from openpilot.sunnypilot.selfdrive.controls.lib.nav_turn_speed import NAV_TURN_HOLD, NAV_TURN_MAX_DECEL, NAV_TURN_SPEED, \
-  NavTurnSpeedController, turn_speed_limit
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NAV_TURN_MARGIN, NAV_TURN_SPEED, NavDesireController, NavInputs
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_turn_speed import NAV_TURN_ALERT_RESET, NAV_TURN_JERK, NAV_TURN_MAX_DECEL, \
+  NavTurnSpeedController
 
 EventNameSP = custom.OnroadEventSP.EventName
-V_CRUISE = 30.  # m/s, the driver's set speed
 
 
 class FakeSubMaster(SimpleNamespace):
@@ -31,120 +32,87 @@ class FakeEvents(list):
     self.append(event)
 
 
-def submaster(distance=200., modifier='right', blinkers=(False, False), route=True):
-  # real messages, so a renamed or retired field fails here rather than in plannerd
-  car_state = messaging.new_message('carState').carState
-  car_state.leftBlinker, car_state.rightBlinker = blinkers
-  instruction = messaging.new_message('navInstruction').navInstruction
-  instruction.maneuverType, instruction.maneuverModifier, instruction.maneuverDistance = 'turn', modifier, distance
-  return FakeSubMaster(seen={'navInstruction': route}, valid={'navInstruction': route}, recv_time={'navInstruction': time.monotonic()},
-                       data={'carState': car_state, 'navInstruction': instruction})
+def submaster(limit=10., age=0., seen=True):
+  # a real message, so a renamed or retired field fails here rather than in plannerd
+  msg = messaging.new_message('modelDataV2SP').modelDataV2SP
+  msg.navTurnSpeed = limit
+  return FakeSubMaster(seen={'modelDataV2SP': seen}, recv_time={'modelDataV2SP': time.monotonic() - age}, data={'modelDataV2SP': msg})
 
 
-def controller(auto=True, turns=False, openpilot_long=True):
-  params = Params()
-  params.put_bool("NavAutoTurn", auto)
-  params.put_bool("NavTurnDesire", turns)
+def controller(openpilot_long=True):
   return NavTurnSpeedController(SimpleNamespace(openpilotLongitudinalControl=openpilot_long))
 
 
-def step(c, sm, v_ego, long_enabled=True, long_override=False, a_prev=0., v_cruise=V_CRUISE, frames=1):
+def step(c, sm, v_ego, long_enabled=True, long_override=False, a_prev=0., frames=1):
   events = FakeEvents()
   for _ in range(frames):
-    c.update(sm, long_enabled, long_override, v_ego, a_prev, v_cruise, events)
+    c.update(sm, long_enabled, long_override, v_ego, a_prev, events)
   return events
 
 
 class TestNavTurnSpeed(OpenpilotTestCase):
-  def test_speed_profile(self):
-    assert turn_speed_limit(0.) == turn_speed_limit(15.) == NAV_TURN_SPEED  # down to turn speed 15 m before the turn
-    assert math.isclose(turn_speed_limit(115.), math.sqrt(NAV_TURN_SPEED ** 2 + 2 * 0.8 * 100.))
-    assert turn_speed_limit(50.) < turn_speed_limit(100.) < turn_speed_limit(400.)
-
-  def test_auto_slows_for_every_turn(self):
+  def test_follows_the_published_limit(self):
     c = controller()
-    events = step(c, submaster(distance=400.), 20.)
-    assert c.active and math.isclose(c.v_target, turn_speed_limit(400.), rel_tol=1e-4) and not events  # limiting, not slowing yet
-    events = step(c, submaster(distance=200.), 20., frames=40)
-    assert c.active and c.v_target < 20. and events == [EventNameSP.navTurnSlowing]  # one chime per approach
-    assert math.isclose(c.a_target, -NAV_TURN_MAX_DECEL)  # behind the profile: slows harder than the cruise limit, never more
+    step(c, submaster(10.), 12.)
+    assert c.active and c.v_target == 10.
     assert LongitudinalPlannerSP.nav_turn_accel(SimpleNamespace(nav_turn=c)) == c.a_target
 
-  def test_jerk_limited(self):
-    c = controller()
-    step(c, submaster(distance=30.), 20.)  # a late turn
-    assert math.isclose(c.a_target, -1.5 * 0.05)  # eases in from the planner's acceleration
-
-  def test_auto_waits_while_signaling_the_other_way(self):
-    c = controller()
-    step(c, submaster(blinkers=(True, False)), 20.)
-    assert not c.active and c.v_target == V_CRUISE_UNSET  # a blinker the other way is not for this turn
-    step(c, submaster(blinkers=(False, True)), 20.)
-    assert c.active
-
-  def test_blinker_turns(self):
-    for blinkers, active in [((False, False), False), ((False, True), True), ((True, False), False), ((True, True), False)]:
-      c = controller(auto=False, turns=True)
-      step(c, submaster(blinkers=blinkers), 20.)
-      assert c.active == active, blinkers
-    c = controller(auto=False, turns=True)
-    step(c, submaster(distance=300., blinkers=(False, True)), 20.)  # beyond 15 m + 12 s: the blinker is for a lane change
-    assert not c.active
-
-  def test_only_with_openpilot_longitudinal(self):
-    for c, long_enabled in [(controller(openpilot_long=False), True), (controller(), False)]:
-      step(c, submaster(), 20., long_enabled=long_enabled)
+  def test_inactive(self):
+    for c, sm, long_enabled, long_override in [
+      (controller(openpilot_long=False), submaster(), True, False),
+      (controller(), submaster(), False, False),
+      (controller(), submaster(), True, True),  # the gas
+      (controller(), submaster(0.), True, False),  # no route turn
+      (controller(), submaster(math.nan), True, False),
+      (controller(), submaster(age=1.), True, False),  # modeld stopped publishing
+      (controller(), submaster(seen=False), True, False),
+    ]:
+      step(c, sm, 12., long_enabled=long_enabled, long_override=long_override)
       assert not c.active and c.v_target == V_CRUISE_UNSET
+      assert LongitudinalPlannerSP.nav_turn_accel(SimpleNamespace(nav_turn=c)) is None
 
-  def test_inactive_without_route(self):
-    for sm in [submaster(route=False), submaster(modifier='slight right')]:
-      c = controller()
-      step(c, sm, 20.)
-      assert not c.active
-
-  def test_gas_calls_turn_off(self):
+  def test_more_braking_is_jerk_limited_and_capped(self):
     c = controller()
-    step(c, submaster(distance=200.), 20.)
-    step(c, submaster(distance=190.), 20., long_override=True)
-    assert not c.active
-    step(c, submaster(distance=180.), 20.)
-    assert not c.active  # stays off for this turn
-    step(c, submaster(distance=170., blinkers=(False, True)), 20.)
-    assert c.active  # until the driver signals for it
-    c = controller()
-    step(c, submaster(distance=200.), 20.)
-    step(c, submaster(distance=190.), 20., long_override=True)
-    step(c, submaster(distance=500., modifier='left'), 20.)
-    step(c, submaster(distance=200., modifier='left'), 20.)
-    assert c.active  # and the next turn slows again
+    step(c, submaster(10.), 20.)
+    assert math.isclose(c.a_target, -NAV_TURN_JERK * DT_MDL)  # eases in from the planner's last output
+    a = 0.
+    for _ in range(100):
+      step(c, submaster(10.), 20., a_prev=a)
+      a = c.a_target
+    assert math.isclose(a, -NAV_TURN_MAX_DECEL)  # far behind the profile: never harder than its cap
 
-  def test_holds_through_the_turn(self):
+  def test_never_holds_on_to_other_braking(self):
     c = controller()
-    step(c, submaster(distance=10.), NAV_TURN_SPEED)
-    assert c.v_target == NAV_TURN_SPEED and c.hold == NAV_TURN_HOLD
-    step(c, submaster(distance=-3.), NAV_TURN_SPEED)
-    assert c.v_target == NAV_TURN_SPEED
-    step(c, submaster(distance=500., modifier='left'), NAV_TURN_SPEED, frames=10)  # navd moved on: still through the turn
-    assert c.v_target == NAV_TURN_SPEED
-    step(c, submaster(distance=500., modifier='left'), NAV_TURN_SPEED, frames=100)  # 20 m later
-    assert math.isclose(c.v_target, turn_speed_limit(c.tracker.distance), rel_tol=1e-4) and c.hold == 0.
+    step(c, submaster(11.), 12., a_prev=-3.)  # the planner brakes hard for a lead car as the slowdown starts
+    assert c.a_target == -NAV_TURN_MAX_DECEL
+    step(c, submaster(15.), 12., a_prev=-3.)  # and the turn needs none
+    assert c.a_target == ACCEL_MAX
 
-  def test_signal_latches_while_slowing(self):
-    c = controller(auto=False, turns=True)
-    step(c, submaster(distance=200., blinkers=(False, True)), 20.)  # within 15 m + 12 s at 20 m/s
-    assert c.active
-    step(c, submaster(distance=160., blinkers=(False, True)), 10., frames=20)  # slowing shrinks that distance to 135 m
-    assert c.active
-    step(c, submaster(distance=150.), 10.)  # until the blinker goes off
-    assert not c.active
-
-  def test_completed_turn_is_not_slowed_for_again(self):
+  def test_alerts_once_as_it_starts_slowing(self):
+    # modeld's controller and this one together, on a steady approach from cruising speed with no other limit
+    nav = NavDesireController()
+    nav.turn_enabled, nav.auto_enabled, nav.param_read_counter = False, True, 1
     c = controller()
-    step(c, submaster(distance=5.), NAV_TURN_SPEED, frames=40)  # through the maneuver point
-    step(c, submaster(distance=1.), NAV_TURN_SPEED, frames=100)  # navd still reports it just ahead, for 22 m
-    assert c.tracker.passed and c.hold == 0. and not c.active
+    v, a, distance, events, v_at_margin = 20., 0., 400., [], None
+    while distance > -30.:
+      instruction = SimpleNamespace(maneuverType='turn', maneuverModifier='left', maneuverDistance=distance,
+                                    distanceRemaining=distance + 1000., lanes=[])
+      carstate = SimpleNamespace(vEgo=v, leftBlinker=False, rightBlinker=False, leftBlindspot=False, rightBlindspot=False,
+                                 gasPressed=False, standstill=False, steeringPressed=False, steeringTorque=0.)
+      nav.update(carstate, True, NavInputs(instruction, 0., True))
+      events += step(c, submaster(nav.speed_limit), v, a_prev=a)
+      a = min(c.a_target, 0.) if c.active else 0.  # the cruise speed is 20 m/s
+      v = max(v + a * DT_MDL, 0.)
+      distance -= v * DT_MDL
+      if v_at_margin is None and distance <= NAV_TURN_MARGIN:
+        v_at_margin = v
+    assert events == [EventNameSP.navTurnSlowing]
+    assert v_at_margin <= NAV_TURN_SPEED + 0.5
 
-  def test_below_cruise_only(self):
+  def test_alerts_again_only_after_a_pause(self):
     c = controller()
-    step(c, submaster(distance=200.), 10., v_cruise=10.)  # the set speed is already lower than the profile
-    assert not c.active
+    assert step(c, submaster(10.), 15.) == [EventNameSP.navTurnSlowing]
+    assert not step(c, submaster(0.), 15., frames=round(3. / DT_MDL))  # a short break, like navd moving on
+    assert not step(c, submaster(10.), 15.)
+    step(c, submaster(0.), 15., frames=round((NAV_TURN_ALERT_RESET + 1.) / DT_MDL))
+    assert step(c, submaster(10.), 15.) == [EventNameSP.navTurnSlowing]

@@ -4,16 +4,19 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+import math
 import os
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import requests
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.navigation.navd import RouteEngine, set_banner
+from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE
 
 
 def route_engine(values, sm=None, pm=None):
@@ -112,3 +115,66 @@ class TestGpsLoss(OpenpilotTestCase):
       sm.recv_time['gpsLocation'] = time.monotonic()
       engine.update()
       assert last().valid
+
+
+def degrees(meters):
+  return meters / METERS_PER_DEGREE
+
+
+def step(start, end, banner_type, modifier):
+  coordinates = [[degrees(x), degrees(y)] for x, y in (start, end)]
+  banners = [{'distanceAlongGeometry': 200, 'primary': {'text': 'Main St', 'type': banner_type, 'modifier': modifier}}] if banner_type else []
+  return {'geometry': {'coordinates': coordinates}, 'distance': math.dist(start, end), 'duration': 10, 'bannerInstructions': banners}
+
+
+# 300 m north to a right turn, 200 m east to a left turn, then 200 m north to the destination
+ROUTE = [step((0, 0), (0, 300), 'turn', 'right'), step((0, 300), (200, 300), 'turn', 'left'),
+         step((200, 300), (200, 500), 'arrive', ''), step((200, 500), (200, 500), None, None)]
+
+
+class TestManeuverProgress(OpenpilotTestCase):
+  def setUp(self):
+    self.pm = MagicMock()
+    self.engine = route_engine({'NavDestination': {'latitude': degrees(500), 'longitude': degrees(200)}}, pm=self.pm)
+    self.engine.route = ROUTE
+    self.engine.route_geometry = [np.array(s['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for s in ROUTE]
+    self.engine.step_idx, self.engine.nav_destination = 0, (degrees(200), degrees(500))
+
+  def at(self, x, y):
+    self.engine.last_position = (degrees(x), degrees(y))
+    self.engine.send_instruction()
+    return self.pm.send.call_args.args[1]
+
+  def test_taken_turn_moves_on_once_along_the_new_road(self):
+    for y in (100, 250, 295):
+      assert self.at(0, y).valid and self.engine.step_idx == 0
+    assert self.at(5, 300).valid and self.engine.step_idx == 0  # turning
+    msg = self.at(12, 300)
+    assert msg.valid and str(msg.navInstruction.maneuverType) == 'turn' and self.engine.step_idx == 1
+    msg = self.at(15, 300)
+    assert math.isclose(msg.navInstruction.maneuverDistance, 185., abs_tol=0.5) and str(msg.navInstruction.maneuverModifier) == 'left'
+    assert not self.engine.should_recompute()
+
+  def test_straight_past_a_turn_is_missed(self):
+    assert self.at(0, 305).valid and self.engine.step_idx == 0
+    msg = self.at(0, 312)  # it went past the right turn without taking it
+    assert not msg.valid and self.engine.step_idx == 0  # never the left turn after it, which isn't on this road
+    assert self.engine.should_recompute()
+
+  def test_off_route_is_invalid(self):
+    assert not self.at(30, 150).valid
+
+  def test_maneuver_keeps_its_distance_to_the_destination(self):
+    # how controls tell a GPS jump from the next maneuver
+    for y in (0, 120, 299):
+      msg = self.at(0, y).navInstruction
+      assert math.isclose(msg.distanceRemaining - msg.maneuverDistance, 400., abs_tol=0.01)
+
+  def test_arrival(self):
+    self.engine.step_idx = 2
+    assert self.at(200, 505).valid and self.engine.step_idx == 2
+    self.at(200, 512)
+    assert self.engine.step_idx == 3
+    self.at(200, 540)  # driving away from the destination clears it
+    assert self.engine.route is None
+    self.engine.params.remove.assert_called_with("NavDestination")

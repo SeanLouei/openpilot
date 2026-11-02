@@ -10,10 +10,11 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
-from openpilot.selfdrive.navigation.route import along_path, local_meters
+from openpilot.selfdrive.navigation.route import along_path, cumulative_distance, local_meters, project_onto_path
 
 REROUTE_DISTANCE = 25
 MANEUVER_TRANSITION_THRESHOLD = 10
+NEXT_STEP_DISTANCE = 15  # m from the next step's path the car drives along it, once it took the maneuver
 REROUTE_COUNTER_MIN = 3
 ROUTE_RESEND_PERIOD = 10  # updates (seconds); a restarted mapsd gets the route within this
 RECOMPUTE_HOLD = 10  # updates (seconds) between route requests
@@ -58,6 +59,7 @@ class RouteEngine:
     self.recompute_hold = 0
     self.reroute_counter = 0
     self.gps_ok = True
+    self.missed_maneuver = False  # the car went past the maneuver point without taking it
 
     self.api = Api(self.params.get("DongleId")) if not os.environ.get("MAPBOX_TOKEN") else None
 
@@ -144,6 +146,7 @@ class RouteEngine:
         self.route = r['routes'][0]['legs'][0]['steps']
         self.route_geometry = [np.array(step['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for step in self.route]
         self.step_idx = 0
+        self.missed_maneuver = False
       else:
         cloudlog.warning("Got empty route response")
         self.clear_route()
@@ -163,8 +166,16 @@ class RouteEngine:
 
     assert self.route is not None and self.route_geometry is not None and self.last_position is not None
     step = self.route[self.step_idx]
-    along_geometry, _ = along_path(self.route_geometry[self.step_idx], self.last_position)
+    along_geometry, off_route = along_path(self.route_geometry[self.step_idx], self.last_position)
     distance_to_maneuver_along_geometry = step['distance'] - along_geometry
+
+    # Onto another road the car took the maneuver once it drives along the next step. Past the maneuver point without
+    # that, it missed the maneuver: what comes after it is not ahead of the car, so the instruction is invalid until the
+    # reroute, as it is off the route. The last maneuver, the arrival, keeps the distance rule.
+    road_ahead = self.step_idx + 2 < len(self.route)
+    took_maneuver = road_ahead and self.took_maneuver()
+    self.missed_maneuver = road_ahead and not took_maneuver and distance_to_maneuver_along_geometry < -MANEUVER_TRANSITION_THRESHOLD
+    msg.valid = not self.missed_maneuver and off_route <= REROUTE_DISTANCE
 
     # Banner instructions are for the following maneuver step, don't use empty last step
     banner_step = step
@@ -184,7 +195,10 @@ class RouteEngine:
     self.pm.send('navInstruction', msg)
 
     # Transition to next route segment
-    if distance_to_maneuver_along_geometry < -MANEUVER_TRANSITION_THRESHOLD:
+    if took_maneuver:
+      self.step_idx += 1
+      self.recompute_hold = 0
+    elif not road_ahead and distance_to_maneuver_along_geometry < -MANEUVER_TRANSITION_THRESHOLD:
       if self.step_idx + 1 < len(self.route):
         self.step_idx += 1
         self.recompute_hold = 0
@@ -195,6 +209,13 @@ class RouteEngine:
         if np.linalg.norm(local_meters(self.last_position, self.nav_destination)) > REROUTE_DISTANCE:
           self.params.remove("NavDestination")
           self.clear_route()
+
+  def took_maneuver(self) -> bool:
+    """Whether the car drives along the next step: close to its path, and some way along it."""
+    assert self.route_geometry is not None and self.step_idx is not None and self.last_position is not None
+    path = self.route_geometry[self.step_idx + 1]
+    along, lateral = project_onto_path(path, self.last_position)
+    return lateral <= NEXT_STEP_DISTANCE and along >= min(MANEUVER_TRANSITION_THRESHOLD, cumulative_distance(path)[-1] / 2)
 
   def send_route(self):
     coords = np.concatenate(self.route_geometry) if self.route_geometry is not None else np.empty((0, 2))
@@ -207,6 +228,7 @@ class RouteEngine:
     self.route_geometry = None
     self.step_idx = None
     self.nav_destination = None
+    self.missed_maneuver = False
 
   def should_recompute(self):
     if self.step_idx is None:
@@ -216,6 +238,8 @@ class RouteEngine:
     # Don't recompute in last segment, assume destination is reached
     if self.step_idx == len(self.route) - 1:
       return False
+    if self.missed_maneuver:
+      return True
 
     # TODO: Check for going wrong way in segment
     if along_path(self.route_geometry[self.step_idx], self.last_position)[1] > REROUTE_DISTANCE:

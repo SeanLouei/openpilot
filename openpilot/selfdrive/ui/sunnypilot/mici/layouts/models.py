@@ -100,13 +100,13 @@ class ModelsLayoutMici(NavScroller):
                                                           "lane lines are clear. Yields around obstacles. Not available with the Default model."))
 
     self.nav_turn_toggle = BigParamControl(tr("nav turn desires"), "NavTurnDesire",
-                                           description=tr("With a navigation route, signal for the route's next turn: the car plans the turn about 3 s " +
-                                                          "before it, below 20 mph, and slows for it when openpilot controls the speed. While " +
-                                                          "that blinker is on, it never starts an automatic lane change."))
+                                           description=tr("With a navigation route, signal for the route's next turn about 8 s ahead: the car plans " +
+                                                          "the turn about 3 s before it, below 20 mph, and slows for it when openpilot controls " +
+                                                          "the speed. While that blinker is on, it never starts an automatic lane change."))
     self.nav_auto_turn_toggle = BigParamControl(tr("auto route turns (alpha)"), "NavAutoTurn",
-                                                description=tr("Slows for each route turn and turns without your blinker, with alpha " +
-                                                               "longitudinal. Waits for your blinker when it can't confirm the lane. " +
-                                                               "Gas or the other blinker calls a turn off. Watch every turn."))
+                                                description=tr("With alpha longitudinal, slows for each route turn and turns right on its " +
+                                                               "own from the curb lane; left turns wait for your blinker. Before a turn " +
+                                                               "starts, gas or the other blinker calls it off; after, steer. Watch every turn."))
     self.nav_exit_toggle = BigParamControl(tr("nav exit desires (alpha)"), "NavExitDesire",
                                            description=tr("Near a route exit or fork with lane guidance, a light steering nudge toward it has the car " +
                                                           "keep to that side of the split. Above 20 mph with your blinker on, a nudge " +

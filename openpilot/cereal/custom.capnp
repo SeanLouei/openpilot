@@ -477,6 +477,7 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulLeftProb @7 :Float32;
   blendfulRightProb @8 :Float32;
   blendfulLaneWidth @9 :Float32;
+  navTurnSpeed @10 :Float32;  # m/s the route's turn limits the speed to, 0 without one
 
   enum TurnDirection {
     none @0;

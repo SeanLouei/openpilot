@@ -581,8 +581,8 @@
               "key": "NavTurnDesire",
               "widget": "toggle",
               "title": "Navigation Turn Desires",
-              "description": "With a route, signal for its next turn. The car plans the turn about 3 seconds before it, below 20 mph (32 km/h), and slows to turning speed when openpilot controls the speed. While that blinker is on it never starts an automatic lane change, though a nudge still changes lanes before the turn begins.",
-              "details": "With the car's own cruise control, slow to turning speed yourself. Route turns need a GPS fix. The model chooses the opening to turn into, so stay ready to steer.",
+              "description": "With a route, signal for its next turn about 8 seconds ahead. The car plans the turn about 3 seconds before it, below 20 mph (32 km/h), and slows to turning speed when openpilot controls the speed; signal late and it may be too fast to turn. While that blinker is on it never starts an automatic lane change, though a nudge still changes lanes before the turn begins.",
+              "details": "With the car's own cruise control, slow to turning speed yourself. Brake whenever you need to: on a Tesla that also turns steering off. Route turns need a GPS fix. The model chooses the opening to turn into, so stay ready to steer.",
               "enablement": [
                 {
                   "type": "param",
@@ -595,8 +595,8 @@
               "key": "NavAutoTurn",
               "widget": "toggle",
               "title": "Automatic Route Turns (Alpha)",
-              "description": "Slows for each route turn and turns without your blinker. Needs openpilot longitudinal (alpha); otherwise turns wait for your blinker. When the car cannot confirm it is in a lane it can turn from, it slows and waits for your blinker. The gas pedal or the opposite blinker calls a turn off.",
-              "details": "Turning without signaling is illegal in most places and gives pedestrians and other drivers no warning: signal yourself where you can. The model picks the opening and does not judge gaps in oncoming traffic, so watch every turn and be ready to take over.",
+              "description": "Slows for each route turn, and turns right on its own (left where traffic keeps left) once slowed down in the curb lane. Needs openpilot longitudinal (alpha). Turns across oncoming traffic, and turns where the model cannot see the curb lane, slow and wait for your blinker. Before a turn starts, the gas pedal or the opposite blinker calls it off; once it starts, only steering stops it.",
+              "details": "Turning without signaling is illegal in most places and gives pedestrians and other drivers no warning: signal yourself where you can. The car does not watch for pedestrians, cyclists or cross traffic, turns across a bike lane, and does not reliably stop for red lights or stop signs, so watch every turn and be ready to take over.",
               "enablement": [
                 {
                   "type": "param",

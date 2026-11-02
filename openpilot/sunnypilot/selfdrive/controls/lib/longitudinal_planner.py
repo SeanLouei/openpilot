@@ -55,7 +55,7 @@ class LongitudinalPlannerSP:
                     self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp)
 
     # Route turn
-    self.nav_turn.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise, self.events_sp)
+    self.nav_turn.update(sm, long_enabled, long_override, v_ego, a_ego, self.events_sp)
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),

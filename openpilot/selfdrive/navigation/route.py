@@ -40,6 +40,16 @@ def along_path(path: np.ndarray, point) -> tuple[float, float]:
   return float(cumulative_distance(path)[segment] + np.linalg.norm(local_meters(point, path[segment]))), lateral
 
 
+def project_onto_path(path: np.ndarray, point) -> tuple[float, float]:
+  """(meters along a (longitude, latitude) path to the closest spot on it, and the point's distance from that spot)."""
+  local, p = local_meters(path, path[0]), local_meters(point, path[0])
+  if len(local) < 2:
+    return 0.0, float(np.linalg.norm(p))
+  segment, fraction, lateral = nearest_segment(local[:-1], local[1:], p)
+  distance = cumulative_distance(path)
+  return float(distance[segment] + fraction * (distance[segment + 1] - distance[segment])), lateral
+
+
 class RouteTracker:
   """Progress of the ego along a route, in meters, and the map pose at that progress."""
 

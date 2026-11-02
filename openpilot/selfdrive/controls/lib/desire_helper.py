@@ -50,10 +50,10 @@ class DesireHelper:
                                                left_blinker=carstate.leftBlinker, right_blinker=carstate.rightBlinker, v_ego=v_ego)
     self.lane_turn_direction = self.lane_turn_controller.get_turn_direction()
 
-    # Route turns: a blinker for the route's next turn gets that turn's desire shortly before it, and no other desire.
+    # Route turns: a blinker for the route's next turn gets that turn's desire shortly before it, and no other desire, and
+    # from a route turn's start to its maneuver point no lane turn desire pulses either way.
     # A route message the controller cannot read must never stop the driving model, so it only drops the route turn.
-    lane_turning = self.desire in (log.Desire.turnLeft, log.Desire.turnRight) and self.nav_desire.turning is None \
-                   and not self.nav_desire.route_turn_signal
+    lane_turning = self.desire in (log.Desire.turnLeft, log.Desire.turnRight) and not self.nav_desire.owns_turn_desire
     try:
       self.nav_desire.update(carstate, lateral_active, nav, self.lane_change_state == LaneChangeState.laneChangeStarting, lane_turning)
     except Exception:
@@ -62,7 +62,7 @@ class DesireHelper:
       self.nav_desire_failed = True
       self.nav_desire.reset()
     route_turning = self.nav_desire.turning is not None
-    if route_turning or self.nav_desire.route_turn_signal:
+    if self.nav_desire.owns_turn_desire:
       self.lane_turn_direction = self.nav_desire.turn_direction
 
     # a route turn holds the lane change off, so no lane change waits hidden behind its turn desire
