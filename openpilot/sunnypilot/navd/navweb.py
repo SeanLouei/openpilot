@@ -7,15 +7,18 @@ See the LICENSE.md file in the root directory for more details.
 
 A page on the device's network for setting the navigation destination and Mapbox token from a phone.
 """
+import ipaddress
 import json
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from typing import NamedTuple
+from urllib.parse import SplitResult, parse_qs, unquote_plus, urljoin, urlsplit
 
 import requests
 
 import openpilot.cereal.messaging as messaging
+from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
@@ -23,45 +26,138 @@ from openpilot.selfdrive.navigation.helpers import latest_gps_source
 PORT = 8082
 MAX_BODY = 4096
 GEOCODE_URL = "https://api.mapbox.com/search/geocode/v6/forward"
-SHORT_LINK_HOSTS = ('maps.app.goo.gl', 'goo.gl', 'maps.apple')  # shared map links that redirect to one with coordinates
+SHORT_LINK_HOSTS = ('maps.app.goo.gl', 'maps.apple')  # shared map links that redirect to one with the place in it
+MAX_REDIRECTS = 5
 
+LINK = re.compile(r'https?://\S+')
 COORDINATES = re.compile(r'^\s*(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)\s*$')
 GOOGLE_PLACE = re.compile(r'!3d(-?\d{1,2}\.\d+)!4d(-?\d{1,3}\.\d+)')  # the place itself, not the map's viewport
+GOOGLE_STOP = re.compile(r'!1d(-?\d{1,3}\.\d+)!2d(-?\d{1,2}\.\d+)')  # a directions stop, longitude first
 GOOGLE_VIEWPORT = re.compile(r'@(-?\d{1,2}\.\d+),(-?\d{1,3}\.\d+)')
-LINK_QUERY_KEYS = ('ll', 'coordinate', 'q', 'query', 'destination', 'daddr')
+COORDINATE_KEYS = ('destination', 'daddr', 'q', 'query', 'coordinate', 'll')  # best first: Google's ll is the map's center
+TEXT_KEYS = ('destination', 'daddr', 'q', 'query', 'address')
+
+OFFLINE = "The device is offline: connect it to the internet and try again"
+LINK_FAILED = "Couldn't open that link: copy it from your maps app again, or paste the place's coordinates"
+MAPBOX_ERRORS = {
+  401: "The Mapbox token is missing or invalid: save a valid one below",
+  403: "The Mapbox token is missing or invalid: save a valid one below",
+  422: "Mapbox couldn't read that address: shorten it and try again",
+  429: "Too many searches: try again shortly",
+}
+MAPBOX_FAILED = "Mapbox isn't answering right now: try again shortly"
+
+
+class Place(NamedTuple):
+  coordinates: tuple[float, float] | None
+  name: str = ''  # what the link calls the place, to show
+  query: str = ''  # what to look up when the link has no coordinates
+
+
+class LinkError(Exception):
+  """A share link that didn't lead to a map link."""
 
 
 def valid_coordinates(latitude: float, longitude: float) -> bool:
   return -90 <= latitude <= 90 and -180 <= longitude <= 180 and (latitude, longitude) != (0, 0)
 
 
-def coordinates_from_text(text: str) -> tuple[float, float] | None:
-  """(latitude, longitude) from 'lat, lon' or a Google or Apple Maps link, else None."""
-  text = text.strip()
-  url = urlparse(text)
-  if url.scheme in ('http', 'https'):
-    query = parse_qs(url.query)
-    candidates = [v for key in LINK_QUERY_KEYS for v in query.get(key, [])]
-    matches = [GOOGLE_PLACE.search(text), *(COORDINATES.match(c) for c in candidates), GOOGLE_VIEWPORT.search(unquote(url.path))]
-  else:
-    matches = [COORDINATES.match(text)]
-  for match in matches:
-    if match and valid_coordinates(float(match[1]), float(match[2])):
-      return float(match[1]), float(match[2])
+def coordinates_in(text: str) -> tuple[float, float] | None:
+  """(latitude, longitude) from 'lat, lon', else None."""
+  match = COORDINATES.match(text)
+  if match and valid_coordinates(float(match[1]), float(match[2])):
+    return float(match[1]), float(match[2])
   return None
 
 
-def resolve_link(text: str) -> str:
-  """The full map link behind a shortened one, which only carries an ID."""
-  url = urlparse(text.strip())
-  if url.scheme == 'https' and url.hostname in SHORT_LINK_HOSTS:
-    with requests.get(url.geturl(), allow_redirects=True, timeout=5, stream=True) as response:
-      return response.url
-  return text
+def short_link(url: str) -> bool:
+  """Whether url is a share link to expand: https on exactly a short-link host, with nothing that URL parsers read differently."""
+  # requests ends the host at a backslash and urlsplit doesn't, so https://evil.example\@maps.app.goo.gl/x would pass a
+  # hostname check here and then connect to evil.example. Userinfo, a port or whitespace can hide a host too.
+  if not (url.isascii() and url.isprintable()) or any(c in ' \\@' for c in url):
+    return False
+  scheme, _, rest = url.partition('://')
+  return scheme == 'https' and re.split('[/?#]', rest, maxsplit=1)[0] in SHORT_LINK_HOSTS
+
+
+def resolve_link(url: str) -> str:
+  """The map link behind a share link, which only carries an ID, else url itself. Only short-link hosts are ever fetched."""
+  for _ in range(MAX_REDIRECTS):
+    if not short_link(url):
+      return url
+    # one redirect at a time, so that each URL is checked before it's fetched
+    with requests.get(url, allow_redirects=False, timeout=5, stream=True) as response:
+      location = response.headers.get('Location') if response.is_redirect else None
+    if not location:
+      raise LinkError("the share link didn't redirect")
+    url = urljoin(url, location)
+  if short_link(url):
+    raise LinkError("too many redirects")
+  return url
+
+
+def interstitial(url: SplitResult) -> bool:
+  """Whether url is Google's cookie consent or unusual traffic page, which has the page it's in front of as continue=."""
+  host = url.hostname or ''
+  return host.startswith('consent.google.') or (url.path.startswith('/sorry') and re.match(r'(www\.)?google\.', host) is not None)
+
+
+def read_link(link: str) -> Place:
+  """The place a Google or Apple Maps link points to: its coordinates when the link has them, and its name or address."""
+  url = urlsplit(link)
+  if interstitial(url):  # the link it continues to, never the page itself
+    url = urlsplit(parse_qs(url.query).get('continue', [''])[0])
+    if interstitial(url):
+      return Place(None)
+  query = {key: values[0].strip() for key, values in parse_qs(url.query).items()}
+  segments = [unquote_plus(segment).strip() for segment in url.path.split('/')]
+  path = '/'.join(segments)
+
+  # Google: /maps/place/<name>, /maps/search/<text>, /maps/dir/<stop>/.../<stop> or /maps/@<viewport>, then the viewport and data
+  after = segments[segments.index('maps') + 1:] if 'maps' in segments else []
+  kind = after[0] if after else ''
+  stops = [s for s in after[1:] if s and not s.startswith('@') and '=' not in s]
+  if kind == 'dir':
+    stop = stops[-1] if stops else ''  # the destination: the first stop is where the directions start
+  else:
+    stop = stops[0] if stops and kind in ('place', 'search') else ''
+
+  pairs = COORDINATES.findall(stop)
+  if kind == 'dir':
+    pairs += [(latitude, longitude) for longitude, latitude in GOOGLE_STOP.findall(path)[-1:]]
+  pairs += GOOGLE_PLACE.findall(path)[-1:]
+  for key in COORDINATE_KEYS:
+    pairs += COORDINATES.findall(query.get(key, ''))
+  if kind == 'place' or kind.startswith('@'):  # the map's center: the place on a place link, and all a link to the map has
+    pairs += GOOGLE_VIEWPORT.findall(path)[:1]
+  candidates = [(float(latitude), float(longitude)) for latitude, longitude in pairs]
+  coordinates = next((c for c in candidates if valid_coordinates(*c)), None)
+
+  texts = [text for text in (stop, *(query.get(key, '') for key in TEXT_KEYS)) if text and not COORDINATES.match(text)]
+  text = texts[0] if texts else ''
+  return Place(coordinates, ' '.join((query.get('name') or text).split())[:200], text)
+
+
+def place_from_text(text: str) -> Place:
+  """The place in pasted text: from the first map link in it, expanding a share link (which fetches it), else from 'lat, lon'."""
+  link = LINK.search(text)
+  return read_link(resolve_link(link[0])) if link else Place(coordinates_in(text))
+
+
+def search_text(text: str) -> str:
+  """text as Mapbox takes it: one line without semicolons, of at most 20 words and numbers and 256 characters."""
+  text = ' '.join(text.replace(';', ' ').split())
+  words = list(re.finditer(r'\w+', text))
+  if len(words) > 20:
+    text = text[:words[19].end()]
+  return text[:256].rstrip()
 
 
 def geocode(query: str, token: str, near: tuple[float, float] | None) -> list[dict]:
   """Places matching an address search, nearest first when the position is known."""
+  query = search_text(query)
+  if not query:
+    return []
   options = {'q': query, 'access_token': token, 'limit': 5, 'autocomplete': 'false'}
   if near is not None:
     options['proximity'] = f'{near[1]},{near[0]}'
@@ -79,6 +175,50 @@ def geocode(query: str, token: str, near: tuple[float, float] | None) -> list[di
     places.append({'place_name': properties.get('full_address') or properties.get('name') or query,
                    'latitude': float(point['latitude']), 'longitude': float(point['longitude'])})
   return places
+
+
+def mapbox_error(e: requests.RequestException) -> str:
+  """What to tell the user about a failed Mapbox request: never the error itself, whose URL has the access token."""
+  if isinstance(e, requests.ConnectionError):
+    return OFFLINE
+  if e.response is not None and e.response.status_code in MAPBOX_ERRORS:
+    return MAPBOX_ERRORS[e.response.status_code]
+  return MAPBOX_FAILED
+
+
+def last_gps_position(params: Params) -> tuple[float, float] | None:
+  """(latitude, longitude) of the last GPS fix saved, else None."""
+  data = params.get("LastGPSPosition")
+  if not data:
+    return None
+  try:
+    if data.startswith(b'{'):
+      # the JSON that osm_map_data writes for mapd to the memory params, which on macOS are these
+      position = json.loads(data)
+      latitude, longitude = float(position['latitude']), float(position['longitude'])
+    else:
+      # the gpsLocationExternal event ubloxd saves about once a minute with a fix
+      with log.Event.from_bytes(data) as event:
+        latitude, longitude = event.gpsLocationExternal.latitude, event.gpsLocationExternal.longitude
+  except Exception:  # unreadable: searches just aren't biased
+    return None
+  return (latitude, longitude) if valid_coordinates(latitude, longitude) else None
+
+
+def device_host(host: str) -> bool:
+  """Whether a Host header names the device by an IP address or as localhost, which a rebound DNS name never does."""
+  name, _, port = host.rpartition(':')
+  if not (port.isascii() and port.isdigit()):  # no port to strip
+    name = host
+  if name.startswith('[') and name.endswith(']'):  # an IPv6 address
+    name = name[1:-1]
+  if name.lower() == 'localhost':
+    return True
+  try:
+    ipaddress.ip_address(name)
+  except ValueError:
+    return False
+  return True
 
 
 class NavWeb:
@@ -101,6 +241,12 @@ class NavWeb:
   def token(self) -> str:
     return (self.params.get("MapboxToken") or '').strip()
 
+  def near(self) -> tuple[float, float] | None:
+    """Where to search near: the live GPS fix, else the last one saved, so that searches offroad are local too."""
+    with self.lock:
+      position = self.position
+    return position if position is not None else last_gps_position(self.params)
+
   def state(self) -> dict:
     token = self.token()
     with self.lock:
@@ -114,21 +260,39 @@ class NavWeb:
       return 400, {'error': 'Type an address to search for'}
     if not self.token():
       return 400, {'error': 'Add a Mapbox token to search, or paste a map link or coordinates instead'}
-    with self.lock:
-      near = self.position
-    return 200, {'places': geocode(query, self.token(), near)}
+    return 200, {'places': geocode(query, self.token(), self.near())}
+
+  def look_up(self, text: str) -> tuple[int, dict]:
+    """Places to pick from for a link that names its place without coordinates. The destination stays as it is."""
+    token = self.token()
+    if not token:
+      return 400, {'error': 'A Mapbox token is needed to look up this link: save one below, or paste the coordinates instead'}
+    near = self.near()
+    places = geocode(text, token, near)
+    address = text.partition(',')[2].strip()
+    if not places and address:
+      # Mapbox has addresses but not businesses, so "Costco Wholesale, 1600 El Camino Real, ..." is found by its address
+      places = geocode(address, token, near)
+    return 200, {'places': places}
 
   def set_destination(self, body: dict) -> tuple[int, dict]:
     if 'text' in body:
-      coordinates = coordinates_from_text(resolve_link(str(body['text'])))
-      if coordinates is None:
+      try:
+        place = place_from_text(str(body['text']))
+      except (requests.RequestException, LinkError) as e:
+        cloudlog.error(f"navweb: could not open a link: {type(e).__name__}")
+        return 502, {'error': OFFLINE if isinstance(e, requests.ConnectionError) else LINK_FAILED}
+      if place.coordinates is None:
+        if place.query:
+          return self.look_up(place.query)
         return 400, {'error': 'No coordinates found: paste "latitude, longitude" or a Google or Apple Maps link'}
-      latitude, longitude, place_name = *coordinates, f'{coordinates[0]:.5f}, {coordinates[1]:.5f}'
+      latitude, longitude = place.coordinates
+      place_name = place.name or f'{latitude:.5f}, {longitude:.5f}'
     else:
       latitude, longitude, place_name = float(body['latitude']), float(body['longitude']), str(body.get('place_name', ''))[:200]
     if not valid_coordinates(latitude, longitude):
       return 400, {'error': 'Invalid coordinates'}
-    self.params.put("NavDestination", {'latitude': latitude, 'longitude': longitude, 'place_name': place_name})
+    self.params.put("NavDestination", {'latitude': latitude, 'longitude': longitude, 'place_name': place_name}, block=True)
     return 200, self.state()
 
   def clear_destination(self, _body: dict) -> tuple[int, dict]:
@@ -136,9 +300,11 @@ class NavWeb:
     return 200, self.state()
 
   def set_token(self, body: dict) -> tuple[int, dict]:
-    token = str(body.get('token', '')).strip()
-    if token:
-      self.params.put("MapboxToken", token)
+    token = body.get('token')
+    if not isinstance(token, str):  # a request without a token never removes the saved one
+      return 400, {'error': 'Missing token'}
+    if token.strip():
+      self.params.put("MapboxToken", token.strip(), block=True)
     else:
       self.params.remove("MapboxToken")
     return 200, self.state()
@@ -149,6 +315,8 @@ def make_handler(navweb: NavWeb):
             '/api/clear': navweb.clear_destination, '/api/token': navweb.set_token}
 
   class Handler(BaseHTTPRequestHandler):
+    timeout = 10  # seconds a read or write may stall, so that a stalled client can't hold its thread forever
+
     def send(self, status: int, body: bytes, content_type: str) -> None:
       self.send_response(status)
       self.send_header('Content-Type', content_type)
@@ -160,7 +328,23 @@ def make_handler(navweb: NavWeb):
     def send_json(self, status: int, payload: dict) -> None:
       self.send(status, json.dumps(payload).encode(), 'application/json')
 
+    def refusal(self) -> tuple[int, dict] | None:
+      """The answer for a request to refuse before reading it, else None."""
+      host = self.headers.get('Host', '')
+      # a page on another site can rebind its DNS name to this device to read and post as the same origin, but the
+      # browser still sends that name as the Host
+      if not device_host(host):
+        return 421, {'error': "Open this page at the device's IP address"}
+      origin = self.headers.get('Origin')
+      if origin is not None and origin.partition('://')[2].lower() != host.lower():
+        return 403, {'error': 'Requests from other sites are not allowed'}
+      if 'Transfer-Encoding' in self.headers:  # the body is never decoded from chunks here, so it would be misread
+        return 501, {'error': 'Chunked requests are not supported'}
+      return None
+
     def do_GET(self):
+      if (refusal := self.refusal()) is not None:
+        return self.send_json(*refusal)
       if self.path == '/':
         self.send(200, PAGE.encode(), 'text/html; charset=utf-8')
       elif self.path == '/api/state':
@@ -169,22 +353,27 @@ def make_handler(navweb: NavWeb):
         self.send_json(404, {'error': 'Not found'})
 
     def do_POST(self):
+      if (refusal := self.refusal()) is not None:
+        return self.send_json(*refusal)
       # Requiring JSON makes browsers preflight requests from other sites, which this server never allows
       if self.headers.get('Content-Type', '').split(';')[0].strip() != 'application/json':
         return self.send_json(415, {'error': 'Expected JSON'})
-      length = self.headers.get('Content-Length') or '0'
-      if not length.isdigit() or int(length) > MAX_BODY:
+      length = self.headers.get('Content-Length')
+      if length is None:
+        return self.send_json(411, {'error': 'Content-Length required'})
+      if not (length.isascii() and length.isdigit()):  # isdigit() alone passes digits like '²', which int() rejects
+        return self.send_json(400, {'error': 'Invalid Content-Length'})
+      if len(length) > 9 or int(length) > MAX_BODY:  # int() also rejects thousands of digits
         return self.send_json(413, {'error': 'Request too large'})
-      length = int(length)
       if self.path not in routes:
         return self.send_json(404, {'error': 'Not found'})
       try:
-        body = json.loads(self.rfile.read(length) or b'{}')
+        body = json.loads(self.rfile.read(int(length)) or b'{}')
         status, payload = routes[self.path](body if isinstance(body, dict) else {})
       except requests.RequestException as e:
         # requests exceptions contain the URL, and with it the access token; keep it out of logs
         cloudlog.error(f"navweb: request failed: {type(e).__name__}")
-        status, payload = 502, {'error': 'Could not reach the map service. Is the device online, and is the token valid?'}
+        status, payload = 502, {'error': mapbox_error(e)}
       except (ValueError, KeyError, TypeError):
         status, payload = 400, {'error': 'Invalid request'}
       self.send_json(status, payload)
@@ -295,9 +484,24 @@ async function refresh() {
   try { render(await call('/api/state')); } catch (e) { showError(e.message); }
 }
 
+function showPlaces(places) {
+  showError(places.length ? '' : 'No matches');
+  $('results').replaceChildren(...places.map((place) => {
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.textContent = place.place_name;
+    button.addEventListener('click', () => setDestination(place));
+    item.append(button);
+    return item;
+  }));
+}
+
 async function setDestination(body) {
   try {
-    render(await call('/api/destination', body));
+    const payload = await call('/api/destination', body);
+    // a link that names its place without coordinates gives places to pick from, like a search
+    if (payload.places) return showPlaces(payload.places);
+    render(payload);
     $('results').replaceChildren();
     $('link').value = '';
     showError('');
@@ -306,18 +510,7 @@ async function setDestination(body) {
 
 $('search-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  try {
-    const {places} = await call('/api/search', {query: $('query').value});
-    showError(places.length ? '' : 'No matches');
-    $('results').replaceChildren(...places.map((place) => {
-      const item = document.createElement('li');
-      const button = document.createElement('button');
-      button.textContent = place.place_name;
-      button.addEventListener('click', () => setDestination(place));
-      item.append(button);
-      return item;
-    }));
-  } catch (e) { showError(e.message); }
+  try { showPlaces((await call('/api/search', {query: $('query').value})).places); } catch (e) { showError(e.message); }
 });
 
 $('link-form').addEventListener('submit', (event) => { event.preventDefault(); setDestination({text: $('link').value}); });
