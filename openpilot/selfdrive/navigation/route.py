@@ -1,4 +1,6 @@
 """Planar geometry for routes, and route-relative map pose and progress tracking."""
+import math
+
 import numpy as np
 
 METERS_PER_DEGREE = 2 * np.pi * 6371008.8 / 360  # mean Earth radius, as Mapbox measures distances
@@ -32,22 +34,38 @@ def cumulative_distance(route: np.ndarray) -> np.ndarray:
   return np.r_[0.0, np.cumsum(steps)]
 
 
-def along_path(path: np.ndarray, point) -> tuple[float, float]:
-  """(meters along a (longitude, latitude) path to a point, and the point's distance from the path):
-  the path up to the start of the nearest segment, then straight to the point."""
-  local, p = local_meters(path, path[0]), local_meters(point, path[0])
-  segment, _, lateral = nearest_segment(local[:-1], local[1:], p)
-  return float(cumulative_distance(path)[segment] + np.linalg.norm(local_meters(point, path[segment]))), lateral
+def bearing(east: float, north: float) -> float:
+  """Degrees clockwise from north of a local east/north direction."""
+  return math.degrees(math.atan2(east, north)) % 360
 
 
-def project_onto_path(path: np.ndarray, point) -> tuple[float, float]:
-  """(meters along a (longitude, latitude) path to the closest spot on it, and the point's distance from that spot)."""
+def project_onto_path(path: np.ndarray, point, extend: bool = False) -> tuple[float, float, float]:
+  """(meters along a (longitude, latitude) path to the closest spot on it, the point's distance from that spot, and the
+  path's bearing there), measured on the nearest segment, so a point beside the path gets no progress for its offset.
+  With extend, the first segment reaches back before the path's start and the last one past its end: a point behind the
+  path reads below 0 and one past it beyond its length, each with its distance from that line. A path of one point has
+  no direction: a point is its distance past it, with a NaN bearing."""
   local, p = local_meters(path, path[0]), local_meters(point, path[0])
-  if len(local) < 2:
-    return 0.0, float(np.linalg.norm(p))
-  segment, fraction, lateral = nearest_segment(local[:-1], local[1:], p)
   distance = cumulative_distance(path)
-  return float(distance[segment] + fraction * (distance[segment + 1] - distance[segment])), lateral
+  keep = np.r_[True, np.diff(distance) > 1e-6]  # a zero length segment has no direction
+  local, distance = local[keep], distance[keep]
+  if len(local) < 2:
+    offset = float(np.linalg.norm(p))
+    return offset if extend else 0.0, offset, math.nan
+  segment, fraction, lateral = nearest_segment(local[:-1], local[1:], p)
+  start, direction = local[segment], local[segment + 1] - local[segment]
+  if extend:
+    t = float(np.dot(p - start, direction) / np.dot(direction, direction))
+    if (segment == 0 and t < 0) or (segment == len(local) - 2 and t > 1):
+      fraction, lateral = t, float(np.linalg.norm(start + t * direction - p))
+  along = distance[segment] + fraction * (distance[segment + 1] - distance[segment])
+  return float(along), lateral, bearing(*direction)
+
+
+def point_along(path: np.ndarray, distance: float) -> np.ndarray:
+  """The (longitude, latitude) spot a distance along a path, clipped to its ends."""
+  cumulative = cumulative_distance(path)
+  return np.array([np.interp(distance, cumulative, path[:, 0]), np.interp(distance, cumulative, path[:, 1])])
 
 
 class RouteTracker:

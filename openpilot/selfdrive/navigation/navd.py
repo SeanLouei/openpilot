@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os
+import time
+from dataclasses import dataclass
 
 import numpy as np
 import requests
@@ -10,7 +12,7 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
-from openpilot.selfdrive.navigation.route import along_path, cumulative_distance, local_meters, project_onto_path
+from openpilot.selfdrive.navigation.route import bearing, cumulative_distance, local_meters, nearest_segment, point_along, project_onto_path
 
 REROUTE_DISTANCE = 25
 MANEUVER_TRANSITION_THRESHOLD = 10
@@ -18,6 +20,35 @@ NEXT_STEP_DISTANCE = 15  # m from the next step's path the car drives along it, 
 REROUTE_COUNTER_MIN = 3
 ROUTE_RESEND_PERIOD = 10  # updates (seconds); a restarted mapsd gets the route within this
 RECOMPUTE_HOLD = 10  # updates (seconds) between route requests
+MAX_FIX_AGE = 1.5  # s; navd may read a fix a second late, so the published distances count the car's travel since, up to this
+
+# The next step of a U-turn, a sharp turn or a roundabout turnaround runs right beside the road the car comes on, so the car
+# takes a maneuver only once it reached the maneuver point and heads along the route after it
+REACHED_DISTANCE = 15.  # m before the maneuver point
+REACHED_TIME = 1.5  # s at the car's speed, so that a 1 Hz fix lands within it
+HEADING_MIN_SPEED = 2.  # m/s; slower, the GPS bearing is noise, so the step waits
+HEADING_TOLERANCE = 45.  # deg
+
+# At a split the old road goes on straight beside the route's branch at first: an exit, a fork, or a turn within the heading
+# tolerance, which a car going straight on would pass. Past it, the car is on whichever road it is clearly closer to. Moving
+# on wrongly would bring the branch's next turn to a car on the old road, while a wrong miss only reroutes.
+SPLIT_TYPES = ('off ramp', 'fork')
+SPLIT_ANGLE = HEADING_TOLERANCE  # deg between the old road and the route's branch
+SPLIT_NEAR = 8.  # m from the branch, at most, to be on it
+SPLIT_MARGIN = 10.  # m closer to the branch than to the old road; a GPS error of a few meters can last seconds
+SPLIT_MISSED = 10.  # m from the branch, at least, to have missed it
+SPLIT_MISSED_MARGIN = 6.  # m closer to the old road than to the branch
+ROUTE_AHEAD = 300.  # m of the route after a maneuver, and of the old road's straight continuation, that are compared
+DIRECTION_LENGTH = 20.  # m of road a direction at a maneuver is measured over
+
+# navd samples once a second, and at highway speed a short step is driven past between two fixes
+REPLAY_SPACING = 2.  # m between the spots checked along the straight line from the previous fix
+REPLAY_MAX = 80.  # m; a longer line, after a GPS gap, is not replayed
+
+# Heading away from the step's direction, with its maneuver still far ahead, the car left the route
+WRONG_HEADING_SPEED = 3.  # m/s
+WRONG_HEADING_DISTANCE = 25.  # m before the maneuver point; nearer, turning in early is normal
+WRONG_HEADING_FIXES = 2  # consecutive
 
 # Mapbox lane indications as navInstruction lane directions
 LANE_DIRECTIONS = {'sharp left': 'left', 'left': 'left', 'slight left': 'slightLeft', 'straight': 'straight',
@@ -42,6 +73,32 @@ def set_banner(instruction, banners, distance_to_maneuver):
                         'activeDirection': LANE_DIRECTIONS.get(lane.get('active_direction'), 'none')} for lane in lanes]
 
 
+def angle_between(a: float, b: float) -> float:
+  """Degrees between two bearings, 0 to 180."""
+  return abs((a - b + 180) % 360 - 180)
+
+
+def step_maneuver(step) -> tuple[str, str]:
+  """(type, modifier) of the maneuver a step ends at, from its banners."""
+  banners = step['bannerInstructions']
+  primary = banners[0]['primary'] if banners else {}
+  return primary.get('type') or '', primary.get('modifier') or ''
+
+
+@dataclass
+class RouteAhead:
+  """The route after a step's maneuver, which the car drives along once it took the maneuver."""
+  path: np.ndarray  # (longitude, latitude) of the following steps, ROUTE_AHEAD m of them or to the route's end
+  next_length: float  # m of the next step
+  split: bool  # the old road goes on straight beside the route's branch at first
+  maneuver: np.ndarray  # (longitude, latitude) of the maneuver point
+  continuation: np.ndarray  # east/north meters from the maneuver point to the end of the old road's straight continuation
+
+  def continuation_distance(self, position) -> float:
+    """m from a (longitude, latitude) position to the old road's straight continuation."""
+    return nearest_segment(np.zeros((1, 2)), self.continuation[None], local_meters(position, self.maneuver))[2]
+
+
 class RouteEngine:
   def __init__(self, sm, pm, params=None):
     self.sm = sm
@@ -50,18 +107,33 @@ class RouteEngine:
 
     self.last_position = None  # (longitude, latitude)
     self.last_bearing = None
+    self.last_speed = 0.  # m/s
+    self.fix_time = None  # monotonic s the last fix was published
 
     self.nav_destination = None
     self.step_idx = None
     self.route = None
     self.route_geometry = None  # an (n, 2) array of (longitude, latitude) per step
+    self.ahead_cache: tuple[list | None, dict[int, RouteAhead]] = (None, {})
 
     self.recompute_hold = 0
     self.reroute_counter = 0
     self.gps_ok = True
-    self.missed_maneuver = False  # the car went past the maneuver point without taking it
+    self.reset_progress()
 
     self.api = Api(self.params.get("DongleId")) if not os.environ.get("MAPBOX_TOKEN") else None
+
+  def reset_progress(self) -> None:
+    """Forget the car's progress, for a new route or none."""
+    self.missed_maneuver = False  # the car went past the maneuver point without taking it
+    self.reached = False  # the car came up to the current step's maneuver point
+    self.previous_position = None  # the last fix the steps were followed at
+    self.wrong_heading_fixes = 0  # consecutive fixes heading away from the step's direction, far from its maneuver
+    self.near_destination = False  # the car has been near the destination on this route
+
+  @property
+  def wrong_way(self) -> bool:
+    return self.wrong_heading_fixes >= WRONG_HEADING_FIXES
 
   def update(self):
     self.sm.update(0)
@@ -69,7 +141,8 @@ class RouteEngine:
     source = latest_gps_source(self.sm)
     if source is not None:
       gps = self.sm[source]
-      self.last_position, self.last_bearing = (gps.longitude, gps.latitude), gps.bearingDeg
+      self.last_position, self.last_bearing, self.last_speed = (gps.longitude, gps.latitude), gps.bearingDeg, gps.speed
+      self.fix_time = self.sm.logMonoTime[source] * 1e-9
     # without a fresh fix the distance to the maneuver is frozen, so the instruction is not valid for steering on
     self.gps_ok = source is not None
     route = self.route
@@ -146,7 +219,7 @@ class RouteEngine:
         self.route = r['routes'][0]['legs'][0]['steps']
         self.route_geometry = [np.array(step['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for step in self.route]
         self.step_idx = 0
-        self.missed_maneuver = False
+        self.reset_progress()
       else:
         cloudlog.warning("Got empty route response")
         self.clear_route()
@@ -165,57 +238,150 @@ class RouteEngine:
       return
 
     assert self.route is not None and self.route_geometry is not None and self.last_position is not None
+    self.follow_route()
     step = self.route[self.step_idx]
-    along_geometry, off_route = along_path(self.route_geometry[self.step_idx], self.last_position)
-    distance_to_maneuver_along_geometry = step['distance'] - along_geometry
+    along, off_route, direction = project_onto_path(self.route_geometry[self.step_idx], self.last_position, extend=True)
+    distance_to_maneuver = step['distance'] - along
 
-    # Onto another road the car took the maneuver once it drives along the next step. Past the maneuver point without
-    # that, it missed the maneuver: what comes after it is not ahead of the car, so the instruction is invalid until the
-    # reroute, as it is off the route. The last maneuver, the arrival, keeps the distance rule.
+    # Past the maneuver point without taking it, the car missed the maneuver: what comes after it is not ahead of the car,
+    # so the instruction is invalid until the reroute, as it is off the route or heading away from the step's direction.
+    # The last maneuver, the arrival, keeps the distance rule.
     road_ahead = self.step_idx + 2 < len(self.route)
-    took_maneuver = road_ahead and self.took_maneuver()
-    self.missed_maneuver = road_ahead and not took_maneuver and distance_to_maneuver_along_geometry < -MANEUVER_TRANSITION_THRESHOLD
-    msg.valid = not self.missed_maneuver and off_route <= REROUTE_DISTANCE
+    self.missed_maneuver = road_ahead and self.missed(distance_to_maneuver)
+    wrong_heading = (self.last_speed >= WRONG_HEADING_SPEED and distance_to_maneuver > WRONG_HEADING_DISTANCE and
+                     angle_between(self.last_bearing, direction) > HEADING_TOLERANCE)
+    self.wrong_heading_fixes = self.wrong_heading_fixes + 1 if wrong_heading else 0
+    msg.valid = not self.missed_maneuver and not self.wrong_way and off_route <= REROUTE_DISTANCE
 
     # Banner instructions are for the following maneuver step, don't use empty last step
     banner_step = step
     if not len(banner_step['bannerInstructions']) and self.step_idx == len(self.route) - 1:
       banner_step = self.route[max(self.step_idx - 1, 0)]
 
-    # Current instruction
-    msg.navInstruction.maneuverDistance = distance_to_maneuver_along_geometry
-    set_banner(msg.navInstruction, banner_step['bannerInstructions'], distance_to_maneuver_along_geometry)
+    # Current instruction, for where the car is as it goes out: the fix may be a second old
+    fix_age = float(np.clip(time.monotonic() - self.fix_time, 0., MAX_FIX_AGE)) if self.fix_time is not None else 0.
+    maneuver_distance = distance_to_maneuver - self.last_speed * fix_age
+    msg.navInstruction.maneuverDistance = maneuver_distance
+    set_banner(msg.navInstruction, banner_step['bannerInstructions'], maneuver_distance)
 
-    # Total remaining distance and time: the rest of this step, then every step after it
-    remaining = 1.0 - along_geometry / max(step['distance'], 1)
+    # Total remaining distance and time: the rest of this step, then every step after it. So the maneuver's distance to the
+    # destination is the later steps' sum, whatever the GPS does, which is how controls tell a GPS jump from the next maneuver.
     future = self.route[self.step_idx + 1:]
-    msg.navInstruction.distanceRemaining = step['distance'] * remaining + sum(s['distance'] for s in future)
+    msg.navInstruction.distanceRemaining = maneuver_distance + sum(s['distance'] for s in future)
+    remaining = max(distance_to_maneuver, 0.) / max(step['distance'], 1)
     msg.navInstruction.timeRemaining = step['duration'] * remaining + sum(s['duration'] for s in future)
 
     self.pm.send('navInstruction', msg)
 
-    # Transition to next route segment
-    if took_maneuver:
-      self.step_idx += 1
-      self.recompute_hold = 0
-    elif not road_ahead and distance_to_maneuver_along_geometry < -MANEUVER_TRANSITION_THRESHOLD:
+    # Navigation ends once the car drives away from the destination, after it has been there on this route
+    route_end = self.route_geometry[-1][-1]
+    self.near_destination |= bool(np.linalg.norm(local_meters(self.last_position, route_end)) <= REROUTE_DISTANCE)
+    if self.nav_destination is not None:
+      self.near_destination |= bool(np.linalg.norm(local_meters(self.last_position, self.nav_destination)) <= REROUTE_DISTANCE)
+    if not road_ahead and distance_to_maneuver < -MANEUVER_TRANSITION_THRESHOLD:
       if self.step_idx + 1 < len(self.route):
-        self.step_idx += 1
-        self.recompute_hold = 0
+        self.next_step()
       else:
         cloudlog.warning("Destination reached")
 
         # Clear route if driving away from destination
-        if np.linalg.norm(local_meters(self.last_position, self.nav_destination)) > REROUTE_DISTANCE:
+        if self.near_destination and np.linalg.norm(local_meters(self.last_position, self.nav_destination)) > REROUTE_DISTANCE:
           self.params.remove("NavDestination")
           self.clear_route()
 
-  def took_maneuver(self) -> bool:
-    """Whether the car drives along the next step: close to its path, and some way along it."""
-    assert self.route_geometry is not None and self.step_idx is not None and self.last_position is not None
-    path = self.route_geometry[self.step_idx + 1]
-    along, lateral = project_onto_path(path, self.last_position)
-    return lateral <= NEXT_STEP_DISTANCE and along >= min(MANEUVER_TRANSITION_THRESHOLD, cumulative_distance(path)[-1] / 2)
+  def next_step(self) -> None:
+    assert self.step_idx is not None
+    self.step_idx += 1
+    self.reached = False
+    self.recompute_hold = 0
+
+  def follow_route(self) -> None:
+    """Move on through every step the car took since the last fix. The straight line from that fix to this one is checked
+    every 2 m, as if navd had sampled there, with this fix's speed and bearing: at highway speed the car drives past a short
+    step between two fixes."""
+    assert self.route is not None and self.step_idx is not None and self.last_position is not None
+    position = np.array(self.last_position, dtype=np.float64)
+    positions = [position]
+    if self.previous_position is not None:
+      length = float(np.linalg.norm(local_meters(position, self.previous_position)))
+      if length <= REPLAY_MAX:
+        line = position - self.previous_position
+        positions = [self.previous_position + line * d / length for d in np.arange(REPLAY_SPACING, length, REPLAY_SPACING)] + positions
+    for spot in positions:
+      while self.step_idx + 2 < len(self.route):  # the last road step, to the destination, keeps the distance rule
+        if not self.reached:
+          along = project_onto_path(self.route_geometry[self.step_idx], spot, extend=True)[0]
+          self.reached = self.route[self.step_idx]['distance'] - along <= max(REACHED_DISTANCE, self.last_speed * REACHED_TIME)
+        if not self.took_maneuver(spot):
+          break
+        self.next_step()
+    self.previous_position = position
+
+  def route_ahead(self, idx: int) -> RouteAhead:
+    """The route after step idx's maneuver, kept until the route changes."""
+    assert self.route is not None and self.route_geometry is not None
+    if self.ahead_cache[0] is not self.route_geometry:
+      self.ahead_cache = (self.route_geometry, {})
+    cache = self.ahead_cache[1]
+    if idx not in cache:
+      paths, length = [], 0.
+      for path in self.route_geometry[idx + 1:]:
+        paths.append(path)
+        length += float(cumulative_distance(path)[-1])
+        if length >= ROUTE_AHEAD:
+          break
+      road, following = self.route_geometry[idx], self.route_geometry[idx + 1]
+      maneuver, next_length = road[-1], float(cumulative_distance(following)[-1])
+      old = local_meters(maneuver, point_along(road, float(cumulative_distance(road)[-1]) - DIRECTION_LENGTH))
+      new = local_meters(point_along(following, DIRECTION_LENGTH), maneuver)
+      kind, modifier = step_maneuver(self.route[idx])
+      split = False
+      if min(np.linalg.norm(old), np.linalg.norm(new)) > 1e-3 and modifier != 'straight':
+        # a maneuver straight on, or a merge, stays on the road: no other road goes on beside it
+        slight = kind != 'merge' and modifier != '' and angle_between(bearing(*old), bearing(*new)) <= SPLIT_ANGLE
+        split = kind in SPLIT_TYPES or slight
+      continuation = old / max(float(np.linalg.norm(old)), 1e-3) * ROUTE_AHEAD
+      cache[idx] = RouteAhead(np.concatenate(paths), next_length, split, maneuver, continuation)
+    return cache[idx]
+
+  def along_route_ahead(self, position) -> tuple[RouteAhead, float, float, bool | None]:
+    """The route after the current step's maneuver, a position's progress along it and distance from it, and whether the
+    car heads along it there, None while too slow to tell. Past a short next step, that is the road the car is on now."""
+    assert self.step_idx is not None and self.last_bearing is not None
+    ahead = self.route_ahead(self.step_idx)
+    along, lateral, direction = project_onto_path(ahead.path, position)
+    heading = angle_between(self.last_bearing, direction) <= HEADING_TOLERANCE if self.last_speed >= HEADING_MIN_SPEED else None
+    return ahead, along, lateral, heading
+
+  def on_next_step(self, ahead: RouteAhead, position) -> bool:
+    """Close to the next step's path and some way along it."""
+    assert self.route_geometry is not None and self.step_idx is not None
+    along, lateral, _ = project_onto_path(self.route_geometry[self.step_idx + 1], position)
+    return lateral <= NEXT_STEP_DISTANCE and along >= min(MANEUVER_TRANSITION_THRESHOLD, ahead.next_length / 2)
+
+  def took_maneuver(self, position) -> bool:
+    """Whether the car took the current step's maneuver: it reached the maneuver point, and drives along the next step.
+    Past a split it must instead be on the route and clearly closer to it than to the old road going on, measured along the
+    following steps too, as the car may be past a short next step before it is clearly apart from the old road."""
+    if not self.reached:
+      return False
+    ahead, along, lateral, heading = self.along_route_ahead(position)
+    if not heading:
+      return False
+    if ahead.split:
+      return (along >= min(MANEUVER_TRANSITION_THRESHOLD, ahead.next_length / 2) and lateral <= SPLIT_NEAR and
+              ahead.continuation_distance(position) - lateral >= SPLIT_MARGIN)
+    return self.on_next_step(ahead, position)
+
+  def missed(self, distance_to_maneuver: float) -> bool:
+    """Whether the car went past the current step's maneuver point without taking it."""
+    ahead, _, lateral, heading = self.along_route_ahead(self.last_position)
+    if ahead.split:
+      # past a split, until the car is clearly on one road, the step stays: its maneuver is behind the car, so nothing
+      # turns or slows for it
+      return distance_to_maneuver < 0. and lateral >= SPLIT_MISSED and lateral - ahead.continuation_distance(self.last_position) >= SPLIT_MISSED_MARGIN
+    # on the next step but too slow to tell its heading, it waits
+    return distance_to_maneuver < -MANEUVER_TRANSITION_THRESHOLD and not (self.on_next_step(ahead, self.last_position) and heading is not False)
 
   def send_route(self):
     coords = np.concatenate(self.route_geometry) if self.route_geometry is not None else np.empty((0, 2))
@@ -228,7 +394,7 @@ class RouteEngine:
     self.route_geometry = None
     self.step_idx = None
     self.nav_destination = None
-    self.missed_maneuver = False
+    self.reset_progress()
 
   def should_recompute(self):
     if self.step_idx is None:
@@ -241,8 +407,9 @@ class RouteEngine:
     if self.missed_maneuver:
       return True
 
-    # TODO: Check for going wrong way in segment
-    if along_path(self.route_geometry[self.step_idx], self.last_position)[1] > REROUTE_DISTANCE:
+    # off the route, or heading the wrong way along it
+    off_route = project_onto_path(self.route_geometry[self.step_idx], self.last_position, extend=True)[1] > REROUTE_DISTANCE
+    if off_route or self.wrong_way:
       self.reroute_counter += 1
     else:
       self.reroute_counter = 0

@@ -6,11 +6,11 @@ See the LICENSE.md file in the root directory for more details.
 """
 import http.client
 import json
+import select
 import socket
 import threading
 import time
 from contextlib import contextmanager
-from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import urljoin
@@ -21,8 +21,9 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.parameterized import parameterized
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.sunnypilot.navd.navweb import (LINK_FAILED, MAPBOX_ERRORS, MAPBOX_FAILED, MAX_BODY, MAX_REDIRECTS, OFFLINE, LinkError, NavWeb, Place,
-                                              geocode, make_handler, place_from_text, read_link, resolve_link, search_text)
+from openpilot.sunnypilot.navd.navweb import (LINK_FAILED, MAPBOX_ERRORS, MAPBOX_FAILED, MAX_BODY, MAX_CONNECTIONS, MAX_HEADERS, MAX_REDIRECTS, OFFLINE,
+                                              PORT, LinkError, NavWeb, Place, Server, geocode, main, make_handler, place_from_text, read_link,
+                                              resolve_link, search_text)
 
 COSTCO = 'Costco Wholesale, 1600 El Camino Real, South San Francisco, CA 94080'
 COSTCO_ADDRESS = '1600 El Camino Real, South San Francisco, CA 94080'
@@ -88,7 +89,7 @@ def proximity(navweb):
 
 @contextmanager
 def serving(navweb, **attributes):
-  server = ThreadingHTTPServer(('127.0.0.1', 0), type('Handler', (make_handler(navweb),), attributes))
+  server = Server(('127.0.0.1', 0), type('Handler', (make_handler(navweb),), attributes))
   threading.Thread(target=server.serve_forever, daemon=True).start()
   try:
     yield server.server_address[1]
@@ -102,6 +103,34 @@ def request(port, method, path, body=None, content_type='application/json', head
   connection.request(method, path, body=body, headers={**({'Content-Type': content_type} if body is not None else {}), **(headers or {})})
   response = connection.getresponse()
   return response.status, response.read()
+
+
+def answered(port):
+  """Whether a request for the state gets an answer, rather than its connection closed at once."""
+  try:
+    return request(port, 'GET', '/api/state')[0] == 200
+  except ConnectionError:
+    return False
+
+
+def eventually(condition, timeout=2.):
+  """Whether condition() comes true within timeout seconds."""
+  end = time.monotonic() + timeout
+  while not condition():
+    if time.monotonic() > end:
+      return False
+    time.sleep(0.01)
+  return True
+
+
+def trickle(client, limit=5.):
+  """Sends a byte every 0.1 s until the server closes the connection, or for limit seconds."""
+  start = time.monotonic()
+  try:
+    while not select.select([client], [], [], 0.1)[0] and time.monotonic() - start < limit:
+      client.sendall(b'a')
+  except OSError:  # reset by the server
+    pass
 
 
 def raw_request(port, method, path, headers, body=None):
@@ -387,6 +416,11 @@ class TestServer(OpenpilotTestCase):
       assert request(port, 'POST', '/api/missing', '{}')[0] == 404
       assert request(port, 'POST', '/api/destination', '[1, 2]')[0] == 400
       assert request(port, 'POST', '/api/destination', '{"latitude": "north"}')[0] == 400
+      # float() raises OverflowError, not ValueError, for an integer too big for a float
+      for huge in ({'latitude': int('9' * 400), 'longitude': 1}, {'latitude': 1, 'longitude': -int('9' * 400)}):
+        status, body = request(port, 'POST', '/api/destination', json.dumps(huge))
+        assert status == 400 and json.loads(body) == {'error': 'Invalid request'}
+      assert request(port, 'POST', '/api/destination', '{"latitude": 1e999, "longitude": 1}')[0] == 400  # inf
       assert request(port, 'POST', '/api/clear', 'x' * (MAX_BODY + 1))[0] == 413
       assert request(port, 'POST', '/api/token', '{}')[0] == 400
 
@@ -447,6 +481,61 @@ class TestServer(OpenpilotTestCase):
     with serving(NavWeb(FakeParams()), timeout=0.1) as port, socket.create_connection(('127.0.0.1', port), timeout=5) as client:
       client.sendall(b'GET /api/state HTTP/1.1\r\nHost: 127.0.0.1\r\n')
       assert client.recv(1024) == b''
+
+  @parameterized.expand([
+    (b'GET /api/state HT',),
+    (b'GET /api/state HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Slow: ',),
+    (b'POST /api/clear HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{',),
+  ])
+  def test_trickling_clients_are_cut_off(self, start):
+    # the handler's timeout restarts with every byte it reads, so alone it would never drop a client sending one byte at a time
+    with patch('openpilot.sunnypilot.navd.navweb.MAX_CONNECTION_TIME', 1.), patch('openpilot.sunnypilot.navd.navweb.MAX_CONNECTIONS', 1), \
+         serving(NavWeb(FakeParams())) as port:
+      with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
+        connected = time.monotonic()
+        client.sendall(start)
+        assert not answered(port)  # it holds the only connection
+        trickle(client)
+        assert 0.9 < time.monotonic() - connected < 2.5  # cut off at its deadline, long before the handler's 10 s timeout
+      assert eventually(lambda: answered(port))  # which frees its connection
+
+  def test_connections_are_capped(self):
+    # each connection holds a thread and its buffers, and a phone's browser opens a few at a time
+    with serving(NavWeb(FakeParams())) as port:
+      idle = [socket.create_connection(('127.0.0.1', port), timeout=5) for _ in range(MAX_CONNECTIONS)]
+      try:
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as extra:
+          assert extra.recv(1) == b''  # closed at once, without waiting for a request
+        assert select.select(idle, [], [], 0.2)[0] == []  # while the others stay open
+        idle.pop().close()
+        assert eventually(lambda: answered(port))  # one that closes makes room
+      finally:
+        for client in idle:
+          client.close()
+      # finished requests never keep theirs: with each one kept, all later ones would be refused
+      assert eventually(lambda: all(answered(port) for _ in range(2 * MAX_CONNECTIONS)))
+
+  def test_large_headers_are_refused(self):
+    # the stdlib alone reads up to 100 header lines of 64 KB each, before do_GET or do_POST could refuse them
+    def status_line(port, size):
+      """The response's status line to a request whose headers are size bytes, the blank line that ends them included."""
+      host = b'Host: 127.0.0.1\r\n'
+      padding = b'X-Padding: ' + b'a' * (size - len(host) - len(b'X-Padding: \r\n\r\n')) + b'\r\n'
+      with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
+        client.sendall(b'GET /api/state HTTP/1.1\r\n' + host + padding + b'\r\n')
+        return client.makefile('rb').readline()
+
+    with serving(NavWeb(FakeParams())) as port:
+      assert status_line(port, MAX_HEADERS).startswith(b'HTTP/1.0 200 ')
+      assert status_line(port, MAX_HEADERS + 1).startswith(b'HTTP/1.0 431 ')
+
+  def test_main_serves_with_the_limits(self):
+    class Stop(Exception):
+      pass
+
+    with patch('openpilot.sunnypilot.navd.navweb.Server') as server, patch.object(messaging, 'SubMaster', side_effect=Stop), self.assertRaises(Stop):
+      main()
+    assert server.call_args.args[0] == ('0.0.0.0', PORT)
 
   def test_failed_search_keeps_token_out_of_logs(self):
     with serving(NavWeb(FakeParams(MapboxToken='pk.secret'))) as port, \

@@ -11,6 +11,14 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
+class PlantSubMaster(dict):
+  """One step's messages, and what else the planner reads of a SubMaster: each message was just received."""
+  def __init__(self, msgs):
+    super().__init__(msgs)
+    self.seen = dict.fromkeys(msgs, True)
+    self.recv_time = dict.fromkeys(msgs, time.monotonic())
+
+
 class Plant:
   messaging_initialized = False
 
@@ -58,7 +66,7 @@ class Plant:
   def current_time(self):
     return float(self.rk.frame) / self.rate
 
-  def step(self, v_lead=0.0, prob_lead=1.0, v_cruise=50.):
+  def step(self, v_lead=0.0, prob_lead=1.0, v_cruise=50., nav_turn_speed=0.):
     # ******** publish a fake model going straight and fake calibration ********
     # note that this is worst case for MPC, since model will delay long mpc by one time step
     radar = messaging.new_message('radarState')
@@ -70,6 +78,7 @@ class Plant:
     live_map_data_sp = messaging.new_message('liveMapDataSP')
     gps_data = messaging.new_message('gpsLocation')
     car_control = messaging.new_message('carControl')
+    model_sp = messaging.new_message('modelDataV2SP')
     a_lead = (v_lead - self.v_lead_prev)/self.ts
     self.v_lead_prev = v_lead
 
@@ -118,6 +127,14 @@ class Plant:
     acceleration = log.XYZTData.new_message()
     acceleration.x = [float(x) for x in np.zeros_like(ModelConstants.T_IDXS)]
     model.modelV2.acceleration = acceleration
+    # a straight road's yaw rate, small but not 0, like the real model's: smart cruise control's vision speed divides by it
+    orientation_rate = log.XYZTData.new_message()
+    orientation_rate.z = [1e-3] * len(ModelConstants.T_IDXS)
+    model.modelV2.orientationRate = orientation_rate
+
+    # sunnypilot: its longitudinal features, the route turn's slowdown among them, run while openpilot is engaged
+    car_control.carControl.enabled = self.enabled
+    model_sp.modelDataV2SP.navTurnSpeed = float(nav_turn_speed)  # m/s the route's turn limits the speed to, 0 for none
 
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
     ss.selfdriveState.personality = self.personality
@@ -127,15 +144,16 @@ class Plant:
     car_state.carState.vCruise = float(v_cruise * 3.6)
 
     # ******** get controlsState messages for plotting ***
-    sm = {'radarState': radar.radarState,
-          'carState': car_state.carState,
-          'carControl': car_control.carControl,
-          'controlsState': control.controlsState,
-          'selfdriveState': ss.selfdriveState,
-          'modelV2': model.modelV2,
-          'carStateSP': car_state_sp.carStateSP,
-          'liveMapDataSP': live_map_data_sp.liveMapDataSP,
-          'gpsLocation': gps_data.gpsLocation}
+    sm = PlantSubMaster({'radarState': radar.radarState,
+                         'carState': car_state.carState,
+                         'carControl': car_control.carControl,
+                         'controlsState': control.controlsState,
+                         'selfdriveState': ss.selfdriveState,
+                         'modelV2': model.modelV2,
+                         'carStateSP': car_state_sp.carStateSP,
+                         'liveMapDataSP': live_map_data_sp.liveMapDataSP,
+                         'gpsLocation': gps_data.gpsLocation,
+                         'modelDataV2SP': model_sp.modelDataV2SP})
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:

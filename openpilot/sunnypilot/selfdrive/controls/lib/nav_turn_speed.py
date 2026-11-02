@@ -13,16 +13,15 @@ from opendbc.car.interfaces import ACCEL_MAX
 from openpilot.cereal import custom
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
-from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NAV_TURN_DECEL, NAV_TURN_SPEED
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NAV_TURN_DECEL, NAV_TURN_MAX_DECEL, NAV_TURN_SPEED
 
 EventNameSP = custom.OnroadEventSP.EventName
 
 NAV_TURN_LIMIT_MAX_AGE = 0.5  # s; modeld publishes the route turn's speed limit with every model frame
-NAV_TURN_MAX_DECEL = 1.5  # m/s^2 at most, when the turn comes up late
 NAV_TURN_JERK = 1.5  # m/s^3
-NAV_TURN_ALERT_DECEL = 0.3  # m/s^2 of slowing that counts as the slowdown taking over
+NAV_TURN_ALERT_DECEL = 0.3  # m/s^2 of slowing that counts as the slowdown taking over, and of speeding up as it letting go
 NAV_TURN_ALERT_MARGIN = 0.5  # m/s above turn speed
-NAV_TURN_ALERT_RESET = 5.  # s without a route turn limit before the next one alerts again
+NAV_TURN_ALERT_RESET = 5.  # s the limit lets go of the car, or is off, before the next slowdown alerts again
 
 
 class NavTurnSpeedController:
@@ -37,7 +36,7 @@ class NavTurnSpeedController:
     self.a_target = 0.
     self.active = False  # a route turn limits the speed
     self.alerted = False
-    self.inactive_time = math.inf
+    self.free_time = math.inf  # s the limit has let the car speed up, or been off
 
   @staticmethod
   def published_limit(sm) -> float:
@@ -51,17 +50,18 @@ class NavTurnSpeedController:
     engaged = self.CP.openpilotLongitudinalControl and long_enabled and not long_override
     self.v_target = limit if engaged and limit > 0. else V_CRUISE_UNSET
     self.active = self.v_target < V_CRUISE_UNSET
-    if not self.active:
-      self.inactive_time += DT_MDL
-      self.alerted &= self.inactive_time < NAV_TURN_ALERT_RESET
-      return
-    self.inactive_time = 0.
+    a_desired = ACCEL_MAX  # without a limit
+    if self.active:
+      # follow the profile: its own deceleration plus a correction toward it. Only more braking is jerk limited, from the
+      # planner's last output, so harder braking the planner had for something else never lingers here.
+      profile_decel = NAV_TURN_DECEL if self.v_target > NAV_TURN_SPEED else 0.
+      a_desired = float(np.clip(self.v_target - v_ego - profile_decel, -NAV_TURN_MAX_DECEL, ACCEL_MAX))
+      self.a_target = max(a_desired, a_prev - NAV_TURN_JERK * DT_MDL)
 
-    # follow the profile: its own deceleration plus a correction toward it. Only more braking is jerk limited, from the
-    # planner's last output, so harder braking the planner had for something else never lingers here.
-    profile_decel = NAV_TURN_DECEL if self.v_target > NAV_TURN_SPEED else 0.
-    a_desired = float(np.clip(self.v_target - v_ego - profile_decel, -NAV_TURN_MAX_DECEL, ACCEL_MAX))
-    self.a_target = max(a_desired, a_prev - NAV_TURN_JERK * DT_MDL)
+    # one alert per approach: it re-arms once the limit has let go of the car for a while, as between two turns, where the
+    # next turn's limit is far above the car's speed; holding turn speed through a turn keeps it
+    self.free_time = self.free_time + DT_MDL if a_desired > NAV_TURN_ALERT_DECEL else 0.
+    self.alerted &= self.free_time < NAV_TURN_ALERT_RESET
     if not self.alerted and a_desired < -NAV_TURN_ALERT_DECEL and v_ego > NAV_TURN_SPEED + NAV_TURN_ALERT_MARGIN:
       events_sp.add(EventNameSP.navTurnSlowing)
       self.alerted = True

@@ -7,10 +7,15 @@ See the LICENSE.md file in the root directory for more details.
 
 A page on the device's network for setting the navigation destination and Mapbox token from a phone.
 """
+import http.client
+import io
 import ipaddress
 import json
 import re
+import socket
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NamedTuple
 from urllib.parse import SplitResult, parse_qs, unquote_plus, urljoin, urlsplit
@@ -25,6 +30,9 @@ from openpilot.selfdrive.navigation.helpers import latest_gps_source
 
 PORT = 8082
 MAX_BODY = 4096
+MAX_HEADERS = 16384  # bytes of request headers: a browser sends about 1 KB, and the stdlib alone allows 100 lines of 64 KB
+MAX_CONNECTIONS = 12  # open at once: a phone's browser opens a few
+MAX_CONNECTION_TIME = 15.  # s from accept to close, even while the client keeps sending
 GEOCODE_URL = "https://api.mapbox.com/search/geocode/v6/forward"
 SHORT_LINK_HOSTS = ('maps.app.goo.gl', 'maps.apple')  # shared map links that redirect to one with the place in it
 MAX_REDIRECTS = 5
@@ -314,12 +322,35 @@ class NavWeb:
     return 200, self.state()
 
 
+class HeaderReader(io.BufferedIOBase):
+  """A request's file for the stdlib to read its headers from: raises once they pass MAX_HEADERS bytes, answered with 431."""
+
+  def __init__(self, rfile):
+    self.rfile = rfile
+    self.left = MAX_HEADERS
+
+  def readline(self, size: int | None = -1, /) -> bytes:
+    line = self.rfile.readline(self.left + 1 if size is None or size < 0 else min(size, self.left + 1))
+    self.left -= len(line)
+    if self.left < 0:
+      raise http.client.HTTPException(f'request headers over {MAX_HEADERS} bytes')
+    return line
+
+
 def make_handler(navweb: NavWeb):
   routes = {'/api/search': navweb.search, '/api/destination': navweb.set_destination,
             '/api/clear': navweb.clear_destination, '/api/token': navweb.set_token}
 
   class Handler(BaseHTTPRequestHandler):
     timeout = 10  # seconds a read or write may stall, so that a stalled client can't hold its thread forever
+
+    def parse_request(self):
+      # the stdlib reads the headers in here, before do_GET or do_POST could refuse them
+      rfile, self.rfile = self.rfile, HeaderReader(self.rfile)
+      try:
+        return super().parse_request()
+      finally:
+        self.rfile = rfile
 
     def send(self, status: int, body: bytes, content_type: str) -> None:
       self.send_response(status)
@@ -378,7 +409,7 @@ def make_handler(navweb: NavWeb):
         # requests exceptions contain the URL, and with it the access token; keep it out of logs
         cloudlog.error(f"navweb: request failed: {type(e).__name__}")
         status, payload = 502, {'error': mapbox_error(e)}
-      except (ValueError, KeyError, TypeError):
+      except (ValueError, KeyError, TypeError, OverflowError):  # OverflowError: float() of a JSON integer too big for a float
         status, payload = 400, {'error': 'Invalid request'}
       self.send_json(status, payload)
 
@@ -386,6 +417,46 @@ def make_handler(navweb: NavWeb):
       pass
 
   return Handler
+
+
+class Server(ThreadingHTTPServer):
+  """Serves the page with at most MAX_CONNECTIONS open at once, each for at most MAX_CONNECTION_TIME.
+
+  Each connection holds a thread and its buffers, and navweb runs onroad beside the driving processes.
+  """
+
+  def __init__(self, *args, **kwargs):
+    self.lock = threading.Lock()
+    self.deadlines: dict[socket.socket, float] = {}  # each open connection: when it's cut off
+    super().__init__(*args, **kwargs)
+
+  def verify_request(self, request, client_address) -> bool:
+    with self.lock:
+      if len(self.deadlines) >= MAX_CONNECTIONS:
+        return False  # serve_forever closes it at once
+      self.deadlines[request] = time.monotonic() + MAX_CONNECTION_TIME
+      return True
+
+  def shutdown_request(self, request) -> None:
+    with self.lock:  # forgotten before it's closed, so that service_actions never shuts down a reused descriptor
+      self.deadlines.pop(request, None)
+    super().shutdown_request(request)
+
+  def service_actions(self) -> None:
+    # serve_forever calls this at least every 0.5 s. The handler's timeout restarts with every byte it reads, so alone it
+    # never drops a client that keeps sending a byte at a time.
+    now = time.monotonic()
+    with self.lock:
+      for connection, deadline in self.deadlines.items():
+        if now > deadline:
+          try:
+            connection.shutdown(socket.SHUT_RDWR)  # its handler's reads end and its writes fail
+          except OSError:  # not connected: the client left, or it was cut off already
+            pass
+
+  def handle_error(self, request, client_address) -> None:
+    if not isinstance(sys.exception(), ConnectionError):  # a client that left or was cut off: nothing to report
+      super().handle_error(request, client_address)
 
 
 PAGE = """<!doctype html>
@@ -534,7 +605,7 @@ setInterval(refresh, 2000);
 
 def main():
   navweb = NavWeb()
-  server = ThreadingHTTPServer(('0.0.0.0', PORT), make_handler(navweb))
+  server = Server(('0.0.0.0', PORT), make_handler(navweb))
   threading.Thread(target=server.serve_forever, daemon=True).start()
   cloudlog.warning(f"navweb serving on port {PORT}")
 

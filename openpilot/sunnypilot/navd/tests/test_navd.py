@@ -7,7 +7,6 @@ See the LICENSE.md file in the root directory for more details.
 import math
 import os
 import time
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -15,7 +14,7 @@ import requests
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.selfdrive.navigation.navd import RouteEngine, set_banner
+from openpilot.selfdrive.navigation.navd import MAX_FIX_AGE, REROUTE_COUNTER_MIN, RouteEngine, set_banner
 from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE
 
 
@@ -90,6 +89,18 @@ class TestLaneGuidance(OpenpilotTestCase):
     assert len(instruction.lanes) == 0
 
 
+def degrees(meters):
+  return meters / METERS_PER_DEGREE
+
+
+def gps_fix(x, y, bearing, speed):
+  """A GPS fix at planar meters (x east, y north) near the equator, as navd reads it."""
+  msg = messaging.new_message('gpsLocationExternal', valid=True)
+  msg.gpsLocationExternal = {'hasFix': True, 'longitude': float(degrees(x)), 'latitude': float(degrees(y)), 'bearingDeg': float(bearing % 360),
+                             'speed': float(speed)}
+  return messaging.log_from_bytes(msg.to_bytes()).gpsLocationExternal
+
+
 class TestGpsLoss(OpenpilotTestCase):
   def test_instruction_is_invalid_without_a_fresh_fix(self):
     # without a fix, navd's distance to the maneuver is frozen, which must never look like a valid one to steer on
@@ -98,7 +109,7 @@ class TestGpsLoss(OpenpilotTestCase):
     sm.logMonoTime = {'gpsLocation': 1, 'gpsLocationExternal': 0}
     sm.recv_time = {'gpsLocation': time.monotonic(), 'gpsLocationExternal': 0.}
     sm.frame = 1
-    sm.__getitem__.return_value = SimpleNamespace(hasFix=True, latitude=0., longitude=0., bearingDeg=90.)
+    sm.__getitem__.return_value = gps_fix(0., 0., 90., 0.)
     engine = route_engine({'NavDestination': {'latitude': 0., 'longitude': 0.002}}, sm, pm)
     response = MagicMock(status_code=200)
     response.json.return_value = {'routes': [{'legs': [{'steps': [
@@ -117,43 +128,67 @@ class TestGpsLoss(OpenpilotTestCase):
       assert last().valid
 
 
-def degrees(meters):
-  return meters / METERS_PER_DEGREE
-
-
-def step(start, end, banner_type, modifier):
-  coordinates = [[degrees(x), degrees(y)] for x, y in (start, end)]
+def step(points, banner_type, modifier):
+  """A Mapbox step along planar points, its banner the maneuver at its end."""
+  coordinates = [[degrees(x), degrees(y)] for x, y in points]
+  distance = sum(math.dist(a, b) for a, b in zip(points[:-1], points[1:], strict=True))
   banners = [{'distanceAlongGeometry': 200, 'primary': {'text': 'Main St', 'type': banner_type, 'modifier': modifier}}] if banner_type else []
-  return {'geometry': {'coordinates': coordinates}, 'distance': math.dist(start, end), 'duration': 10, 'bannerInstructions': banners}
+  return {'geometry': {'coordinates': coordinates}, 'distance': distance, 'duration': 10, 'bannerInstructions': banners}
+
+
+def mapbox_route(*steps):
+  """Steps of (planar points, banner type, modifier), then Mapbox's empty last step at the destination."""
+  end = steps[-1][0][-1]
+  return [step(*s) for s in steps] + [step([end, end], None, None)]
 
 
 # 300 m north to a right turn, 200 m east to a left turn, then 200 m north to the destination
-ROUTE = [step((0, 0), (0, 300), 'turn', 'right'), step((0, 300), (200, 300), 'turn', 'left'),
-         step((200, 300), (200, 500), 'arrive', ''), step((200, 500), (200, 500), None, None)]
+ROUTE = mapbox_route(([(0, 0), (0, 300)], 'turn', 'right'), ([(0, 300), (200, 300)], 'turn', 'left'), ([(200, 300), (200, 500)], 'arrive', ''))
+
+
+def load(engine, route):
+  engine.route = route
+  engine.route_geometry = [np.array(s['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for s in route]
+  engine.step_idx = 0
+  end = route[-1]['geometry']['coordinates'][-1]
+  engine.nav_destination = (end[0], end[1])
 
 
 class TestManeuverProgress(OpenpilotTestCase):
   def setUp(self):
     self.pm = MagicMock()
     self.engine = route_engine({'NavDestination': {'latitude': degrees(500), 'longitude': degrees(200)}}, pm=self.pm)
-    self.engine.route = ROUTE
-    self.engine.route_geometry = [np.array(s['geometry']['coordinates'], dtype=np.float64).reshape((-1, 2)) for s in ROUTE]
-    self.engine.step_idx, self.engine.nav_destination = 0, (degrees(200), degrees(500))
+    load(self.engine, ROUTE)
 
-  def at(self, x, y):
-    self.engine.last_position = (degrees(x), degrees(y))
+  def at(self, x, y, bearing=0., speed=10.):
+    self.engine.last_position, self.engine.last_bearing, self.engine.last_speed = (degrees(x), degrees(y)), bearing, speed
     self.engine.send_instruction()
     return self.pm.send.call_args.args[1]
 
   def test_taken_turn_moves_on_once_along_the_new_road(self):
     for y in (100, 250, 295):
       assert self.at(0, y).valid and self.engine.step_idx == 0
-    assert self.at(5, 300).valid and self.engine.step_idx == 0  # turning
-    msg = self.at(12, 300)
-    assert msg.valid and str(msg.navInstruction.maneuverType) == 'turn' and self.engine.step_idx == 1
-    msg = self.at(15, 300)
+    assert self.at(5, 300, bearing=60).valid and self.engine.step_idx == 0  # turning
+    # the update that moves on reports the next maneuver, the left turn, where it used to repeat the passed one
+    msg = self.at(12, 300, bearing=90)
+    assert msg.valid and self.engine.step_idx == 1 and str(msg.navInstruction.maneuverModifier) == 'left'
+    msg = self.at(15, 300, bearing=90)
     assert math.isclose(msg.navInstruction.maneuverDistance, 185., abs_tol=0.5) and str(msg.navInstruction.maneuverModifier) == 'left'
     assert not self.engine.should_recompute()
+
+  def test_step_waits_for_the_car_to_move(self):
+    # Stopped just past a maneuver the GPS bearing is noise: the step waits, and it is not missed
+    self.at(0, 295)
+    assert self.at(12, 300, bearing=200, speed=1.).valid and self.engine.step_idx == 0
+    assert self.at(16, 300, bearing=90).valid and self.engine.step_idx == 1
+    # past a maneuver straight on, a car stopped beyond the old step's end is on the next step
+    load(self.engine, mapbox_route(([(0, 0), (0, 300)], 'new name', 'straight'), ([(0, 300), (0, 600)], 'turn', 'right'),
+                                   ([(0, 600), (200, 600)], 'arrive', '')))
+    self.engine.reset_progress()
+    self.at(0, 295)
+    msg = self.at(0, 312, bearing=200, speed=1.)
+    assert msg.valid and self.engine.step_idx == 0 and not self.engine.missed_maneuver
+    assert self.at(0, 316).valid and self.engine.step_idx == 1
 
   def test_straight_past_a_turn_is_missed(self):
     assert self.at(0, 305).valid and self.engine.step_idx == 0
@@ -170,6 +205,14 @@ class TestManeuverProgress(OpenpilotTestCase):
       msg = self.at(0, y).navInstruction
       assert math.isclose(msg.distanceRemaining - msg.maneuverDistance, 400., abs_tol=0.01)
 
+  def test_progress_ignores_the_offset_from_the_road(self):
+    # Parked in a lot beside the start of the route, which Mapbox snaps to the road, the car has made no progress along it;
+    # behind the start it has made less than none
+    for (x, y), distance in (((20, 0), 300.), ((20, 60), 240.), ((-12, 150), 150.), ((0, -10), 310.)):
+      msg = self.at(x, y).navInstruction
+      assert math.isclose(msg.maneuverDistance, distance, abs_tol=0.01)
+      assert math.isclose(msg.distanceRemaining - msg.maneuverDistance, 400., abs_tol=0.01)
+
   def test_arrival(self):
     self.engine.step_idx = 2
     assert self.at(200, 505).valid and self.engine.step_idx == 2
@@ -178,3 +221,254 @@ class TestManeuverProgress(OpenpilotTestCase):
     self.at(200, 540)  # driving away from the destination clears it
     assert self.engine.route is None
     self.engine.params.remove.assert_called_with("NavDestination")
+
+  def test_arrival_only_from_the_destination(self):
+    # on the last step without having been near the destination, say after a wrong step change, navigation goes on
+    self.engine.step_idx = 3
+    for y in (560, 600):
+      self.at(200, y)
+    self.engine.params.remove.assert_not_called()
+    assert self.engine.route is not None
+    self.at(200, 520)
+    self.at(200, 560)
+    self.engine.params.remove.assert_called_with("NavDestination")
+
+
+class GpsSubMaster:
+  """navd's GPS inputs, with one real gpsLocationExternal fix at a time, as from the u-blox."""
+
+  def __init__(self):
+    self.frame = 0
+    self.valid = {'gpsLocation': False, 'gpsLocationExternal': True}
+    self.recv_time = {'gpsLocation': 0., 'gpsLocationExternal': 0.}
+    self.logMonoTime = {'gpsLocation': 0, 'gpsLocationExternal': 0}
+    self.fixes = {'gpsLocation': gps_fix(0., 0., 0., 0.), 'gpsLocationExternal': gps_fix(0., 0., 0., 0.)}
+
+  def update(self, timeout=0):
+    self.frame += 1
+
+  def __getitem__(self, service):
+    return self.fixes[service]
+
+  def fix(self, x, y, bearing, speed, age=0.):
+    """A new fix, published age seconds ago."""
+    now = time.monotonic()
+    self.fixes['gpsLocationExternal'] = gps_fix(x, y, bearing, speed)
+    self.recv_time['gpsLocationExternal'] = now
+    self.logMonoTime['gpsLocationExternal'] = int((now - age) * 1e9)
+
+
+class Path:
+  """Planar points the car drives through."""
+
+  def __init__(self, points):
+    self.points = np.array(points, dtype=np.float64)
+    self.distance = np.r_[0., np.cumsum(np.linalg.norm(np.diff(self.points, axis=0), axis=1))]
+    self.length = float(self.distance[-1])
+
+  def at(self, s):
+    return np.array([np.interp(s, self.distance, self.points[:, 0]), np.interp(s, self.distance, self.points[:, 1])])
+
+  def bearing(self, s):
+    """The car's heading, over the 2 m around s: it turns through a corner."""
+    (x0, y0), (x1, y1) = self.at(s - 1.), self.at(s + 1.)
+    return math.degrees(math.atan2(x1 - x0, y1 - y0)) % 360
+
+
+def arc(center, radius, start, end, step=5.):
+  """Points on a circle from angle start to end, in degrees counterclockwise from east."""
+  angles = np.radians(np.linspace(start, end, int(abs(end - start) / step) + 1))
+  return [(center[0] + radius * math.cos(a), center[1] + radius * math.sin(a)) for a in angles]
+
+
+class Drive:
+  """The real navd loop, once a second, for a car driving through planar points at a constant speed."""
+
+  def __init__(self, route, start):
+    self.sm, self.pm = GpsSubMaster(), MagicMock()
+    end = route[-1]['geometry']['coordinates'][-1]
+    self.engine = route_engine({'NavDestination': {'longitude': end[0], 'latitude': end[1]}}, self.sm, self.pm)
+    self.engine.last_position = (degrees(start[0]), degrees(start[1]))
+    response = MagicMock(status_code=200)
+    response.json.return_value = {'routes': [{'legs': [{'steps': route}]}]}
+    with patch('requests.get', return_value=response):
+      self.engine.calculate_route((end[0], end[1]))
+    self.engine.recompute_hold = 0
+
+  def drive(self, points, speed, phase=0.):
+    """Drives through points, navd updating phase seconds after the start and then every second, until the points end or
+    navd asks for a new route. Per update: where the car is, navd's step and its instruction."""
+    path, records = Path(points), []
+    with patch('requests.get', return_value=MagicMock(status_code=200)) as get:
+      s = phase * speed
+      while s <= path.length and not get.called:
+        x, y = path.at(s)
+        self.sm.fix(x, y, path.bearing(s), speed)
+        self.pm.reset_mock()
+        self.engine.update()
+        msg = next(call.args[1] for call in self.pm.send.call_args_list if call.args[0] == 'navInstruction')
+        records.append({'s': s, 'x': x, 'y': y, 'step': self.engine.step_idx, 'valid': msg.valid, 'rerouting': get.called,
+                        'type': str(msg.navInstruction.maneuverType), 'distance': msg.navInstruction.maneuverDistance})
+        s += speed
+    return records
+
+
+PHASES = (0., 0.25, 0.5, 0.75)
+
+
+class TestStepAdvance(OpenpilotTestCase):
+  """A U-turn's, a sharp turn's or a roundabout turnaround's next step runs right beside the road the car comes on: navd
+  takes such a maneuver only once the car reached it and heads along the route after it."""
+
+  def test_uturn(self):
+    for median in (0., 12.):  # on one road, and across a median
+      route = mapbox_route(([(0, 0), (0, 300)], 'continue', 'uturn'), ([(0, 300), (-median, 300), (-median, 0)], 'turn', 'right'),
+                           ([(-median, 0), (-median - 200, 0)], 'arrive', 'right'))
+      lane = 1.8  # north in the right lane, through the median opening, south in the right lane
+      points = [(lane, 20.)] + arc((-median / 2, 296.), median / 2 + lane, 0., 180.) + [(-median - lane, 20.)]
+      for phase in PHASES:
+        records = Drive(route, points[0]).drive(points, 6., phase)
+        assert all(r['valid'] for r in records)
+        assert all(r['step'] == 0 for r in records if r['y'] < 296 and r['x'] > 0)  # the whole way to the U-turn
+        back = [r for r in records if r['y'] < 280 and r['x'] < -median]
+        assert back and all(r['step'] == 1 and r['type'] == 'turn' for r in back)  # back along the road, heading the other way
+        assert all(abs(r['distance'] - r['y']) < 0.5 for r in back)  # to the right turn at y = 0
+
+  def test_uturn_before_the_destination_across_the_median(self):
+    # Creeping past the destination on the near side of a narrow median, the car has not arrived: it must U-turn first
+    route = mapbox_route(([(0, 0), (0, 500)], 'continue', 'uturn'), ([(0, 500), (-6, 500), (-6, 300)], 'arrive', 'right'))
+    points = [(1.8, 240.), (1.8, 450.)]
+    for phase in PHASES:
+      drive = Drive(route, points[0])
+      records = drive.drive(points, 2.5, phase)
+      assert all(r['step'] == 0 for r in records)
+      drive.engine.params.remove.assert_not_called()
+
+  def test_sharp_turns(self):
+    lane = 1.8
+    for theta in (30., 45., 55.):  # the new road leaves the corner theta from the road the car comes on
+      a = math.radians(theta)
+      direction, right = np.array([math.sin(a), -math.cos(a)]), np.array([-math.cos(a), -math.sin(a)])
+      corner = np.array([0., 300.])
+      elm = corner + 150. * direction
+      route = mapbox_route(([(0, 0), tuple(corner)], 'turn', 'sharp right'), ([tuple(corner), tuple(elm)], 'turn', 'right'),
+                           ([tuple(elm), tuple(elm + 150. * right)], 'arrive', 'right'))
+      # the right lane up to where it meets the new road's right lane, then along it
+      along = lane * (1 + math.cos(a)) / math.sin(a)
+      turn_in = corner + along * direction + lane * right
+      points = [(lane, 100.), tuple(turn_in), tuple(corner + 140. * direction + lane * right)]
+      corner_s = turn_in[1] - 100.  # m the car drives to the corner
+      for phase in PHASES:
+        records = Drive(route, points[0]).drive(points, 5., phase)
+        assert all(r['valid'] for r in records)
+        assert all(r['step'] == 0 for r in records if r['s'] <= corner_s)  # up to the corner
+        on_elm = [r for r in records if r['s'] > corner_s + 15.]
+        assert on_elm and all(r['step'] == 1 for r in on_elm)
+        for r in on_elm:  # not short by twice the approach, as when it moved on before the corner
+          assert abs(r['distance'] - (150. - np.dot(np.array([r['x'], r['y']]) - corner, direction))) < 0.5
+
+  def test_roundabout_turnaround(self):
+    # In a right-hand traffic roundabout the last exit leads back beside the approach, 5 m from it
+    entry, exit_x = (0., 285.), -5.13
+    circle = arc((0., 300.), 15., -90., 250.)
+    route = mapbox_route(([(0, 0), entry], 'roundabout', 'uturn'), (circle + [(exit_x, 100.)], 'turn', 'right'),
+                         ([(exit_x, 100.), (exit_x - 200, 100.)], 'arrive', 'right'))
+    points = [(1.8, 150.), (1.8, 283.)] + circle + [(exit_x - 1.8, 280.), (exit_x - 1.8, 150.)]
+    for phase in PHASES:
+      records = Drive(route, points[0]).drive(points, 5., phase)
+      assert all(r['valid'] for r in records)
+      assert all(r['step'] == 0 for r in records if r['y'] < 283 and r['x'] > 0)
+      in_roundabout = [r for r in records if r['y'] > 283 or r['x'] > 2]
+      assert in_roundabout[-1]['step'] == 1  # it moved on while going around
+      leaving = [r for r in records if r['y'] < 270 and r['x'] < exit_x]
+      assert leaving and all(r['step'] == 1 and abs(r['distance'] - (r['y'] - 100.)) < 0.5 for r in leaving)
+
+
+class TestSplits(OpenpilotTestCase):
+  """Past an exit the freeway stays right beside the ramp: navd moves onto the ramp only once the car is clearly on it."""
+
+  def setUp(self):
+    a = math.radians(6.)
+    self.gore, self.ramp = np.array([0., 1000.]), np.array([math.sin(a), math.cos(a)])
+    ramp_end = self.gore + 300. * self.ramp
+    self.route = mapbox_route(([(0, 0), tuple(self.gore)], 'off ramp', 'slight right'), ([tuple(self.gore), tuple(ramp_end)], 'end of road', 'right'),
+                              ([tuple(ramp_end), tuple(ramp_end + (200., 0.))], 'arrive', 'right'))
+
+  def test_exit_taken(self):
+    points = [(1.8, 600.), (1.8, 990.), tuple(self.gore + 20. * self.ramp), tuple(self.gore + 280. * self.ramp)]
+    for phase in PHASES:
+      records = Drive(self.route, points[0]).drive(points, 25., phase)
+      assert all(r['valid'] and not r['rerouting'] for r in records)
+      on_ramp = [r for r in records if r['type'] == 'end of road']
+      assert on_ramp, "the ramp's maneuver is published once the car is on the ramp"
+      assert on_ramp[0]['y'] > self.gore[1] + 50.  # some way past the gore, where the ramp is clearly apart from the freeway
+      assert all(r['type'] == 'off ramp' for r in records if r['y'] < on_ramp[0]['y'])  # until then the passed exit, behind the car
+      for r in on_ramp:
+        assert abs(r['distance'] - (300. - np.dot(np.array([r['x'], r['y']]) - self.gore, self.ramp))) < 0.5
+
+  def test_exit_not_taken(self):
+    points = [(1.8, 600.), (1.8, 1600.)]
+    for phase in PHASES:
+      records = Drive(self.route, points[0]).drive(points, 30., phase)
+      assert all(r['type'] != 'end of road' for r in records)  # the ramp's maneuver is never published
+      missed = next(i for i, r in enumerate(records) if not r['valid'])
+      assert records[missed]['y'] > self.gore[1] + 100.  # once the car is clearly on the freeway, not the ramp
+      assert all(r['valid'] for r in records[:missed])
+      assert records[-1]['rerouting'] and records[-1]['y'] - records[missed]['y'] <= 30.  # at the next update
+
+
+class TestShortSteps(OpenpilotTestCase):
+  def test_forks_at_highway_speed(self):
+    # Between two 1 Hz fixes at highway speed the car drives past a short step between two forks: no miss in any phase
+    for length, speed in ((4., 25.), (8., 25.), (15., 30.)):
+      a, b = math.radians(10.), math.radians(5.)
+      fork2 = (length * math.sin(a), length * math.cos(a))
+      turn = (fork2[0] + 1500. * math.sin(b), fork2[1] + 1500. * math.cos(b))
+      route = mapbox_route(([(0, -2000), (0, 0)], 'fork', 'slight right'), ([(0, 0), fork2], 'fork', 'slight left'),
+                           ([fork2, turn], 'end of road', 'right'), ([turn, (turn[0] + 300, turn[1])], 'arrive', 'right'))
+      points = [(0., -400.), (0., 0.), fork2, (fork2[0] + 400. * math.sin(b), fork2[1] + 400. * math.cos(b))]
+      for phase in np.arange(0., 1., 0.1):
+        records = Drive(route, points[0]).drive(points, speed, phase)
+        assert all(r['valid'] and not r['rerouting'] for r in records), (length, speed, phase)
+        assert records[-1]['step'] == 2 and records[-1]['type'] == 'end of road'
+
+
+class TestFixAge(OpenpilotTestCase):
+  def test_late_fix_moves_the_distance_ahead(self):
+    # navd reads a fix up to about a second late; the car drove on meanwhile
+    for age, ahead in ((0., 0.), (0.8, 16.), (5., 20. * MAX_FIX_AGE), (-1., 0.)):
+      drive = Drive(ROUTE, (0., 100.))
+      drive.sm.fix(0., 100., 0., 20., age=age)
+      with patch('requests.get') as get:
+        drive.engine.update()
+      get.assert_not_called()
+      instruction = next(call.args[1] for call in drive.pm.send.call_args_list if call.args[0] == 'navInstruction').navInstruction
+      assert math.isclose(instruction.maneuverDistance, 200. - ahead, abs_tol=0.05), age
+      assert math.isclose(instruction.distanceRemaining - instruction.maneuverDistance, 400., abs_tol=0.01)
+
+
+class TestWrongHeading(OpenpilotTestCase):
+  def run_fixes(self, fixes):
+    drive = Drive(ROUTE, fixes[0][:2])
+    results = []
+    with patch('requests.get', return_value=MagicMock(status_code=200)) as get:
+      for x, y, bearing, speed in fixes:
+        drive.sm.fix(x, y, bearing, speed)
+        drive.engine.update()
+        msg = next(call.args[1] for call in reversed(drive.pm.send.call_args_list) if call.args[0] == 'navInstruction')
+        results.append((msg.valid, get.called))
+    return results
+
+  def test_heading_away_from_a_maneuver_far_ahead(self):
+    # on the route's road, but heading back the way the route came: it left the route
+    results = self.run_fixes([(0., 200. - 10. * i, 180., 10.) for i in range(REROUTE_COUNTER_MIN + 4)])
+    assert results[0] == (True, False)  # one fix may be a bad bearing
+    assert all(not valid for valid, _ in results[1:])
+    # and it counts toward the reroute, like being off the route: from the second fix on, a reroute once the count passes the minimum
+    assert next(i for i, (_, rerouting) in enumerate(results) if rerouting) == 1 + REROUTE_COUNTER_MIN + 1
+
+  def test_turning_in_early_near_the_maneuver(self):
+    assert all(valid for valid, _ in self.run_fixes([(0., 280. + 2. * i, 60., 5.) for i in range(4)]))
+
+  def test_slow(self):
+    assert all(valid for valid, _ in self.run_fixes([(0., 200. - 2. * i, 180., 2.) for i in range(4)]))

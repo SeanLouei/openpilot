@@ -1,4 +1,5 @@
 import gzip
+import math
 import re
 import struct
 import tempfile
@@ -8,7 +9,6 @@ import unittest
 from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -20,7 +20,7 @@ from openpilot.selfdrive.navigation.mapsd import MapsD
 from openpilot.selfdrive.navigation.navd import REROUTE_COUNTER_MIN, ROUTE_RESEND_PERIOD, RouteEngine, set_banner
 from openpilot.selfdrive.navigation.pmtiles import PMTiles, decode_directory, tile_id
 from openpilot.selfdrive.navigation.renderer import MAJOR, MEDIUM, MINOR, SIZE, STREET, TRACK, MapRenderer, draw_segments, mercator, project, stroke_widths
-from openpilot.selfdrive.navigation.route import RouteTracker
+from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE, RouteTracker, point_along, project_onto_path
 from openpilot.selfdrive.navigation.tiles import RemoteTiles
 from openpilot.selfdrive.navigation.vector_tile import decode_lines, decode_roads
 
@@ -87,6 +87,13 @@ def mapbox_response(steps):
   response = MagicMock(status_code=200)
   response.json.return_value = {'routes': [{'legs': [{'steps': steps}]}]}
   return response
+
+
+def gps_fix(latitude, longitude, bearing, speed=0.):
+  """A GPS fix as navd reads it from gpsLocation or gpsLocationExternal."""
+  msg = messaging.new_message('gpsLocationExternal', valid=True)
+  msg.gpsLocationExternal = {'hasFix': True, 'latitude': latitude, 'longitude': longitude, 'bearingDeg': bearing, 'speed': speed}
+  return messaging.log_from_bytes(msg.to_bytes()).gpsLocationExternal
 
 
 def route_engine(sm, pm, values):
@@ -254,7 +261,7 @@ class TestRouteEngine(unittest.TestCase):
     self.sm.valid = dict.fromkeys(('gpsLocation', 'gpsLocationExternal'), True)
     self.sm.logMonoTime = dict.fromkeys(self.sm.valid, time.monotonic_ns())
     self.sm.recv_time = dict.fromkeys(self.sm.valid, time.monotonic())
-    self.sm.__getitem__.return_value = SimpleNamespace(hasFix=True, latitude=0, longitude=0, bearingDeg=90)
+    self.sm.__getitem__.return_value = gps_fix(0, 0, 90)
     self.engine = route_engine(self.sm, self.pm, self.values)
     self.engine.last_position, self.engine.last_bearing = (0, 0), 90
     distance = 111.195  # Mapbox's length of 0.001 degrees at the equator
@@ -346,8 +353,7 @@ class TestRouteEngine(unittest.TestCase):
     self.assertFalse(self.last_message('navInstruction').valid)
 
   def test_gps_source(self):
-    fixes = {'gpsLocation': SimpleNamespace(hasFix=True, latitude=1, longitude=1, bearingDeg=180),
-             'gpsLocationExternal': SimpleNamespace(hasFix=True, latitude=2, longitude=2, bearingDeg=0)}
+    fixes = {'gpsLocation': gps_fix(1, 1, 180), 'gpsLocationExternal': gps_fix(2, 2, 0)}
     self.sm.__getitem__.side_effect = fixes.get
     self.sm.logMonoTime = {'gpsLocation': 2, 'gpsLocationExternal': 1}  # replayed logs are judged by receipt time
     with patch('requests.get', return_value=self.response):
@@ -356,7 +362,7 @@ class TestRouteEngine(unittest.TestCase):
       self.sm.valid['gpsLocation'] = False
       self.engine.update()
       self.assertEqual(self.engine.last_position, (2, 2))  # unless it is invalid
-      fixes['gpsLocationExternal'] = SimpleNamespace(hasFix=True, latitude=3, longitude=3, bearingDeg=0)
+      fixes['gpsLocationExternal'] = gps_fix(3, 3, 0)
       self.sm.recv_time = dict.fromkeys(self.sm.valid, time.monotonic() - 3)  # or stale
       self.engine.update()
       self.assertEqual(self.engine.last_position, (2, 2))
@@ -479,6 +485,20 @@ class TestRouteTracking(unittest.TestCase):
     self.assertAlmostEqual(tracker.snap(9 * m, 150 * m)[2], 0, places=3)
     self.assertAlmostEqual(tracker.progress, 150, delta=0.5)
     self.assertAlmostEqual(RouteTracker(route).snap(9 * m, 150 * m)[2], 180, places=3)
+
+  def test_progress_along_a_path(self):
+    m = 1 / METERS_PER_DEGREE
+    path = np.array([[0, 0], [0, 100 * m], [0, 100 * m], [100 * m, 100 * m]])  # north 100m, a repeated point, then east 100m
+    for (x, y), extend, expected in [((20, 0), False, (0, 20, 0)), ((20, 50), True, (50, 20, 0)),  # beside it: no progress for the offset
+                                     ((0, -10), False, (0, 10, 0)), ((0, -10), True, (-10, 0, 0)),  # behind its start
+                                     ((110, 103), False, (200, math.hypot(10, 3), 90)), ((110, 103), True, (210, 3, 90)),  # past its end
+                                     ((50, 101), True, (150, 1, 90))]:
+      np.testing.assert_allclose(project_onto_path(path, (x * m, y * m), extend), expected, atol=1e-6, err_msg=f'{x, y, extend}')
+    point = np.array([[0, 0], [0, 0]])  # the arrival's step: no direction, and a car is its distance past it
+    np.testing.assert_allclose(project_onto_path(point, (0, 30 * m), True), (30, 30, np.nan), atol=1e-6)
+    np.testing.assert_allclose(project_onto_path(point, (0, 30 * m)), (0, 30, np.nan), atol=1e-6)
+    for distance, expected in [(150, (50, 100)), (-5, (0, 0)), (500, (100, 100))]:
+      np.testing.assert_allclose(point_along(path, distance) / m, expected, atol=1e-6)
 
 
 if __name__ == '__main__':

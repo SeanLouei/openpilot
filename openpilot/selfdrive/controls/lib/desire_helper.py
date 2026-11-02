@@ -4,7 +4,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeController, AutoLaneChangeMode
 from openpilot.sunnypilot.selfdrive.controls.lib.lane_turn_desire import LaneTurnController
-from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NavDesireController
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NavDesireController, blinker_side
 
 LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
@@ -32,6 +32,7 @@ class DesireHelper:
     self.lane_turn_direction = TurnDirection.none
     self.nav_desire = NavDesireController()
     self.nav_desire_failed = False
+    self.route_blinker_side: bool | None = None  # the side (left) of a blinker a route turn has had, until it goes off
 
   @staticmethod
   def get_lane_change_direction(CS):
@@ -51,9 +52,15 @@ class DesireHelper:
     self.lane_turn_direction = self.lane_turn_controller.get_turn_direction()
 
     # Route turns: a blinker for the route's next turn gets that turn's desire shortly before it, and no other desire, and
-    # from a route turn's start to its maneuver point no lane turn desire pulses either way.
+    # from a route turn's start to its maneuver point no lane turn desire pulses either way. A blinker the route has had
+    # stays the route's until it goes off, whatever navd, the steering or the controller do meanwhile, so the lane turn
+    # desire never adds a turn pulse of its own for it.
     # A route message the controller cannot read must never stop the driving model, so it only drops the route turn.
-    lane_turning = self.desire in (log.Desire.turnLeft, log.Desire.turnRight) and not self.nav_desire.owns_turn_desire
+    side = blinker_side(carstate)
+    if side != self.route_blinker_side:
+      self.route_blinker_side = None
+    route_owned = self.nav_desire.owns_turn_desire or self.route_blinker_side is not None
+    lane_turning = self.desire in (log.Desire.turnLeft, log.Desire.turnRight) and not route_owned
     try:
       self.nav_desire.update(carstate, lateral_active, nav, self.lane_change_state == LaneChangeState.laneChangeStarting, lane_turning)
     except Exception:
@@ -61,8 +68,10 @@ class DesireHelper:
         cloudlog.exception("desire_helper.nav_desire_failed")
       self.nav_desire_failed = True
       self.nav_desire.reset()
+    if self.nav_desire.owns_turn_desire and side is not None:
+      self.route_blinker_side = side
     route_turning = self.nav_desire.turning is not None
-    if self.nav_desire.owns_turn_desire:
+    if self.nav_desire.owns_turn_desire or self.route_blinker_side is not None:
       self.lane_turn_direction = self.nav_desire.turn_direction
 
     # a route turn holds the lane change off, so no lane change waits hidden behind its turn desire
@@ -94,8 +103,10 @@ class DesireHelper:
 
         self.alc.update_lane_change(blindspot_detected, edge_detected, carstate.brakePressed, torque_applied)
 
-        # A blinker for the route's next turn needs a nudge to change lanes, so it never starts a nudgeless one
-        auto_lane_change_allowed = self.alc.auto_lane_change_allowed and not self.nav_desire.route_turn_signal
+        # A blinker for the route's next turn needs a nudge to change lanes, so it never starts a nudgeless one, also once
+        # the route let go of it (a reroute, or navd moving on) while it stays on
+        auto_lane_change_allowed = (self.alc.auto_lane_change_allowed and not self.nav_desire.route_turn_signal
+                                    and self.route_blinker_side is None)
 
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off
