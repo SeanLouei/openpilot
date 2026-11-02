@@ -221,10 +221,11 @@ def measurement_report(satellites):
   return msg
 
 
-def hardware_status(antenna):
-  """ubloxd's report of the chip's hardware, with what its antenna check says."""
+def hardware_status(antenna, power='on', noise=90, gain=2900, interference=10):
+  """ubloxd's report of the chip's hardware: what its antenna check says, the antenna's power, noise, gain and interference."""
   msg = messaging.new_message('ubloxGnss', valid=True)
-  msg.ubloxGnss.init('hwStatus').aStatus = antenna
+  hardware = msg.ubloxGnss.init('hwStatus')
+  hardware.aStatus, hardware.aPower, hardware.noisePerMS, hardware.agcCnt, hardware.jamInd = antenna, power, noise, gain, interference
   return msg
 
 
@@ -500,7 +501,8 @@ class TestGpsDetails(OpenpilotTestCase):
     details = page_state(navweb, T)['gpsDetails']
     assert details['gpsLocation'] == details['gpsLocationExternal'] == UNKNOWN
     # the SubMaster's placeholder for ubloxGnss is an empty measurement report, never taken for one of no satellites
-    assert details['ubloxGnss'] == {'seen': False, 'age': None, 'satellites': None, 'satellitesAge': None, 'antenna': None}
+    assert details['ubloxGnss'] == {'seen': False, 'age': None, 'satellites': None, 'satellitesAge': None, 'antenna': None, 'hardware': None,
+                                    'hardwareAge': None}
     assert [details[key] for key in ('started', 'ubloxAvailable', 'processes', 'processesAge')] == [None] * 4
     assert details['summary'] == ['GPS receiver: process state unknown · no messages yet']
 
@@ -519,9 +521,30 @@ class TestGpsDetails(OpenpilotTestCase):
     assert details['gpsLocationExternal'] == {'seen': True, 'age': 0.4, 'valid': True, 'hasFix': False, 'satelliteCount': 3,
                                               'horizontalAccuracy': 48.25, 'verticalAccuracy': 70.5, 'speed': 0.25, 'used': False}
     assert details['gpsLocation'] == UNKNOWN
-    assert details['ubloxGnss'] == {'seen': True, 'age': 0.3, 'satellites': 9, 'satellitesAge': 0.4, 'antenna': 'ok'}
+    assert details['ubloxGnss'] == {'seen': True, 'age': 0.3, 'satellites': 9, 'satellitesAge': 0.4, 'antenna': 'ok', 'hardwareAge': 0.3,
+                                    'hardware': {'antenna': 'ok', 'antennaPower': 'on', 'noise': 90, 'gain': 2900, 'interference': 10}}
     assert details['summary'] == ['Car on', 'GPS receiver (u-blox): running · last message 0.4 s ago · no fix yet · 3 satellites used, 9 heard · ' +
-                                  'accuracy 48 m · antenna OK']
+                                  'accuracy 48 m',
+                                  'GPS chip: antenna OK · antenna powered · interference low (10 of 255) · noise level 90 · gain 35% · ' +
+                                  'reported 0.3 s ago']
+
+  def test_chip_hardware_report(self):
+    # what tells a chip that hears no satellites because of its antenna from one drowned out by interference, or without sky
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond=RUNNING, ubloxd=RUNNING, qcomgpsd={}))
+    cases = [(('dontknow', 'on', 87, 8191, 12), "antenna check not available on this chip · antenna powered · interference low (12 of 255) · " +
+              "noise level 87 · gain 100%"),
+             (('short', 'off', 0, 0, 0), 'antenna short-circuited · antenna not powered · interference low (0 of 255) · noise level 0 · gain 0%'),
+             (('init', 'dontknow', 120, 4096, 200), 'antenna check starting · antenna power unknown · interference high (200 of 255) · ' +
+              'noise level 120 · gain 50%'),
+             (('ok', 'on', 95, 3000, 100), 'antenna OK · antenna powered · interference medium (100 of 255) · noise level 95 · gain 37%')]
+    for i, (report, words) in enumerate(cases):
+      receive(navweb, sm, T + i + 0.1, hardware_status(*report))
+      assert page_state(navweb, T + i + 0.3)['gpsDetails']['summary'][2] == f'GPS chip: {words} · reported 0.2 s ago'
+    # the Quectel modem's GPS gives no such report
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=False)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond={}, ubloxd={}, qcomgpsd=RUNNING))
+    assert not any(line.startswith('GPS chip') for line in page_state(navweb, T + 0.1)['gpsDetails']['summary'])
 
   def test_ublox_running_without_messages(self):
     navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True)), submaster()
@@ -529,8 +552,9 @@ class TestGpsDetails(OpenpilotTestCase):
     assert page_state(navweb, T)['gpsDetails']['summary'][1] == 'GPS receiver (u-blox): running · no messages yet'
     # ubloxd decodes data from the chip, without a position in it
     receive(navweb, sm, T + 0.1, hardware_status('open'))
-    assert page_state(navweb, T + 0.3)['gpsDetails']['summary'][1] == ('GPS receiver (u-blox): running · no position messages yet, but data 0.2 s ago · ' +
-                                                                       'antenna not connected')
+    assert page_state(navweb, T + 0.3)['gpsDetails']['summary'][1:] == ['GPS receiver (u-blox): running · no position messages yet, but data 0.2 s ago',
+                                                                        'GPS chip: antenna not connected · antenna powered · interference low (10 of 255) · ' +
+                                                                        'noise level 90 · gain 35% · reported 0.2 s ago']
 
   def test_fixes(self):
     navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True)), submaster()

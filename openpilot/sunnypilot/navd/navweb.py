@@ -67,7 +67,10 @@ SERVICES = [*GPS_SERVICES, 'navInstruction', 'managerState', 'ubloxGnss']
 # sends; the others run qcomgpsd, for the GPS in the Quectel modem. The manager runs them only while the car is on.
 RECEIVERS = {'u-blox': (('pigeond', 'ubloxd'), 'gpsLocationExternal'), 'Quectel modem': (('qcomgpsd',), 'gpsLocation')}
 GPS_PROCESSES = tuple(name for names, _ in RECEIVERS.values() for name in names)
-ANTENNA = {'ok': 'antenna OK', 'short': 'antenna short-circuited', 'open': 'antenna not connected'}  # what the u-blox's antenna check says
+ANTENNA = {'ok': 'antenna OK', 'short': 'antenna short-circuited', 'open': 'antenna not connected',  # what the u-blox's antenna check says
+           'init': 'antenna check starting', 'dontknow': "antenna check not available on this chip"}
+ANTENNA_POWER = {'on': 'antenna powered', 'off': 'antenna not powered', 'dontknow': 'antenna power unknown'}
+AGC_FULL_SCALE = 8191  # the u-blox's gain control count at full scale: the weaker the signal from the antenna, the higher
 
 
 class Place(NamedTuple):
@@ -355,6 +358,8 @@ class GpsDetails:
     self.satellites: int | None = None  # in the last measurement report: those the chip receives
     self.satellites_time: float | None = None
     self.antenna: str | None = None
+    self.hardware: dict | None = None  # the chip's last hardware report: antenna check and power, noise, gain and interference
+    self.hardware_time: float | None = None
 
   def update(self, sm, source: str | None) -> None:
     """After each update of sm, with the service latest_gps_source took the position from."""
@@ -371,14 +376,20 @@ class GpsDetails:
       if kind == 'measurementReport':
         self.satellites, self.satellites_time = known(field(field(gnss, kind), 'numMeas'), int), self.ublox_time
       elif kind == 'hwStatus':
+        hardware = field(gnss, kind)
         self.antenna = name_of(lambda: gnss.hwStatus.aStatus)
+        self.hardware = {'antenna': self.antenna, 'antennaPower': name_of(lambda: gnss.hwStatus.aPower),
+                         'noise': known(field(hardware, 'noisePerMS'), int), 'gain': known(field(hardware, 'agcCnt'), int),
+                         'interference': known(field(hardware, 'jamInd'), int)}
+        self.hardware_time = self.ublox_time
 
   def state(self, started: bool | None, ublox_available: bool | None) -> dict:
     now = time.monotonic()
     details = {'started': started, 'ubloxAvailable': ublox_available, 'processes': self.processes, 'processesAge': age(now, self.processes_time),
                **{service: {**message, 'age': age(now, then)} for service, (then, message) in self.locations.items()},
                'ubloxGnss': {'seen': self.ublox_time is not None, 'age': age(now, self.ublox_time), 'satellites': self.satellites,
-                             'satellitesAge': age(now, self.satellites_time), 'antenna': self.antenna}}
+                             'satellitesAge': age(now, self.satellites_time), 'antenna': self.antenna,
+                             'hardware': self.hardware, 'hardwareAge': age(now, self.hardware_time)}}
     return {**details, 'summary': gps_summary(details)}
 
 
@@ -451,9 +462,29 @@ def receiver_words(details: dict, receiver: str) -> list[str]:
     words.append(f"accuracy {length(message['horizontalAccuracy'])}")
   elif (message['verticalAccuracy'] or 0) > 0:  # all that qcomgpsd reports
     words.append(f"vertical accuracy {length(message['verticalAccuracy'])}")
-  if ublox and gnss['antenna'] in ANTENNA:
-    words.append(ANTENNA[gnss['antenna']])
   return words
+
+
+def hardware_words(gnss: dict) -> str | None:
+  """The u-blox's own hardware report in words, to tell a chip that hears no satellites because of its antenna (not
+  connected, short-circuited, not powered: a weak signal also turns its gain all the way up) from one that is drowned out
+  by interference, or simply has no sky: its antenna check and power, interference, noise level and gain."""
+  hardware = gnss['hardware']
+  if hardware is None:
+    return None
+  words = [ANTENNA.get(hardware['antenna'], 'antenna check unknown')]
+  if hardware['antennaPower'] in ANTENNA_POWER:
+    words.append(ANTENNA_POWER[hardware['antennaPower']])
+  if hardware['interference'] is not None:
+    level = 'low' if hardware['interference'] < 50 else 'medium' if hardware['interference'] < 150 else 'high'
+    words.append(f"interference {level} ({hardware['interference']} of 255)")
+  if hardware['noise'] is not None:
+    words.append(f"noise level {hardware['noise']}")
+  if hardware['gain'] is not None:
+    words.append(f"gain {round(100 * hardware['gain'] / AGC_FULL_SCALE)}%")
+  if gnss['hardwareAge'] is not None:
+    words.append(f"reported {duration(gnss['hardwareAge'])} ago")
+  return 'GPS chip: ' + ' · '.join(words)
 
 
 def heard_from(details: dict, receiver: str) -> bool:
@@ -474,6 +505,8 @@ def gps_summary(details: dict) -> list[str]:
   else:
     receivers = [receiver for receiver in RECEIVERS if heard_from(details, receiver)]
   lines += [f'GPS receiver ({receiver}): ' + ' · '.join(receiver_words(details, receiver)) for receiver in receivers]
+  if 'u-blox' in receivers and (hardware := hardware_words(details['ubloxGnss'])) is not None:
+    lines.append(hardware)
   if not receivers:
     lines.append(f"GPS receiver: {processes_words(details['processes'], GPS_PROCESSES)} · no messages yet")
   return lines
