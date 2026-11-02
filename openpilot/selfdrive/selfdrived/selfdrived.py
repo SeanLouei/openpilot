@@ -367,7 +367,11 @@ class SelfdriveD:
           self.events.add(EventName.preLaneChangeRight)
     elif self.sm['modelV2'].meta.laneChangeState in (LaneChangeState.laneChangeStarting,
                                                     LaneChangeState.laneChangeFinishing):
-      self.events.add(EventName.laneChange)
+      # the route's own lane change into a turn lane, which no blinker announces, has its own alert in place of this one
+      if self.sm['modelDataV2SP'].navTurnLane:
+        self.events_sp.add(custom.OnroadEventSP.EventName.navTurnLane)
+      else:
+        self.events.add(EventName.laneChange)
 
     # Handle lane turn: an automatic route turn across oncoming traffic has its own alert in place of the turn's, and one
     # that will not start by itself asks for the blinker
@@ -382,8 +386,9 @@ class SelfdriveD:
     if nav_turn_across == NavTurnAcross.signal:
       self.events_sp.add(custom.OnroadEventSP.EventName.navTurnSignal)
     # both show over Slowing for Route Turn, of the same priority, also over one plannerd raises after them, pulling away
-    # from a stop: the newer alert would show, and that one only says the car slows
-    if nav_turn_across in (NavTurnAcross.turning, NavTurnAcross.signal):
+    # from a stop: the newer alert would show, and that one only says the car slows. So does Moving to Turn Lane, which
+    # the slowdown may start during.
+    if nav_turn_across in (NavTurnAcross.turning, NavTurnAcross.signal) or self.sm['modelDataV2SP'].navTurnLane:
       self.events_sp.remove(custom.OnroadEventSP.EventName.navTurnSlowing)
 
     for i, pandaState in enumerate(self.sm['pandaStates']):

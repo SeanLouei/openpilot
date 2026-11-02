@@ -338,6 +338,25 @@ sections:
     - type: param
       key: NavAutoTurn
       equals: true
+  - key: NavAutoTurnLane
+    widget: toggle
+    title: Automatic Turn Lanes (Alpha)
+    description: Needs Automatic Route Turns, and Automatic Left Turns for turns across oncoming traffic. From the outermost
+      lane on the turn's side, once the model has seen the car there (the curb lane for a right turn; for a left turn, the
+      lane right beside a raised median), the car moves by itself into a turn lane that opens beside it before a route turn,
+      then turns from it. Moving to Turn Lane chimes and shows while it moves. It moves without the blinker, which is illegal
+      in most places, so signal yourself where you can. Change it while parked (on the comma 4 you can also switch it off
+      while driving).
+    details: |-
+      It moves once per turn, toward the turn only, into a lane the model sees open beside the car: at least 2.6 m (8.5 ft) wide, with a lane line between, no lane line beyond it, and still open 30 m (100 ft) ahead. It moves only between about 6 and 33 mph (9-54 km/h), within 150 m (490 ft) of the turn, and only where the move can end well before the turn starts, so the turn lane must be open by about 70 m (230 ft) before the turn at 20 mph, 80 m (260 ft) at 25-30 mph; a later one, and the car stays in its lane: no automatic right turn from there, and for a left turn Signal for Route Turn shows. It does not move with a blinker on, with a car in that blind spot, while Block Lane Change: Road Edge Detection blocks that side, with Auto Lane Change by Blinker set to Off, or where the route's lane guidance puts the turn in another lane; for a left turn there must be lane guidance, and everything Automatic Left Turns needs. Never on two-way roads or into painted left-turn bays (no curb beside the car), nor into short bays. The model can still take a bike lane, a parking lane, a bus bay or a turn lane for an earlier street for a turn lane: watch every move. To stop it, steer against it, switch on either blinker, or press the gas; on a Tesla, braking turns steering off. A car coming up in that blind spot stops it only before the car starts moving over. Once in the turn lane, the car turns from it as from the curb lane, while the model still sees it there. Its thresholds were set without real drives: use it first on quiet streets, with full attention. This setting is not restored from a sunnylink backup.
+    enablement:
+    - $ref: '#/macros/offroad'
+    - type: param
+      key: NavigationEnabled
+      equals: true
+    - type: param
+      key: NavAutoTurn
+      equals: true
   - key: NavExitDesire
     widget: toggle
     title: Navigation Exit Desires (Alpha)

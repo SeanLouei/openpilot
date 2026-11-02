@@ -34,6 +34,7 @@ class DesireHelper:
     self.nav_desire_failed = False
     self.route_blinker_side: bool | None = None  # the side (left) of a blinker a route turn has had, until it goes off
     self.ahead_blinker_side: bool | None = None  # the side (left) of a blinker toward the route's next turn ahead, until it goes off
+    self.turn_lane_change: bool | None = None  # the side (left) of the route's own lane change into a turn lane, while under way
 
   @staticmethod
   def get_lane_change_direction(CS):
@@ -86,9 +87,20 @@ class DesireHelper:
       # that blinker, which would pulse again.
       self.lane_turn_direction = TurnDirection.none
 
+    # A route turn lane: the route's own lane change toward the turn into the turn lane opening beside the car, with no
+    # blinker and at any speed it allows, through the same states as any other. It ends early, and for good, as the route
+    # says: the driver signaling, pressing the gas, steering against it or calling the turn off, or a car in that blind spot
+    # before the car moved. The blinker that ends it never starts a lane change of its own: it is no new blinker after.
+    turn_lane = self.nav_desire.turn_lane
+    turn_lane_completed = False
+
     # a route turn holds the lane change off, so no lane change waits hidden behind its turn desire
     if (not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX or self.alc.lane_change_set_timer == AutoLaneChangeMode.OFF
         or route_turning):
+      self.lane_change_state = LaneChangeState.off
+      self.lane_change_direction = LaneChangeDirection.none
+      self.lane_change_timer = 0.0
+    elif self.turn_lane_change is not None and turn_lane != self.turn_lane_change:
       self.lane_change_state = LaneChangeState.off
       self.lane_change_direction = LaneChangeDirection.none
       self.lane_change_timer = 0.0
@@ -98,6 +110,14 @@ class DesireHelper:
         self.lane_change_timer = 0.0
         # Initialize lane change direction to prevent UI alert flicker
         self.lane_change_direction = self.get_lane_change_direction(carstate)
+
+      elif (self.lane_change_state == LaneChangeState.off and turn_lane is not None
+            and not (left_edge_detected if turn_lane else right_edge_detected)):
+        self.lane_change_state = LaneChangeState.laneChangeStarting
+        self.lane_change_timer = 0.0
+        self.lane_change_direction = LaneChangeDirection.left if turn_lane else LaneChangeDirection.right
+        self.turn_lane_change = turn_lane
+        self.nav_desire.start_turn_lane()
 
       elif self.lane_change_state == LaneChangeState.preLaneChange:
         # Update lane change direction
@@ -134,12 +154,19 @@ class DesireHelper:
 
         if lane_change_prob < 0.02 and self.lane_change_timer >= LANE_CHANGE_START_TIME:
           self.lane_change_timer = 0.0
+          turn_lane_completed = self.turn_lane_change is not None
           if one_blinker:
             self.lane_change_state = LaneChangeState.preLaneChange
             self.lane_change_direction = self.get_lane_change_direction(carstate)
           else:
             self.lane_change_state = LaneChangeState.off
             self.lane_change_direction = LaneChangeDirection.none
+
+    # the route's lane change into the turn lane is over: done, the model finished it with nothing ending it early, the car
+    # is in the turn lane
+    if self.turn_lane_change is not None and self.lane_change_state != LaneChangeState.laneChangeStarting:
+      self.nav_desire.end_turn_lane(turn_lane_completed)
+      self.turn_lane_change = None
 
     self.prev_one_blinker = one_blinker and lateral_active
 

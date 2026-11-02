@@ -129,13 +129,23 @@ class ModelsLayoutMici(NavScroller):
                                                               "oncoming traffic, arrows or red lights: watch and brake (on a Tesla, braking " +
                                                               "turns steering off: finish the turn yourself). Turn it on while parked; with auto " +
                                                               "route turns switched on while driving, it comes on at the next stop."))
+    self.nav_turn_lane_toggle = BigParamControl(tr("auto turn lanes (alpha)"), "NavAutoTurnLane",
+                                                description=tr("Needs auto route turns, and auto left turns for left turns. From the curb " +
+                                                               "lane (for a left turn, the lane beside a raised median), moves by itself into " +
+                                                               "a turn lane that opens beside it before a route turn, showing Moving to Turn " +
+                                                               "Lane, then turns from it. It doesn't signal, which is illegal in most places: " +
+                                                               "signal yourself where you can. It can take a bike lane, parking or a bus bay " +
+                                                               "for a turn lane: watch every move, and steer, signal or press the gas to stop " +
+                                                               "it (on a Tesla, braking turns steering off). Set up without real drives yet: " +
+                                                               "full attention at first. Turn it on while parked."))
     self.nav_exit_toggle = BigParamControl(tr("nav exit desires (alpha)"), "NavExitDesire",
                                            description=tr("Near a route exit or fork with lane guidance, a light steering nudge toward it has the car " +
                                                           "keep to that side of the split. Above 20 mph with your blinker on, a nudge " +
                                                           "changes lanes instead."))
 
     self.main_items = [self.current_model_info, self.select_model_btn, self.cancel_download_btn, self.refresh_btn, self.clear_cache_btn,
-                       self.blendful_toggle, self.nav_turn_toggle, self.nav_auto_turn_toggle, self.nav_far_turn_toggle, self.nav_exit_toggle]
+                       self.blendful_toggle, self.nav_turn_toggle, self.nav_auto_turn_toggle, self.nav_far_turn_toggle, self.nav_turn_lane_toggle,
+                       self.nav_exit_toggle]
     self._scroller.add_widgets(self.main_items)
 
   @property
@@ -251,6 +261,7 @@ class ModelsLayoutMici(NavScroller):
     self.nav_turn_toggle.refresh()
     self.nav_auto_turn_toggle.refresh()
     self.nav_far_turn_toggle.refresh()
+    self.nav_turn_lane_toggle.refresh()
     self.nav_exit_toggle.refresh()
 
   def _update_state(self):
@@ -273,7 +284,7 @@ class ModelsLayoutMici(NavScroller):
       self.blendful_toggle.set_value(blendful_value)
 
     # automatic left turns work only with navigation and auto route turns on, and show as off without them, whatever the
-    # param says. They can be switched off while driving, but on only while parked.
+    # param says. They can be switched off while driving, but on only while parked. So can automatic turn lanes.
     navigation, auto_turns = ui_state.params.get_bool("NavigationEnabled"), ui_state.params.get_bool("NavAutoTurn")
     far_checked = navigation and auto_turns and ui_state.params.get_bool("NavAutoTurnFarSide")
     self.nav_far_turn_toggle.set_checked(far_checked)
@@ -281,6 +292,11 @@ class ModelsLayoutMici(NavScroller):
     far_value = "" if navigation and auto_turns else tr("needs navigation") if not navigation else tr("needs auto route turns")
     if self.nav_far_turn_toggle.value != far_value:
       self.nav_far_turn_toggle.set_value(far_value)
+    lane_checked = navigation and auto_turns and ui_state.params.get_bool("NavAutoTurnLane")
+    self.nav_turn_lane_toggle.set_checked(lane_checked)
+    self.nav_turn_lane_toggle.set_enabled(navigation and auto_turns and (ui_state.is_offroad() or lane_checked))
+    if self.nav_turn_lane_toggle.value != far_value:
+      self.nav_turn_lane_toggle.set_value(far_value)
 
     manager = self.model_manager
     self._download_frame += 1

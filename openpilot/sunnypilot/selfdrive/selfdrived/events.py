@@ -235,6 +235,18 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleLow, 1.),
   },
 
+  # the route's own lane change into a turn lane: with no blinker, the driver's only notice that the car moves over. It shows
+  # in place of Changing Lanes, while the lane change lasts. Its sound, the soft Pay Attention tone, is none of the other
+  # route alerts' sounds, so it plays also right after one of them (soundd plays a sound again only when it changes). Low
+  # priority, as the other route alerts: driver monitoring's warnings show over it.
+  EventNameSP.navTurnLane: {
+    ET.WARNING: Alert(
+      "Moving to Turn Lane",
+      "Steer to stay in your lane",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, log.SelfdriveState.AudibleAlert.preAlert, .1),
+  },
+
   EventNameSP.speedLimitActive: {
     ET.WARNING: Alert(
       "Auto adjusting to speed limit",

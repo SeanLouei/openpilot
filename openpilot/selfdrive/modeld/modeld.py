@@ -469,6 +469,7 @@ def main(demo=False):
       mdv2sp_send.modelDataV2SP.laneTurnDirection = DH.lane_turn_direction
       mdv2sp_send.modelDataV2SP.navTurnSpeed = DH.nav_desire.speed_limit
       mdv2sp_send.modelDataV2SP.navTurnAcross = 'turning' if DH.nav_desire.turn_across else 'signal' if DH.nav_desire.signal_prompt else 'none'
+      mdv2sp_send.modelDataV2SP.navTurnLane = DH.turn_lane_change is not None
 
       fill_driving_model_data(drivingdata_send, modelv2_send)
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, extrinsics_calibration_seen)

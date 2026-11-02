@@ -120,6 +120,41 @@ FAR_PROMPT_DEBOUNCE = 0.5  # s
 # is the driver calling the turn off
 FAR_CANCEL_TIME = 2.0  # s
 
+# A turn lane (a bay or a pocket) opening beside the car on the turn's side before the route's turn: with automatic turn
+# lanes on, the car moves into it by itself, without the blinker, so the automatic turn can start from it. Only from the
+# outermost lane on that side, confirmed there (on the near side by the curb lane test for OUTER_LANE_TIME and
+# POCKET_CURB_DISTANCE, on the far side by the curb's run) with no lane change since, and only into a lane the model surely
+# sees open: the road edge POCKET_WIDTH or more beyond where it was beside the car, sure, and still that far out from the
+# car to POCKET_LOOKAHEAD ahead (a bus bay or a driveway's flare ends sooner), behind a lane line surely seen 1.0-2.4 m from
+# the car's center and POCKET_WIDTH or more from it (a bike lane or a shoulder is narrower), with no lane line beyond it,
+# for POCKET_TIME.
+POCKET_WIDTH = 2.6  # m
+POCKET_LOOKAHEAD = 30.  # m ahead of the car, or to POCKET_END before the maneuver point where that is nearer
+POCKET_END = 10.  # m
+POCKET_TIME = 0.5  # s
+POCKET_LINE_PROB = 0.5
+POCKET_LINE_DISTANCE = (1.0, 2.4)  # m from the car's center
+POCKET_CURB_DISTANCE = 10.  # m
+# Where the edge was beside the car is its distance averaged over POCKET_BASELINE_TIME while the car was in the lane beside
+# it, so the start of a taper hardly moves it. It counts only until the car has driven POCKET_MEMORY with neither that
+# edge close beside it nor a turn lane open there, and never after the steering was off: a lane the car left by hand looks
+# just like one opening.
+POCKET_BASELINE_TIME = 2.0  # s
+POCKET_MEMORY = 50.  # m
+# The move: only between POCKET_MIN_SPEED and POCKET_MAX_SPEED, within POCKET_MAX_DISTANCE of the turn, and only where it,
+# POCKET_CHANGE_TIME at the car's speed, ends POCKET_MARGIN before the turn's start, NAV_TURN_TRIGGER_TIME before the
+# steering point. Else the car stays in its lane, as without the setting.
+POCKET_MIN_SPEED = 2.5  # m/s
+POCKET_MAX_SPEED = 15.  # m/s
+POCKET_MAX_DISTANCE = 150.  # m
+POCKET_CHANGE_TIME = 3.5  # s
+POCKET_MARGIN = 5.  # m
+# Nor while a turn command is still in the model's desire history: the last turn's, just made
+POCKET_AFTER_TURN = 5.0  # s since a turn's last pulse
+# A car coming up in that blind spot ends the move only before the car has moved toward the turn lane: until the lane line
+# between them is POCKET_MOVED nearer than it was as the move started
+POCKET_MOVED = 0.5  # m
+
 # A blinker switched on for the route's next turn within this distance is its turn signal, not a lane change, for as long
 # as it stays on; on a fast road from farther, from where the slowdown starts, so it has the room to get down to turn
 # speed, but only once the car is in the outermost lane on the turn's side: from another lane, out there it is a lane
@@ -174,6 +209,18 @@ LEFT_DIRECTIONS, RIGHT_DIRECTIONS = ('slightLeft', 'left', 'sharpLeft'), ('sligh
 STRAIGHT_ON_TYPES = ('new name', 'continue', 'turn')  # with a 'straight' modifier: no blinker is the signal for them
 
 
+@dataclass(frozen=True)
+class RoadView:
+  """The model's road edges and lane lines as the turn lane test reads them, in m to the right of the car's center (left
+  is negative): each road edge's points ahead of the car and how unsure the model is of it, (left, right), and each lane
+  line beside the car and its probability, left to right. Empty without model output."""
+  edge_x: tuple[tuple[float, ...], ...] = ()
+  edge_y: tuple[tuple[float, ...], ...] = ()
+  edge_stds: tuple[float, ...] = ()
+  line_y: tuple[float, ...] = ()
+  line_probs: tuple[float, ...] = ()
+
+
 @dataclass
 class NavInputs:
   instruction: Any = None  # the latest navInstruction, None without a valid, recent one
@@ -187,6 +234,7 @@ class NavInputs:
   driver_alert: bool = False  # driver monitoring is warning
   speed_limit: float = 0.  # m/s the posted limit plannerd found, or the car's own if higher; 0 unknown
   long_delay: float = 0.15  # s the car's longitudinal actuators take to respond (CarParams.longitudinalActuatorDelay)
+  road: RoadView = RoadView()  # the model's road edges and lane lines, for automatic turn lanes
 
 
 def normalize_direction(modifier) -> str:
@@ -255,6 +303,64 @@ def far_turn_lane(lanes, left: bool) -> bool:
   return bool(lane.active) and direction in side
 
 
+def road_view(model) -> RoadView:
+  """The model message's road edges and lane lines, for the turn lane test. It never raises: modeld calls it outside
+  DesireHelper's guard."""
+  try:
+    edges, lines, stds, probs = model.roadEdges, model.laneLines, model.roadEdgeStds, model.laneLineProbs
+    if len(edges) < 2 or len(lines) < 4 or len(stds) < 2 or len(probs) < 4:
+      return RoadView()
+    return RoadView(edge_x=tuple(tuple(float(x) for x in edges[i].x) for i in range(2)),
+                    edge_y=tuple(tuple(float(y) for y in edges[i].y) for i in range(2)),
+                    edge_stds=(float(stds[0]), float(stds[1])),
+                    line_y=tuple(float(lines[i].y[0]) if len(lines[i].y) else math.nan for i in range(4)),
+                    line_probs=tuple(float(probs[i]) for i in range(4)))
+  except Exception:
+    return RoadView()
+
+
+def curb_distance(road: RoadView, left: bool) -> float:
+  """m from the car's center to the road edge on that side, where the model reads it close beside the car, on that side
+  and not under it; NaN otherwise."""
+  try:
+    distance = (-1. if left else 1.) * float(road.edge_y[0 if left else 1][0])
+  except (IndexError, TypeError, ValueError):
+    return math.nan
+  return distance if FAR_EDGE_MIN < distance < OUTER_EDGE_DISTANCE else math.nan  # NaN fails every comparison
+
+
+def lane_line_distance(road: RoadView, left: bool) -> float:
+  """m from the car's center to its lane's line on that side, positive on that side; NaN without a reading."""
+  try:
+    distance = (-1. if left else 1.) * float(road.line_y[1 if left else 2])
+  except (IndexError, TypeError, ValueError):
+    return math.nan
+  return distance if math.isfinite(distance) else math.nan
+
+
+def turn_lane_open(road: RoadView, left: bool, baseline: float, lookahead: float) -> bool:
+  """Whether the model surely sees a turn lane open beside the car on that side, beyond the car's lane line there: the road
+  edge POCKET_WIDTH or more beyond `baseline`, where it was beside the car, sure, and still that far out at every point to
+  `lookahead` m ahead; the lane line between surely seen POCKET_LINE_DISTANCE from the car's center, with the edge
+  POCKET_WIDTH or more beyond it; no lane line beyond the new lane. Any value missing, not finite or on the other side of
+  the car, and it is not."""
+  side, sign = (0, -1.) if left else (1, 1.)
+  try:
+    xs, ys = np.asarray(road.edge_x[side], dtype=float), sign * np.asarray(road.edge_y[side], dtype=float)
+    std, line_prob = float(road.edge_stds[side]), float(road.line_probs[1 if left else 2])
+    beyond_prob = float(road.line_probs[0 if left else 3])
+  except (IndexError, TypeError, ValueError):
+    return False
+  if (xs.ndim != 1 or len(xs) < 2 or xs.shape != ys.shape or not np.all(np.isfinite(xs)) or not np.all(np.isfinite(ys))
+      or not np.all(np.diff(xs) > 0.) or not math.isfinite(baseline) or not xs[0] <= lookahead <= xs[-1]):
+    return False
+  edge = min(float(np.min(ys[xs <= lookahead])), float(np.interp(lookahead, xs, ys)))  # from beside the car to the lookahead
+  line = lane_line_distance(road, left)
+  return bool(edge >= baseline + POCKET_WIDTH and 0. <= std < FAR_EDGE_STD and POCKET_LINE_PROB <= line_prob <= 1.
+              and POCKET_LINE_DISTANCE[0] <= line <= POCKET_LINE_DISTANCE[1] and ys[0] - line >= POCKET_WIDTH
+              and 0. <= beyond_prob < NEARSIDE_PROB)
+
+
 def yaw_rate(model) -> float:
   """The model's yaw rate now, positive left (the model's frame is forward, right, down), 0 without one."""
   rates = getattr(getattr(model, 'orientationRate', None), 'z', ())
@@ -307,7 +413,7 @@ def nav_inputs(sm, model, openpilot_longitudinal: bool, long_delay: float = NavI
   dm = sm['driverMonitoringState']
   return NavInputs(instruction, age, long_active, outer_lanes(model), not dm.isRHD, yaw_rate(model), acceleration(sm),
                    far_lanes=far_lanes(model), driver_alert=dm.alertLevel != log.DriverMonitoringState.AlertLevel.none,
-                   speed_limit=posted_speed_limit(sm), long_delay=long_delay)
+                   speed_limit=posted_speed_limit(sm), long_delay=long_delay, road=road_view(model))
 
 
 def signal_distance(v_ego: float) -> float:
@@ -497,6 +603,13 @@ class NavDesireController:
   driver signals for, through a lane change too, and by a started turn until the car passes it. The turn's point is
   pinned on the odometer once it starts or the car is close: the slowdown keeps the nearest the point has been, and turn
   speed holds to 20 m past the farthest, even once navd moves on. plannerd follows it while openpilot controls the speed.
+  Turn lanes: with automatic turn lanes on too (switched on as the drive starts or at a standstill; on the far side only
+  with automatic far side turns), a turn lane that opens beside the outermost lane on the turn's side, once the car was
+  confirmed in that lane, has the car move into it by itself: one lane change toward the turn, no blinker, through
+  DesireHelper, once per maneuver, while an automatic turn can still come and early enough to end before the turn's start.
+  The driver's blinker, the gas, steering against it or calling the turn off ends it, and so does a car in that blind spot
+  before the car moved. Once it is done, the car counts as confirmed in the outermost lane for as long as the model still
+  sees it there, so the turn starts from the new lane as from any other.
   Exits and forks: a nudge toward the side the route's lane guidance takes gives a keep desire near the split.
   """
 
@@ -506,6 +619,7 @@ class NavDesireController:
     self.turn_enabled = False
     self.auto_enabled = False
     self.far_enabled = False
+    self.lane_enabled = False
     self.exit_enabled = False
     self.standstill = True  # the car stood still on the last frame; modeld starts with the drive, from parked
     self.read_params()
@@ -515,6 +629,7 @@ class NavDesireController:
     self.odometer = 0.  # m driven
     self.gap = math.inf  # s since the last fresh route instruction
     self.outer_lane_time = [0., 0.]  # s the model has seen the car in the outermost lane on its (left, right)
+    self.outer_lane_distance = [0., 0.]  # m the car has driven meanwhile
     # s and m a curb or median has surely been close beside the car on its (left, right), with no lane change and no car in
     # that blind spot
     self.far_lane_time = [0., 0.]
@@ -534,11 +649,14 @@ class NavDesireController:
     self.pulse_frame = 0
     # the maneuver whose far side turn asked for the blinker: it waits for it, whatever reset() forgets
     self.asked_maneuver: int | None = None
+    # the maneuver a lane change into its turn lane started for: never a second one, whatever reset() forgets
+    self.lane_move_maneuver: int | None = None
     self.reset()
 
   def reset(self) -> None:
-    """Forget any route turn: no desire, no turn signal, no speed limit, nothing held. The pinned turn points stay, so a
-    turn already under way keeps its slowdown once the route can be read again."""
+    """Forget any route turn: no desire, no turn signal, no speed limit, nothing held, no lane change into a turn lane and
+    nothing seen for one. The pinned turn points stay, so a turn already under way keeps its slowdown once the route can be
+    read again."""
     self.turn_direction = TurnDirection.none
     self.route_turn_signal = False
     self.keep_desire = log.Desire.none
@@ -558,6 +676,20 @@ class NavDesireController:
     self.handed_back = False  # the current maneuver's automatic far side turn started, and was handed back to the driver
     self.prompt_time = 0.  # s the current far side turn's automatic start has been out of reach, in its prompt's window
     self.turn_blinker_ahead = False  # a blinker toward the route's next turn, within its early signal distance
+    # automatic turn lanes: the side (left) the car is to move to a turn lane on, this frame, or keep moving to (DesireHelper
+    # runs the lane change), and the one DesireHelper has under way
+    self.turn_lane: bool | None = None
+    self.lane_move: bool | None = None
+    self.lane_move_line = math.nan  # m from the car's center to the lane line between it and the turn lane as the move began
+    self.lane_move_moved = False  # the car has moved toward the turn lane
+    self.lane_carry: bool | None = None  # the side (left) of the turn lane the car moved into: the outermost lane there
+    # whether the car was confirmed in the outermost lane on its (left, right) with no lane change since, where the road
+    # edge was beside it there, how far it has driven since that edge was close beside it or a turn lane open there, and
+    # how long a turn lane has been open beside it
+    self.curb_confirmed = [False, False]
+    self.curb_baseline = [math.nan, math.nan]
+    self.curb_gone = [0., 0.]
+    self.pocket_time = [0., 0.]
 
   def read_params(self) -> None:
     self.turn_enabled = self.params.get_bool("NavTurnDesire")
@@ -566,6 +698,9 @@ class NavDesireController:
     # automatic route turns are switched on while driving with them already set; they go off at once
     far = self.auto_enabled and self.params.get_bool("NavAutoTurnFarSide")
     self.far_enabled = far and (self.far_enabled or self.standstill)
+    # so do automatic turn lanes; on the far side they also need automatic far side turns
+    lane = self.auto_enabled and self.params.get_bool("NavAutoTurnLane")
+    self.lane_enabled = lane and (self.lane_enabled or self.standstill)
     self.exit_enabled = self.params.get_bool("NavExitDesire")
 
   def update_params(self) -> None:
@@ -601,6 +736,7 @@ class NavDesireController:
     self.frame += 1
     self.turn_direction = TurnDirection.none
     self.keep_desire = log.Desire.none
+    self.turn_lane = None
     side = blinker_side(carstate)
     if side != self.blinker:
       self.blinker, self.blinker_onset = side, self.frame
@@ -611,6 +747,8 @@ class NavDesireController:
     self.odometer += v_ego * DT_MDL
     self.gap = 0. if nav.instruction is not None else self.gap + DT_MDL
     self.outer_lane_time = [t + DT_MDL if outer and not lane_changing else 0. for t, outer in zip(self.outer_lane_time, nav.outer_lanes, strict=True)]
+    self.outer_lane_distance = [d + v_ego * DT_MDL if outer and not lane_changing else 0.
+                                for d, outer in zip(self.outer_lane_distance, nav.outer_lanes, strict=True)]
     # a car in the blind spot beside the curb means a lane there after all, so the curb counts again once it is gone
     blindspots = (carstate.leftBlindspot, carstate.rightBlindspot)
     curbs = [far and not lane_changing and not blindspot for far, blindspot in zip(nav.far_lanes, blindspots, strict=True)]
@@ -645,6 +783,15 @@ class NavDesireController:
       self.stale_blinker = None
     turn = self.tracker.turn()
     pending = (self.turn_enabled or self.auto_enabled) and turn is not None and not self.tracker.passed and self.gap <= NAV_INSTRUCTION_GRACE
+
+    # automatic turn lanes: the outermost lane the car was confirmed in on each side, and a turn lane opening beside it on
+    # the turn's side, all forgotten while the setting is off; and in the turn lane the car moved into, the outermost lane
+    # counts as confirmed while it is seen
+    if self.lane_enabled:
+      self._watch_turn_lanes(carstate, lateral_active, nav, lane_changing, curbs, v_ego, turn)
+    else:
+      self.curb_confirmed, self.curb_baseline, self.curb_gone, self.pocket_time = [False, False], [math.nan, math.nan], [0., 0.], [0., 0.]
+    self._carry_turn_lane(nav, lane_changing, curbs)
 
     # the heading change toward the turn's side as the car comes up to it, whenever the car moves
     if turn is not None and v_ego > NAV_TURN_LINEUP_MIN_SPEED and self.tracker.distance <= NAV_TURN_LINEUP_DISTANCE:
@@ -698,6 +845,13 @@ class NavDesireController:
       self._hold_turn(carstate, nav, lateral_active, v_ego)
     elif pending and lateral_active and nav.instruction is not None:
       self._start_turn(carstate, nav, v_ego, turn, lane_changing)
+
+    # the lane change into a turn lane, which DesireHelper runs: under way, it goes on until something ends it; else it may
+    # start now, toward the turn's side
+    if self.lane_move is not None:
+      self.turn_lane = self.lane_move if self._turn_lane_holds(carstate, nav) else None
+    elif self.lane_enabled and turn is not None and self._turn_lane_allowed(carstate, nav, v_ego, turn):
+      self.turn_lane, self.lane_move_line = turn, lane_line_distance(nav.road, turn)
 
     # One prompt to signal, for a far side turn that will not start or go on by itself: while the car waits short of it,
     # still lined up, or while it moves, from FAR_SIGNAL_LEAD before its start would come, once its automatic start has been
@@ -882,6 +1036,104 @@ class NavDesireController:
     run_distance = min(max(FAR_LANE_DISTANCE - self.far_lane_distance[side], 0.), distance)
     run = max(FAR_LANE_TIME - self.far_lane_time[side], self._time_to_steer(nav, distance, v_ego, distance - run_distance))
     return run <= self._time_to_steer(nav, distance, v_ego) - FAR_TURN_MIN_LEAD
+
+  def _watch_turn_lanes(self, carstate, lateral_active: bool, nav: NavInputs, lane_changing: bool, curbs: list[bool], v_ego: float,
+                        turn: bool | None) -> None:
+    """Whether the car was confirmed in the outermost lane on each side, with no lane change since, where the road edge was
+    beside it there, and how long a turn lane has been open beside it on the turn's side. The near side's confirmation is
+    the curb lane test's, for OUTER_LANE_TIME and POCKET_CURB_DISTANCE; the far side's the curb's run, which a car in that
+    blind spot also ends. A lane change or the steering off forgets it, as does driving POCKET_MEMORY with neither the
+    edge close beside the car nor a turn lane open there."""
+    lookahead = max(min(POCKET_LOOKAHEAD, self.tracker.nearest - POCKET_END), 0.)
+    for side, left in enumerate((True, False)):
+      near = left != nav.right_hand_traffic
+      if near:
+        seen = nav.outer_lanes[side] and not lane_changing
+        confirmed = self.outer_lane_time[side] >= OUTER_LANE_TIME - 1e-6 and self.outer_lane_distance[side] >= POCKET_CURB_DISTANCE - 1e-6
+      else:
+        seen = curbs[side]
+        confirmed = self.far_lane_time[side] >= FAR_LANE_TIME - 1e-6 and self.far_lane_distance[side] >= FAR_LANE_DISTANCE - 1e-6
+      edge = curb_distance(nav.road, left)
+      opened = False
+      if lane_changing or not lateral_active or (not near and (carstate.leftBlindspot if left else carstate.rightBlindspot)):
+        self.curb_confirmed[side], self.curb_baseline[side], self.curb_gone[side] = False, math.nan, 0.
+      elif seen and math.isfinite(edge):
+        baseline = self.curb_baseline[side]
+        self.curb_baseline[side] = edge if math.isnan(baseline) else baseline + (edge - baseline) * DT_MDL / POCKET_BASELINE_TIME
+        self.curb_confirmed[side] |= confirmed
+        self.curb_gone[side] = 0.
+      else:
+        opened = left == turn and self.curb_confirmed[side] and turn_lane_open(nav.road, left, self.curb_baseline[side], lookahead)
+        self.curb_gone[side] = 0. if opened else self.curb_gone[side] + v_ego * DT_MDL
+        if self.curb_gone[side] > POCKET_MEMORY:
+          self.curb_confirmed[side], self.curb_baseline[side], opened = False, math.nan, False
+      self.pocket_time[side] = self.pocket_time[side] + DT_MDL if opened else 0.
+
+  def _carry_turn_lane(self, nav: NavInputs, lane_changing: bool, curbs: list[bool]) -> None:
+    """In the turn lane the car moved into, the car counts as confirmed in the outermost lane on its side, so the automatic
+    turn starts from it as from any other, while the model sees it there frame by frame: the near side's curb lane test, the
+    far side's curb test with no car in that blind spot. Once that fails, the lane counts again from there, as after any
+    lane change."""
+    if self.lane_carry is None:
+      return
+    side = 0 if self.lane_carry else 1
+    if self.lane_carry != nav.right_hand_traffic:
+      if nav.outer_lanes[side] and not lane_changing:
+        self.outer_lane_time[side] = max(self.outer_lane_time[side], OUTER_LANE_TIME)
+        return
+    elif curbs[side]:
+      self.far_lane_time[side] = max(self.far_lane_time[side], FAR_LANE_TIME)
+      self.far_lane_distance[side] = max(self.far_lane_distance[side], FAR_LANE_DISTANCE)
+      return
+    self.lane_carry = None
+
+  def _turn_lane_allowed(self, carstate, nav: NavInputs, v_ego: float, left: bool) -> bool:
+    """Whether the car moves into the turn lane open beside it now: a turn lane on the turn's side, open for POCKET_TIME
+    beside the outermost lane the car was confirmed in, that route lane guidance does not veto (on the far side there must
+    be guidance), while this maneuver's automatic turn can still come (on the far side, everything an automatic far side
+    turn needs but the curb's run; openpilot's speed control on; a fresh route instruction; its automatic start not called
+    off, which calling the turn off also does; no blinker) and navd agrees on the distance; between POCKET_MIN_SPEED and
+    POCKET_MAX_SPEED, within POCKET_MAX_DISTANCE of the turn and far enough that the move, POCKET_CHANGE_TIME at this
+    speed, ends POCKET_MARGIN before the turn's start; no car in that blind spot; no turn command still in the model's
+    desire history (the last turn's, just made). Once per maneuver. The rest of what the move needs comes with the rest:
+    the setting needs automatic turns; a lane change or the steering off forgets the outermost lane; a latched blinker is a
+    blinker on; this turn starts only nearer than the move can be."""
+    side = 0 if left else 1
+    near = left != nav.right_hand_traffic
+    lanes = nav.instruction.lanes if nav.instruction is not None else []
+    blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
+    end = self.tracker.nearest - v_ego * POCKET_CHANGE_TIME - POCKET_MARGIN  # m before the maneuver point where the move ends
+    turn_in_history = self.pulsed_maneuver is not None and (self.frame - self.pulse_frame) * DT_MDL < POCKET_AFTER_TURN
+    return bool(nav.long_active and nav.instruction is not None and not self.auto_off
+                and not (carstate.leftBlinker or carstate.rightBlinker) and self.lane_move_maneuver != self.maneuver_id and not turn_in_history
+                and self.tracker.residual <= NAV_AGREE_DISTANCE and POCKET_MIN_SPEED <= v_ego <= POCKET_MAX_SPEED
+                and self.tracker.nearest <= POCKET_MAX_DISTANCE and self._time_to_steer(nav, end, v_ego) > NAV_TURN_TRIGGER_TIME
+                and not blindspot and self.pocket_time[side] >= POCKET_TIME - 1e-6
+                and (far_turn_lane(lanes, left) if near else bool(len(lanes)) and self._far_gates(carstate, nav, v_ego, left)))
+
+  def _turn_lane_holds(self, carstate, nav: NavInputs) -> bool:
+    """Whether the lane change into the turn lane goes on: not once the driver signals either way, presses the gas, steers
+    against it or disengages the speed control, which is all that calls the turn off, nor once navd moves on to another
+    maneuver, nor when a car comes up in that blind spot before the car has moved toward the turn lane."""
+    left = self.lane_move
+    line = lane_line_distance(nav.road, left)
+    if line <= self.lane_move_line - POCKET_MOVED:  # NaN fails
+      self.lane_move_moved = True
+    blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
+    against = carstate.steeringPressed and (carstate.steeringTorque < 0. if left else carstate.steeringTorque > 0.)  # positive is left
+    return not (carstate.leftBlinker or carstate.rightBlinker or carstate.gasPressed or against or not nav.long_active
+                or self.lane_move_maneuver != self.maneuver_id or (blindspot and not self.lane_move_moved))
+
+  def start_turn_lane(self) -> None:
+    """DesireHelper started the lane change into the turn lane this frame asked for."""
+    self.lane_move, self.lane_move_maneuver, self.lane_move_moved = self.turn_lane, self.maneuver_id, False
+
+  def end_turn_lane(self, completed: bool) -> None:
+    """DesireHelper's lane change into the turn lane ended: completed, the model done with it and nothing having ended it
+    early, the car is in the turn lane."""
+    if completed and self.lane_move is not None and self.lane_move_maneuver == self.maneuver_id:
+      self.lane_carry = self.lane_move
+    self.lane_move = None
 
   def _pin(self) -> None:
     """Pin the current maneuver's point on the odometer, at the nearest and the farthest it has been: a distance pulled in
