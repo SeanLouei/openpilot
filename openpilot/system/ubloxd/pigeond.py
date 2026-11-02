@@ -283,6 +283,22 @@ def deinitialize_and_exit(pigeon: TTYPigeon | None):
   set_power(False)
   sys.exit(0)
 
+# A comma 4 whose u-blox answers but hears no satellites at all (0 measured, normal noise and gain, no jamming), where the
+# same pigeond got fixes before: start the receiver cold and without aiding, so nothing it saved or is given (navigation data,
+# almanac backup, time, position, AssistNow) can keep it from searching the whole sky, and start its GNSS explicitly, since
+# pigeond stops it on exit and the power cycle may not reach the chip.
+COLD_START = True
+
+
+def cold_start(pigeon: TTYPigeon) -> None:
+  cloudlog.warning("Cold starting ublox")
+  # UBX-CFG-RST: clear all navigation data (cold start), controlled software reset of the GNSS only (the configuration stays)
+  pigeon.send(add_ubx_checksum(b"\xB5\x62\x06\x04\x04\x00\xFF\xFF\x02\x00"))
+  time.sleep(1)
+  # UBX-CFG-RST: controlled GNSS start
+  pigeon.send(add_ubx_checksum(b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00"))
+
+
 def init(pigeon: TTYPigeon) -> None:
   # register exit handler
   signal.signal(signal.SIGINT, lambda sig, frame: deinitialize_and_exit(pigeon))
@@ -296,7 +312,9 @@ def init(pigeon: TTYPigeon) -> None:
   init_baudrate(pigeon)
   init_pigeon(pigeon)
 
-  if system_time_valid():
+  if COLD_START:
+    cold_start(pigeon)
+  elif system_time_valid():
     try:
       send_time(pigeon)
       send_position(pigeon)
@@ -328,7 +346,7 @@ def run_receiving(duration: int = 0):
   threading.Thread(target=download_assistnow, daemon=True).start()
 
   while (duration == 0) or (time.monotonic() - start_time < duration):
-    if assist_messages is not None and not assist_attempted:
+    if assist_messages is not None and not assist_attempted and not COLD_START:
       assist_attempted = True
       try:
         for msg in assist_messages:
