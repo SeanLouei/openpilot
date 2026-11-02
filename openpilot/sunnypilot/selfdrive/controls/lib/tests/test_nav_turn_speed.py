@@ -256,3 +256,17 @@ class TestNavTurnWiring(OpenpilotTestCase):
       assert 'modelDataV2SP' in services(tree, 'PubMaster'), modeld
       assert any(isinstance(n, ast.Attribute) and n.attr == 'navTurnSpeed' and isinstance(n.ctx, ast.Store) for n in ast.walk(tree)), modeld
     assert 'modelDataV2SP' in services(source('openpilot.selfdrive.controls.plannerd'), 'SubMaster')
+
+  def test_modeld_gives_desire_helper_the_route(self):
+    # DesireHelper.update without the route inputs, or another value published as the limit, silently turns every route
+    # turn and slowdown off, and no test runs either modeld's loop
+    for modeld in ('openpilot.selfdrive.modeld.modeld', 'openpilot.sunnypilot.modeld_v2.modeld'):
+      tree = source(modeld)
+      route_inputs = {target.id for node in ast.walk(tree) if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                      and getattr(node.value.func, 'id', None) == 'nav_inputs' for target in node.targets if isinstance(target, ast.Name)}
+      updates = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, 'attr', None) == 'update'
+                 and getattr(node.func.value, 'id', None) == 'DH']
+      assert updates and all(call.args and getattr(call.args[-1], 'id', None) in route_inputs for call in updates), modeld
+      limits = [node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                for target in node.targets if isinstance(target, ast.Attribute) and target.attr == 'navTurnSpeed']
+      assert limits and all(ast.unparse(value) == 'DH.nav_desire.speed_limit' for value in limits), modeld

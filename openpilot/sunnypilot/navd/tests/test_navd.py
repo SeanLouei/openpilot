@@ -14,13 +14,14 @@ import requests
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.selfdrive.navigation.navd import MAX_FIX_AGE, REROUTE_COUNTER_MIN, RouteEngine, set_banner
+from openpilot.selfdrive.navigation.navd import MAX_FIX_AGE, RECOMPUTE_HOLD, REROUTE_COUNTER_MIN, RouteEngine, set_banner
 from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE
 
 
 def route_engine(values, sm=None, pm=None):
   params = MagicMock()
   params.get.side_effect = values.get
+  params.remove.side_effect = lambda key: values.pop(key, None)
   with patch('openpilot.selfdrive.navigation.navd.Api') as api:
     api.return_value.get_token.return_value = 'device-token'
     engine = RouteEngine(sm or MagicMock(), pm or MagicMock(), params=params)
@@ -284,10 +285,14 @@ def arc(center, radius, start, end, step=5.):
 class Drive:
   """The real navd loop, once a second, for a car driving through planar points at a constant speed."""
 
-  def __init__(self, route, start):
+  def __init__(self, route, start, destination=None):
+    """destination: planar meters of the place set on the phone, by default the route's end."""
     self.sm, self.pm = GpsSubMaster(), MagicMock()
     end = route[-1]['geometry']['coordinates'][-1]
-    self.engine = route_engine({'NavDestination': {'longitude': end[0], 'latitude': end[1]}}, self.sm, self.pm)
+    if destination is not None:
+      end = [degrees(destination[0]), degrees(destination[1])]
+    self.values = {'NavDestination': {'longitude': end[0], 'latitude': end[1]}}
+    self.engine = route_engine(self.values, self.sm, self.pm)
     self.engine.last_position = (degrees(start[0]), degrees(start[1]))
     response = MagicMock(status_code=200)
     response.json.return_value = {'routes': [{'legs': [{'steps': route}]}]}
@@ -310,6 +315,20 @@ class Drive:
         records.append({'s': s, 'x': x, 'y': y, 'step': self.engine.step_idx, 'valid': msg.valid, 'rerouting': get.called,
                         'type': str(msg.navInstruction.maneuverType), 'distance': msg.navInstruction.maneuverDistance})
         s += speed
+    return records
+
+  def fixes(self, fixes):
+    """Feeds fixes of (x, y, bearing, speed), once a second, a stop or a turnaround too. Per fix: whether the instruction
+    was valid, and how many routes navd asked for so far."""
+    records = []
+    with patch('requests.get', return_value=MagicMock(status_code=200)) as get:
+      for x, y, bearing, speed in fixes:
+        self.sm.fix(x, y, bearing, speed)
+        self.pm.reset_mock()
+        self.engine.update()
+        msg = next(call.args[1] for call in self.pm.send.call_args_list if call.args[0] == 'navInstruction')
+        records.append({'x': x, 'y': y, 'step': self.engine.step_idx, 'valid': msg.valid, 'type': str(msg.navInstruction.maneuverType),
+                        'requests': get.call_count})
     return records
 
 
@@ -416,6 +435,45 @@ class TestSplits(OpenpilotTestCase):
       assert all(r['valid'] for r in records[:missed])
       assert records[-1]['rerouting'] and records[-1]['y'] - records[missed]['y'] <= 30.  # at the next update
 
+  def test_gps_outlier_past_an_exit_not_taken(self):
+    # One fix off toward the ramp, from multipath say, while the car stays on the freeway. The straight line navd checks
+    # between two fixes then runs through the ramp's side of the road, where the car never was: the ramp's turn must
+    # never come to the car on the freeway
+    for jump in (20., 30., 60.):
+      for past in (70., 80., 90., 100., 110.):
+        for phase in (0., 0.5):
+          outlier = self.gore[1] + past
+          fixes = [(1.8 + (jump if abs(y - outlier) < 15. else 0.), y, 0., 30.) for y in np.arange(600. + 30. * phase, 1400., 30.)]
+          records = Drive(self.route, (1.8, 600.)).fixes(fixes)  # the receiver's course stays the car's, from its motion
+          assert not [r for r in records if r['valid'] and r['type'] == 'end of road'], (jump, past, phase)
+          assert records[-1]['requests'] > 0  # missed, and rerouted
+
+
+class TestServiceRoad(OpenpilotTestCase):
+  """The route turns onto a short connector to a service road that runs beside the main road: a car staying on the main
+  road is as close to the route after the turn as one that took it, so navd waits until the car is clearly on one road."""
+
+  def route(self, side):
+    return mapbox_route(([(0, 0), (0, 300)], 'turn', 'right'), ([(0, 300), (side, 300), (side, 600)], 'turn', 'right'),
+                        ([(side, 600), (side + 200, 600)], 'arrive', 'right'))
+
+  def test_staying_on_the_main_road(self):
+    for side in (12., 15.):  # m between the roads' center lines
+      for speed in (8., 12., 16.):
+        for phase in PHASES:
+          records = Drive(self.route(side), (1.8, 100.)).drive([(1.8, 100.), (1.8, 700.)], speed, phase)
+          assert all(r['step'] == 0 for r in records[:-1]), (side, speed, phase)  # never onto the service road's turn
+          assert records[-1]['rerouting'] and records[-1]['y'] < 350.  # missed, and rerouted
+
+  def test_taking_the_service_road(self):
+    for side in (12., 15.):
+      points = [(1.8, 100.), (1.8, 298.2), (side + 1.8, 298.2), (side + 1.8, 590.)]
+      for phase in PHASES:
+        records = Drive(self.route(side), points[0]).drive(points, 6., phase)
+        assert all(r['valid'] and not r['rerouting'] for r in records)
+        along = [r for r in records if r['y'] > 320.]
+        assert along and all(r['step'] == 1 and abs(r['distance'] - (600. - r['y'])) < 0.5 for r in along), (side, phase)
+
 
 class TestShortSteps(OpenpilotTestCase):
   def test_forks_at_highway_speed(self):
@@ -472,3 +530,118 @@ class TestWrongHeading(OpenpilotTestCase):
 
   def test_slow(self):
     assert all(valid for valid, _ in self.run_fixes([(0., 200. - 2. * i, 180., 2.) for i in range(4)]))
+
+
+class TestLeavingTheRoute(OpenpilotTestCase):
+  """A road that branches off at a shallow angle stays within 25 m and 45 degrees of the route for a long way: a car that
+  takes it must not get the route's next turn on it, a road the route doesn't take."""
+  TURN = 400.  # m north to the route's right turn
+
+  def route(self):
+    return mapbox_route(([(0, 0), (0, self.TURN)], 'turn', 'right'), ([(0, self.TURN), (300, self.TURN)], 'turn', 'left'),
+                        ([(300, self.TURN), (300, self.TURN + 300)], 'arrive', ''))
+
+  def test_shallow_branch(self):
+    for angle in (15., 25., 35.):
+      for before in (50., 70., 90.):  # m before the route's turn the branch leaves
+        a, branch = math.radians(angle), self.TURN - before
+        points = [(1.8, 150.), (1.8, branch), (1.8 + 150. * math.sin(a), branch + 150. * math.cos(a))]
+        for phase in PHASES:
+          records = Drive(self.route(), points[0]).drive(points, 11., phase)
+          assert all(r['valid'] for r in records if r['y'] <= branch)
+          on_branch = [r for r in records if r['y'] > branch]
+          gone = next(i for i, r in enumerate(on_branch) if not r['valid'])
+          assert on_branch[gone]['s'] - (branch - 150.) < 35., (angle, before, phase)  # m into the branch
+          assert not any(r['valid'] for r in on_branch[gone:])
+          assert records[-1]['rerouting']  # and the route is calculated again
+
+  def test_branch_where_the_route_goes_straight_on(self):
+    # the route goes on straight through the junction, as a new name: navd moves onto that step as the car takes the branch
+    a = math.radians(15.)
+    route = mapbox_route(([(0, 0), (0, 300)], 'new name', 'straight'), ([(0, 300), (0, 380)], 'turn', 'right'),
+                         ([(0, 380), (200, 380)], 'arrive', 'right'))
+    points = [(1.8, 100.), (1.8, 300.), (1.8 + 150. * math.sin(a), 300. + 150. * math.cos(a))]
+    for phase in PHASES:
+      records = Drive(route, points[0]).drive(points, 11., phase)
+      assert not [r for r in records if r['valid'] and r['type'] == 'turn' and r['distance'] < 40.], phase
+      assert records[-1]['rerouting']
+
+  def test_frontage_road(self):
+    # a branch that turns to run beside the route, 15 m from it
+    a, branch, side = math.radians(25.), self.TURN - 120., 15.
+    run = (side - 1.8) / math.sin(a)
+    points = [(1.8, 150.), (1.8, branch), (side, branch + run * math.cos(a)), (side, self.TURN + 50.)]
+    for phase in PHASES:
+      records = Drive(self.route(), points[0]).drive(points, 11., phase)
+      assert not [r for r in records if r['valid'] and r['x'] > side - 1.], phase
+      assert records[-1]['rerouting']
+
+  def test_lane_change(self):
+    # a lane change heads off the step's direction and moves away from it only for a moment: the route and its turn stay
+    for speed, length in ((6., 12.), (8., 15.), (11., 35.)):
+      for before in (100., 150.):
+        start = self.TURN - before
+        points = [(1.8, 150.), (1.8, start), (5.3, start + length), (5.3, self.TURN - 20.)]
+        for phase in PHASES:
+          records = Drive(self.route(), points[0]).drive(points, speed, phase)
+          assert not any(r['rerouting'] for r in records)
+          after = [r for r in records if r['y'] > start + length + 2. * speed]  # two fixes after it
+          assert after and all(r['valid'] for r in after), (speed, length, before, phase)
+
+
+class TestArrival(OpenpilotTestCase):
+  """Navigation ends once the car drives away from the destination, whichever way it leaves: never with a route back."""
+
+  def arrive(self):
+    """Drives ROUTE in the right lane to 5 m short of its end, where it stops for 30 s, still on: a drop-off."""
+    drive = Drive(ROUTE, (1.8, 100.))
+    records = drive.drive([(1.8, 100.), (1.8, 298.2), (201.8, 298.2), (201.8, 495.)], 10.)
+    assert all(r['valid'] for r in records) and records[-1]['step'] == 2
+    drive.fixes([(201.8, 495., 0., 0.)] * 30)
+    assert drive.engine.route is not None and 'NavDestination' in drive.values
+    return drive
+
+  def test_leaving(self):
+    for way, fixes in (('turning around', [(199., 497., 270., 3.)] + [(198.2, y, 180., 10.) for y in range(490, 280, -10)]),
+                       ('through a lot beside it', [(x, 492., 90., 6.) for x in range(205, 330, 8)]),
+                       ('on past the end', [(201.8, y, 0., 10.) for y in range(500, 600, 10)])):
+      drive = self.arrive()
+      records = drive.fixes(fixes)
+      assert records[-1]['requests'] == 0, way
+      assert 'NavDestination' not in drive.values and drive.engine.route is None, way
+
+  def test_parked_deep_in_a_lot(self):
+    # The place is set back 20 m from the road, where Mapbox ends the route. The car parks 40 m from the road for a minute,
+    # still on, and leaves by the lot's back exit: off the route all along, but never with a route back to the place.
+    route = mapbox_route(([(0, -400), (0, 0)], 'turn', 'right'), ([(0, 0), (90, 0)], 'arrive', 'right'))
+    drive = Drive(route, (1.8, -300.), destination=(90., -20.))
+    drive.drive([(1.8, -300.), (1.8, -1.8), (86., -1.8)], 10.)
+    lot = [(88., -1.8 - d, 180., 4.) for d in range(4, 40, 4)] + [(88., -40., 180., 0.)] * 60
+    back_exit = [(88., -40. - d, 180., 6.) for d in range(6, 80, 6)] + [(88. - d, -121.8, 270., 10.) for d in range(10, 200, 10)]
+    records = drive.fixes(lot + back_exit)
+    assert records[-1]['requests'] == 0
+    assert 'NavDestination' not in drive.values and drive.engine.route is None
+
+  def test_new_destination_set_before_leaving(self):
+    # set on the phone as the car leaves the old one, before navd routes to it: the old one's end never removes it
+    drive = self.arrive()
+    new = {'longitude': degrees(-500.), 'latitude': degrees(100.)}
+    drive.values['NavDestination'] = new
+    drive.engine.last_position = (degrees(198.2), degrees(440.))
+    drive.engine.send_instruction()
+    assert drive.engine.route is None and drive.values['NavDestination'] == new
+    assert drive.fixes([(198.2, 430., 180., 10.)])[0]['requests'] == 1  # and it gets its route
+
+
+class TestDestinationChange(OpenpilotTestCase):
+  def test_new_destination_gets_its_route_at_once(self):
+    # Set on the phone right after a route came, at the start of a drive or after a reroute: the old route's turns must not
+    # go on until the reroute hold ends
+    drive = Drive(ROUTE, (0., 100.))
+    drive.engine.recompute_hold = RECOMPUTE_HOLD
+    drive.values['NavDestination'] = {'longitude': degrees(-300.), 'latitude': degrees(100.)}
+    records = drive.fixes([(0., 110., 0., 10.)])
+    assert records[0]['requests'] == 1 and not records[0]['valid']  # here Mapbox found no route
+    # a failed request is tried again once the hold ends, not every second
+    records = drive.fixes([(0., 120. + 10. * i, 0., 10.) for i in range(RECOMPUTE_HOLD)])
+    assert [r['requests'] for r in records] == [0] * (RECOMPUTE_HOLD - 1) + [1]

@@ -5,14 +5,16 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-A page on the device's network for setting the navigation destination and Mapbox token from a phone.
+A page on the device's Wi-Fi for setting the navigation destination and Mapbox token from a phone.
 """
+import fcntl
 import http.client
 import io
 import ipaddress
 import json
 import re
 import socket
+import struct
 import sys
 import threading
 import time
@@ -29,6 +31,9 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import latest_gps_source
 
 PORT = 8082
+WIFI_INTERFACE = 'wlan0'  # the comma's Wi-Fi, also its hotspot's; its cellular link is another interface
+SIOCGIFADDR = 0x8915  # Linux ioctl: an interface's IPv4 address
+LOOPBACK = '127.0.0.1'
 MAX_BODY = 4096
 MAX_HEADERS = 16384  # bytes of request headers: a browser sends about 1 KB, and the stdlib alone allows 100 lines of 64 KB
 MAX_CONNECTIONS = 12  # open at once: a phone's browser opens a few
@@ -215,6 +220,29 @@ def last_gps_position(params: Params) -> tuple[float, float] | None:
   except Exception:  # unreadable: searches just aren't biased
     return None
   return (latitude, longitude) if valid_coordinates(latitude, longitude) else None
+
+
+def wifi_address() -> str | None:
+  """The Wi-Fi interface's IPv4 address now, else None."""
+  try:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+      ifreq = fcntl.ioctl(s.fileno(), SIOCGIFADDR, struct.pack('256s', WIFI_INTERFACE.encode()))
+  except OSError:  # no address: not connected
+    return None
+  return socket.inet_ntoa(ifreq[20:24])
+
+
+def serves(local_address: str) -> bool:
+  """Whether to answer a connection that came in at this address of the device: from the device itself or over its Wi-Fi,
+  never over its cellular link, where anyone on the carrier's network may reach it. The page has no password. A machine
+  without Wi-Fi, such as a PC, answers on every address."""
+  if local_address == LOOPBACK:
+    return True
+  try:
+    socket.if_nametoindex(WIFI_INTERFACE)
+  except OSError:
+    return True
+  return local_address == wifi_address()
 
 
 def device_host(host: str) -> bool:
@@ -420,7 +448,8 @@ def make_handler(navweb: NavWeb):
 
 
 class Server(ThreadingHTTPServer):
-  """Serves the page with at most MAX_CONNECTIONS open at once, each for at most MAX_CONNECTION_TIME.
+  """Serves the page over Wi-Fi and to the device itself, with at most MAX_CONNECTIONS open at once, each for at most
+  MAX_CONNECTION_TIME.
 
   Each connection holds a thread and its buffers, and navweb runs onroad beside the driving processes.
   """
@@ -431,6 +460,13 @@ class Server(ThreadingHTTPServer):
     super().__init__(*args, **kwargs)
 
   def verify_request(self, request, client_address) -> bool:
+    # before anything is kept for it, so that a refused connection costs nothing
+    try:
+      local_address = request.getsockname()[0]
+    except OSError:  # the client left already
+      return False
+    if not serves(local_address):
+      return False  # serve_forever closes it at once
     with self.lock:
       if len(self.deadlines) >= MAX_CONNECTIONS:
         return False  # serve_forever closes it at once

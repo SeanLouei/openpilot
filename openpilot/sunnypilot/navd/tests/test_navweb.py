@@ -4,6 +4,7 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+import errno
 import http.client
 import json
 import select
@@ -22,8 +23,8 @@ from openpilot.common.parameterized import parameterized
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.sunnypilot.navd.navweb import (LINK_FAILED, MAPBOX_ERRORS, MAPBOX_FAILED, MAX_BODY, MAX_CONNECTIONS, MAX_HEADERS, MAX_REDIRECTS, OFFLINE,
-                                              PORT, LinkError, NavWeb, Place, Server, geocode, main, make_handler, place_from_text, read_link,
-                                              resolve_link, search_text)
+                                              PORT, SIOCGIFADDR, WIFI_INTERFACE, LinkError, NavWeb, Place, Server, geocode, main, make_handler,
+                                              place_from_text, read_link, resolve_link, search_text)
 
 COSTCO = 'Costco Wholesale, 1600 El Camino Real, South San Francisco, CA 94080'
 COSTCO_ADDRESS = '1600 El Camino Real, South San Francisco, CA 94080'
@@ -131,6 +132,37 @@ def trickle(client, limit=5.):
       client.sendall(b'a')
   except OSError:  # reset by the server
     pass
+
+
+@contextmanager
+def wifi(address):
+  """The device's Wi-Fi interface, with this IPv4 address, or None while it has none."""
+  def if_nametoindex(name):
+    if name != WIFI_INTERFACE:
+      raise OSError(errno.ENXIO, 'no interface with this name')
+    return 3
+
+  def ioctl(fd, request, ifreq):
+    assert request == SIOCGIFADDR and ifreq[:len(WIFI_INTERFACE) + 1] == WIFI_INTERFACE.encode() + b'\0'
+    if address is None:
+      raise OSError(errno.EADDRNOTAVAIL, 'Cannot assign requested address')
+    return ifreq[:20] + socket.inet_aton(address) + ifreq[24:]  # struct ifreq: the name, then a sockaddr_in
+
+  with patch('openpilot.sunnypilot.navd.navweb.socket.if_nametoindex', side_effect=if_nametoindex), \
+       patch('openpilot.sunnypilot.navd.navweb.fcntl.ioctl', side_effect=ioctl):
+    yield
+
+
+class Connection:
+  """An accepted connection, as verify_request gets it, that came in at this address of the device."""
+
+  def __init__(self, local_address):
+    self.local_address = local_address
+
+  def getsockname(self):
+    if self.local_address is None:
+      raise OSError(errno.ENOTCONN, 'Transport endpoint is not connected')
+    return self.local_address, PORT
 
 
 def raw_request(port, method, path, headers, body=None):
@@ -514,6 +546,43 @@ class TestServer(OpenpilotTestCase):
           client.close()
       # finished requests never keep theirs: with each one kept, all later ones would be refused
       assert eventually(lambda: all(answered(port) for _ in range(2 * MAX_CONNECTIONS)))
+
+  def test_only_wifi_and_the_device_itself(self):
+    # The page has no password: it answers over the comma's Wi-Fi and to the device itself, never at the address of its
+    # cellular link, which anyone on the carrier's network may reach. A refused connection takes none of the places.
+    server = Server(('127.0.0.1', 0), make_handler(NavWeb(FakeParams())))
+    try:
+      wlan, modem = '172.20.10.4', '10.172.5.9'  # the comma on a phone's hotspot; a carrier's address
+      with wifi(wlan):
+        assert server.verify_request(Connection(wlan), ('172.20.10.1', 50000))
+        assert server.verify_request(Connection('127.0.0.1'), ('127.0.0.1', 50001))
+        assert not server.verify_request(Connection(modem), ('203.0.113.7', 50002))
+        assert not server.verify_request(Connection(None), ('172.20.10.1', 50003))  # the client left already
+      with wifi(None):  # Wi-Fi not connected
+        assert not server.verify_request(Connection(wlan), ('172.20.10.1', 50004))
+        assert server.verify_request(Connection('127.0.0.1'), ('127.0.0.1', 50005))
+      assert len(server.deadlines) == 3
+      # a machine without Wi-Fi, such as a PC, answers on every address
+      with patch('openpilot.sunnypilot.navd.navweb.socket.if_nametoindex', side_effect=OSError(errno.ENXIO, 'no interface with this name')):
+        assert server.verify_request(Connection(modem), ('203.0.113.7', 50006))
+    finally:
+      server.server_close()
+
+  def test_connections_from_elsewhere_get_no_answer(self):
+    # end to end, with the loopback address standing in for the cellular link's
+    params = FakeParams()
+    destination = json.dumps({'text': '37.1, -122.1'})
+    with serving(NavWeb(params)) as port, patch('openpilot.sunnypilot.navd.navweb.LOOPBACK', '127.0.0.2'):
+      with wifi('192.0.2.7'):
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
+          assert client.recv(1) == b''  # closed at once, without waiting for a request
+        with self.assertRaises(ConnectionError):
+          request(port, 'POST', '/api/destination', destination)
+        assert not answered(port)
+      assert 'NavDestination' not in params
+      with wifi('127.0.0.1'):  # the same address as the Wi-Fi's
+        assert request(port, 'POST', '/api/destination', destination)[0] == 200
+    assert params['NavDestination']['latitude'] == 37.1
 
   def test_large_headers_are_refused(self):
     # the stdlib alone reads up to 100 header lines of 64 KB each, before do_GET or do_POST could refuse them

@@ -41,7 +41,8 @@ NAV_INSTRUCTION_GRACE = 3.0  # s a slowdown keeps going on the dead reckoned dis
 
 # The model gets a desire as a one-frame pulse and only remembers it for the 5 s its desire history covers, so a route
 # turn pulses about 3 s before the car starts steering into it. A fresh pulse every 4 s only keeps it there: while the
-# car waits at a crawl still lined up with the approach, or while it is at least NAV_TURN_REFRESH_LEAD from the steering point.
+# car, still lined up with the approach, waits at a crawl short of the turn, or is at least NAV_TURN_REFRESH_LEAD from the
+# steering point.
 NAV_TURN_TRIGGER_TIME = 3.0  # s
 NAV_TURN_STEER_DISTANCE = 8.0  # m before the maneuver point where steering into an intersection turn starts
 NAV_TURN_TRIGGER_MIN_SPEED = 0.5  # m/s; a car stopped short of the turn waits, one stopped at it fires
@@ -50,19 +51,31 @@ NAV_TURN_REFRESH_LEAD = 2.0  # s a moving car is still from the steering point w
 NAV_TURN_MAX_SPEED = 9.0  # m/s (20 mph); openpilot's lateral acceleration cap leaves faster turns running wide
 AUTO_TURN_MAX_SPEED = 7.0  # m/s; an automatic turn, with no blinker to confirm it, also waits for turning speed
 
-# A turn starts only while the car can still make it, else the car goes straight: moving, before the steering point and
-# slow enough to be down to turn speed by it, or at a crawl while still lined up with the approach
+# A turn starts only while the car can still make it, else the car goes straight: lined up with the approach, and moving,
+# far enough before the steering point to steer from it and slow enough to be down to turn speed by it, or at a crawl
 NAV_TURN_CRAWL_SPEED = 1.5  # m/s
 NAV_TURN_REACH_DECEL = 1.2  # m/s^2, below plannerd's NAV_TURN_MAX_DECEL for its jerk ramp and the actuator lag
-NAV_TURN_LAG = 0.3  # s before the braking takes hold
+NAV_TURN_LAG = 0.3  # s before the braking takes hold, or the steering
 NAV_TURN_REACH_MARGIN = 0.5  # m/s
-# Without openpilot's speed control nothing slows the car for the turn (Tesla's own cruise cannot go below 18 mph)
+# Above turn speed, a car openpilot still speeds up (as it pulls away from a light, or after the gas) gets no start until
+# that has stopped: plannerd's slowdown eases an acceleration out at its jerk limit, and the speed the car gains meanwhile
+# is not in the reach speed
+NAV_TURN_START_ACCEL = 0.3  # m/s^2
+# At a crawl, a near side turn (right, where traffic keeps right) starts only short of the intersection: from closer to the
+# maneuver point even the tightest turn this car steers (about 5.5 m about the rear axle, which is some 1.7 m behind the
+# comma) ends in the cross street's oncoming half. A far side turn waiting in the intersection still has room.
+NAV_TURN_NEAR_CRAWL_DISTANCE = 5.  # m
+# Without openpilot's speed control nothing slows the car for the turn (Tesla's own cruise cannot go below 18 mph), so it
+# starts only at turning speed, and never while the car's own cruise is set faster: only a slower car ahead holds it
+# down, and once that one goes straight the cruise speeds back up toward its set speed, through the turn
 NAV_TURN_STOCK_NEAR_SPEED = 5.5  # m/s for a near side turn (right, where traffic keeps right), the tight one
 NAV_TURN_STOCK_FAR_SPEED = 6.7  # m/s for a far side turn
 # How far the car has turned toward the turn's side since it came this close to it: past NAV_TURN_LINED_UP it is in the
-# turn, so a stop there gets no new turn pulse
+# turn, so it gets no new turn pulse there. The heading counts whenever the car moves, inching included; only not at a
+# stop, where the model's yaw rate could only drift.
 NAV_TURN_LINEUP_DISTANCE = 40.  # m
 NAV_TURN_LINED_UP = 25.  # deg
+NAV_TURN_LINEUP_MIN_SPEED = 0.05  # m/s
 
 # An automatic turn starts only from the outermost lane: a confident road edge close beside the car with no lane line
 # beyond the car's own, for a second, counted again after a lane change. Only the edge's distance tells a lane beside the
@@ -72,7 +85,8 @@ OUTER_EDGE_DISTANCE = 2.6  # m from the car's center
 OUTER_LANE_TIME = 1.0  # s
 
 # A blinker switched on for the route's next turn within this distance is its turn signal, not a lane change, for as long
-# as it stays on
+# as it stays on; on a fast road from farther, from where the slowdown starts, so it has the room to get down to turn
+# speed. Only within this distance does it bring back what the driver called off: farther out it may yet be a lane change.
 NAV_TURN_SIGNAL_TIME = 12.0  # s
 NAV_TURN_SIGNAL_BASE_DISTANCE = 15.0  # m
 NAV_TURN_SIGNAL_DISTANCE = (30.0, 250.0)  # m
@@ -89,10 +103,13 @@ NAV_MAX_PUSH_OUT = 1.0  # m/s; follows a speed or map scale error of a few perce
 NAV_RESEED_DISTANCE = 15.0  # m beyond which navd's distance replaces the dead reckoned one outright
 # This close to the maneuver a GPS error behind the car would time the turn late, so there a much longer navd distance
 # takes back at once only what navd pulled in lately (a GPS error ahead that ended), and otherwise holds the turn back: a
-# turn starts only while navd agrees, and judged on the nearer of the two distances
+# turn starts only while navd agrees, and judged on the nearer of the two distances, the dead reckoned one without what
+# navd pushed out beyond that take-back here, since the push-out alone would make navd agree in the end
 NAV_NEAR_DISTANCE = 60.0  # m
 NAV_PULL_IN_MEMORY = 20.0  # s over which a pull-in fades
 NAV_AGREE_DISTANCE = 8.0  # m navd's distance may be beyond the dead reckoned one for a turn to start
+# A car standing still cannot change its distance to the maneuver, so navd's changes then are only GPS noise
+NAV_STANDSTILL_SPEED = 0.1  # m/s
 
 # The slowdown: from the highest speed the car can slow to turn speed from at a gentle deceleration, to turn speed by the turn
 NAV_TURN_SPEED = 4.5  # m/s; 10 mph keeps a tight right turn within openpilot's 3 m/s^2 lateral acceleration cap
@@ -113,6 +130,7 @@ TURN_TYPES = ('turn', 'end of road', 'on ramp', 'continue')
 SPLIT_TYPES = ('off ramp', 'fork')
 TURN_LEFT, TURN_RIGHT = ('left', 'sharpLeft'), ('right', 'sharpRight')
 LEFT_DIRECTIONS, RIGHT_DIRECTIONS = ('slightLeft', 'left', 'sharpLeft'), ('slightRight', 'right', 'sharpRight')
+STRAIGHT_ON_TYPES = ('new name', 'continue', 'turn')  # with a 'straight' modifier: no blinker is the signal for them
 
 
 @dataclass
@@ -123,6 +141,7 @@ class NavInputs:
   outer_lanes: tuple[bool, bool] = (False, False)  # whether the car is in the outermost lane on its (left, right)
   right_hand_traffic: bool = True
   yaw_rate: float = 0.  # rad/s the car turns at, positive left
+  accel: float = 0.  # m/s^2 the car speeds up at: the more of its measured and its commanded acceleration
 
 
 def normalize_direction(modifier) -> str:
@@ -170,12 +189,19 @@ def yaw_rate(model) -> float:
   return -rate if math.isfinite(rate) else 0.
 
 
+def acceleration(sm) -> float:
+  """The more of the car's measured acceleration and the one controlsd commands, which leads it; 0 without either."""
+  accels = (float(sm['carState'].aEgo), float(sm['carControl'].actuators.accel))
+  return max((accel for accel in accels if math.isfinite(accel)), default=0.)
+
+
 def nav_inputs(sm, model, openpilot_longitudinal: bool) -> NavInputs:
   """Everything route desires need from modeld: its SubMaster, the model message just filled for this frame, and whether
   openpilot controls the car's speed, which carControl.longActive alone also reports for cruise button control."""
   instruction, age = fresh_nav_instruction(sm)
   long_active = openpilot_longitudinal and bool(sm['carControl'].longActive)
-  return NavInputs(instruction, age, long_active, outer_lanes(model), not sm['driverMonitoringState'].isRHD, yaw_rate(model))
+  return NavInputs(instruction, age, long_active, outer_lanes(model), not sm['driverMonitoringState'].isRHD, yaw_rate(model),
+                   acceleration(sm))
 
 
 def signal_distance(v_ego: float) -> float:
@@ -188,7 +214,8 @@ def turn_speed_limit(distance: float) -> float:
 
 
 def approach_distance(v_ego: float) -> float:
-  """How far before a route turn the driver calls it off: from where the car would signal for it, or start slowing for it."""
+  """How far before a route turn the car approaches it, where the turn's blinker latches and the driver calls it off: from
+  where the car would signal for it, or start slowing for it."""
   return max(signal_distance(v_ego), NAV_TURN_MARGIN + max(v_ego ** 2 - NAV_TURN_SPEED ** 2, 0.) / (2 * NAV_TURN_DECEL))
 
 
@@ -217,6 +244,19 @@ def blinker_side(carstate) -> bool | None:
   return bool(carstate.leftBlinker) if bool(carstate.leftBlinker) != bool(carstate.rightBlinker) else None
 
 
+def signal_sides(maneuver: tuple[str, str]) -> tuple[bool, ...]:
+  """The blinker sides (left) that may have been the signal for a maneuver: none for one that goes straight on, either
+  for a U-turn, a roundabout, or one without a direction."""
+  kind, direction = maneuver
+  if direction in LEFT_DIRECTIONS:
+    return (True,)
+  if direction in RIGHT_DIRECTIONS:
+    return (False,)
+  if direction == 'straight' and kind in STRAIGHT_ON_TYPES:
+    return ()
+  return (True, False)
+
+
 class ManeuverTracker:
   """The route's next maneuver and the distance to it, dead reckoned between navd's updates. A maneuver is its type,
   direction and distance to the destination. Each navd message leaves a residual, its distance less the dead reckoned
@@ -224,7 +264,8 @@ class ManeuverTracker:
   error), or out at once when navd's is clearly longer (the car left the route or joined it from beside it, or the GPS
   lagged), but close to the maneuver only by what navd lately pulled in. So one bad fix does little and a frozen navd
   distance holds the approach back. Once the maneuver's turn started or the car passed its point the distance only comes
-  in, so nothing restarts or moves a started turn, and a passed maneuver stays passed until navd reports a different one."""
+  in, so nothing restarts or moves a started turn, and a passed maneuver stays passed until navd reports a different one.
+  A car standing still takes none of navd's distances in: its own cannot change, so they are only GPS noise."""
 
   def __init__(self):
     self.maneuver: tuple[str, str] | None = None  # (type, direction)
@@ -235,17 +276,20 @@ class ManeuverTracker:
     self.residuals: deque[float] = deque(maxlen=NAV_RESIDUALS)  # m navd's distance is beyond the dead reckoned one, left to correct
     self.residual = 0.  # their median
     self.pulled_in = 0.  # m navd pulled the distance in lately, fading over NAV_PULL_IN_MEMORY
+    self.pushed_near = 0.  # m navd pushed the distance out within NAV_NEAR_DISTANCE beyond taking back pull-ins, less pull-ins since
 
   @property
   def nearest(self) -> float:
-    """The nearer of the dead reckoned distance and navd's."""
-    return self.distance + min(self.residual, 0.)
+    """The nearer of navd's distance and the dead reckoned one without what navd pushed out close to the maneuver: there a
+    longer navd distance may be a GPS error behind the car, which would time a turn late."""
+    return self.distance - max(self.pushed_near, -min(self.residual, 0.))
 
   def update(self, instruction, age: float, v_ego: float, committed: bool = False) -> bool:
     """Advance one frame, along the last maneuver while there is no instruction. committed: the maneuver's turn started.
     True when a different maneuver began."""
     v_ego = max(v_ego, 0.)
     self.distance -= v_ego * DT_MDL
+    still = v_ego < NAV_STANDSTILL_SPEED
     new = False
     if instruction is not None and instruction is not self.instruction:  # navd's next message
       self.instruction = instruction
@@ -256,10 +300,15 @@ class ManeuverTracker:
         new = maneuver != self.maneuver or not abs(position - self.position) <= NAV_SAME_MANEUVER_DISTANCE
         if new:
           # the first message counts as agreeing until others come, so it takes two to move the distance
-          self.maneuver, self.position, self.distance, self.passed, self.pulled_in = maneuver, position, reported, False, 0.
+          self.maneuver, self.position, self.distance, self.passed = maneuver, position, reported, False
+          self.residual = self.pulled_in = self.pushed_near = 0.
           self.residuals.extend([0.] * NAV_RESIDUALS)
-        else:
+        elif not still:
           self.residuals.append(reported - self.distance)
+    if still:
+      # nothing moves the distance, and a pull-in taken just before the stop can still be taken back once the car moves
+      self.passed |= self.distance < 0.
+      return new
 
     m = float(np.median(self.residuals)) if self.residuals else 0.
     push_out = min(max(m - NAV_PUSH_DEADBAND, 0.), NAV_MAX_PUSH_OUT * DT_MDL)  # a speed or map scale error
@@ -271,6 +320,10 @@ class ManeuverTracker:
       step = m  # navd says the maneuver is clearly farther: the car left the route or joined it, or the GPS lagged
     else:
       step = max(min(m - NAV_PUSH_DEADBAND, self.pulled_in), push_out)  # close to it, only a GPS error ahead that ended
+    if step < 0.:
+      self.pushed_near = max(self.pushed_near + step, 0.)
+    elif self.distance <= NAV_NEAR_DISTANCE:
+      self.pushed_near += max(step - self.pulled_in, 0.)
     self.distance += step
     for i in range(len(self.residuals)):
       self.residuals[i] -= step
@@ -289,22 +342,25 @@ class ManeuverTracker:
 class NavDesireController:
   """Desires and a speed limit from the navigation route, one state for modeld's desires and plannerd's slowdown.
 
-  Turns: switching the blinker on for the route's next turn makes it that turn's signal until it goes off: it never starts
-  a nudgeless lane change, and it holds back the lane turn desire. A blinker already on before the car passed the last
-  maneuver is not its signal. About 3 s before the car starts steering into the turn, timed on the speed the slowdown will
-  impose, the turn desire starts, but only while the car can still make the turn: before the steering point and slow
-  enough to be down to turn speed by it (below 20 mph; without openpilot's speed control, which nothing then slows, at
-  turning speed already), or at a crawl while still lined up with the approach. A car that cannot goes straight. With
-  automatic turns on and openpilot in control of the speed, a near side turn (right, where traffic keeps right) also
-  starts without the blinker, once the car has been in the outermost lane for a second. Before the turn starts, the gas,
-  the other blinker or disengaging calls off its automatic turn and its slowdown; signaling for it brings them back. Once
-  it starts, the model has the turn: the desire holds until the maneuver point, pulsing again every 4 s only to stay in
-  the model's desire history (while the car waits at a crawl still lined up, or is still 2 s or more from the steering
-  point), and no other turn starts until the car is through it.
+  Turns: switching the blinker on for the route's next turn, from where it would signal for it or start slowing for it,
+  makes it that turn's signal until it goes off: it never starts a nudgeless lane change, and it holds back the lane turn
+  desire. A blinker already on before the car passed the last maneuver to its side, or the one before, is not its signal.
+  About 3 s before the car starts steering into the turn, timed on the speed the slowdown will impose, the turn desire
+  starts, but only while the car can still make the turn: still lined up with the approach, and either moving, far enough
+  before the steering point to steer from it and slow enough to be down to turn speed by it (below 20 mph, and with
+  openpilot's speed control not still speeding up above turn speed; without it, which nothing then slows, at turning speed
+  already and with the car's own cruise off or set no faster), or at a crawl short of the maneuver point (a near side turn
+  short of the intersection). A car that cannot goes straight. With automatic turns on and openpilot in control of the
+  speed, a near side turn (right, where traffic keeps right) also starts without the blinker, once the car has been in the
+  outermost lane for a second. Before the turn starts, the gas, the other blinker or disengaging calls off its automatic
+  turn and its slowdown; signaling for it brings them back, within the signal distance. Once it starts, the model has the
+  turn: the desire holds until the maneuver point, pulsing again every 4 s only to stay in the model's desire history
+  (while the car is still lined up, and waits at a crawl short of the turn, or is still 2 s or more from the steering
+  point), a blinker latched again pulses it again only the same way, and no other turn starts until the car is through it.
   Slowing: the speed limit slows the car to turn speed by every route turn with automatic turns on, else by the turn the
   driver signals for, through a lane change too, and by a started turn until the car passes it. The turn's point is
-  pinned on the odometer once it starts or the car is close, so the turn speed holds to 20 m past it even once navd moves
-  on. plannerd follows it while openpilot controls the speed.
+  pinned on the odometer once it starts or the car is close: the slowdown keeps the nearest the point has been, and turn
+  speed holds to 20 m past the farthest, even once navd moves on. plannerd follows it while openpilot controls the speed.
   Exits and forks: a nudge toward the side the route's lane guidance takes gives a keep desire near the split.
   """
 
@@ -325,8 +381,11 @@ class NavDesireController:
     self.blinker_onset = 0
     self.passed_frame: int | None = None  # the frame the car passed the current maneuver's point
     self.maneuver_id = 0
-    self.pins: dict[int, float] = {}  # the odometer reading of each maneuver's turn point, by maneuver
+    self.pins: dict[int, tuple[float, float]] = {}  # the odometer readings of each maneuver's turn point, (nearest, farthest)
     self.turned = 0.  # deg the car turned toward the current turn's side since it came close to it
+    # the maneuver whose turn desire last went out, and the frame it did: the model has that turn, whatever reset() forgets
+    self.pulsed_maneuver: int | None = None
+    self.pulse_frame = 0
     self.reset()
 
   def reset(self) -> None:
@@ -338,6 +397,7 @@ class NavDesireController:
     self.speed_limit = 0.  # m/s the route turn limits the speed to, 0 for none
     self.slowing = False  # the current maneuver's slowdown is on
     self.route_blinker: bool | None = None  # the side (left) of a blinker latched as the route turn's signal
+    self.reviving = False  # the latched blinker brings back what the driver called off, once within the signal distance
     self.stale_blinker: bool | None = None  # the side (left) of a blinker on since before the car passed the last maneuver
     self.blinker_turned = False  # the latched blinker already started its turn
     self.turning: bool | None = None  # the side (left) of the turn desire being held
@@ -345,7 +405,6 @@ class NavDesireController:
     self.started = False  # the current maneuver's turn desire went out to the model
     self.called_off = False  # the current maneuver's automatic turn and slowdown are off, until the driver signals for it
     self.auto_off = False  # the current maneuver's automatic turn is off, until the driver signals for it
-    self.pulse_frame = 0
 
   def read_params(self) -> None:
     self.turn_enabled = self.params.get_bool("NavTurnDesire")
@@ -367,6 +426,11 @@ class NavDesireController:
     """The car still faces along the approach, not into the turn."""
     return self.turned < NAV_TURN_LINED_UP
 
+  @property
+  def route_active(self) -> bool:
+    """Route turns are on and navd has a route: its instruction is fresh, or was within the grace."""
+    return (self.turn_enabled or self.auto_enabled) and self.gap <= NAV_INSTRUCTION_GRACE
+
   def update(self, carstate, lateral_active: bool, nav: NavInputs | None, lane_changing: bool = False, lane_turning: bool = False) -> None:
     """lane_changing: a lane change is under way, so no turn starts and the outermost lane counts again after it.
     lane_turning: the lane turn desire already went out for this blinker, so the route does not take the blinker over,
@@ -383,18 +447,24 @@ class NavDesireController:
     self.odometer += v_ego * DT_MDL
     self.gap = 0. if nav.instruction is not None else self.gap + DT_MDL
     self.outer_lane_time = [t + DT_MDL if outer and not lane_changing else 0. for t, outer in zip(self.outer_lane_time, nav.outer_lanes, strict=True)]
-    self.pins = {maneuver: point for maneuver, point in self.pins.items() if self.odometer <= point + NAV_TURN_HOLD}
+    self.pins = {maneuver: pin for maneuver, pin in self.pins.items() if self.odometer <= pin[1] + NAV_TURN_HOLD}
 
-    following = self.tracker.maneuver is not None
+    previous = self.tracker.maneuver
     passed_frame = self.passed_frame
     if self.tracker.update(nav.instruction, nav.age, v_ego, self.started):
       self.maneuver_id += 1
       self.started = self.called_off = self.auto_off = self.blinker_turned = self.slowing = False
       self.turning = self.route_blinker = None
       self.passed_frame, self.turned = None, 0.
-      # a blinker on since before the car passed the maneuver before was for that one, as is any blinker on when that one
-      # was never passed; one switched on after it is for this one
-      self.stale_blinker = side if following and (passed_frame is None or self.blinker_onset <= passed_frame) else None
+      # a blinker on since before the car passed the maneuver before was for that one, if that one went its way; as is any
+      # blinker on when that one was never passed, or still on from one before it. One switched on after it is for this
+      # one, as is one switched on before a maneuver that went straight on, or the other way.
+      if previous is not None:
+        was_stale = side is not None and side == self.stale_blinker
+        leftover = passed_frame is None or was_stale or (self.blinker_onset <= passed_frame and side in signal_sides(previous))
+        self.stale_blinker = side if leftover else None
+      else:
+        self.stale_blinker = None
     if self.tracker.passed and self.passed_frame is None:
       self.passed_frame = self.frame
     if side != self.stale_blinker:
@@ -402,17 +472,20 @@ class NavDesireController:
     turn = self.tracker.turn()
     pending = (self.turn_enabled or self.auto_enabled) and turn is not None and not self.tracker.passed and self.gap <= NAV_INSTRUCTION_GRACE
 
-    # the heading change toward the turn's side as the car comes up to it, not at a stop, where it would drift
-    if turn is not None and v_ego > NAV_TURN_TRIGGER_MIN_SPEED and self.tracker.distance <= NAV_TURN_LINEUP_DISTANCE:
+    # the heading change toward the turn's side as the car comes up to it, whenever the car moves
+    if turn is not None and v_ego > NAV_TURN_LINEUP_MIN_SPEED and self.tracker.distance <= NAV_TURN_LINEUP_DISTANCE:
       self.turned = max(self.turned + math.degrees(nav.yaw_rate if turn else -nav.yaw_rate) * DT_MDL, 0.)
 
     # a blinker switched on for the route's turn stays its signal until it goes off or over to the other side, steering
-    # disengages or the maneuver changes, whatever the speed does; it brings back what the driver called off
+    # disengages or the maneuver changes, whatever the speed does. It brings back what the driver called off before it
+    # latched, once the car is within the signal distance with it still on.
     if side is None or side != self.route_blinker or not lateral_active:
-      self.route_blinker = None
+      self.route_blinker, self.reviving = None, False
     if (pending and lateral_active and self.route_blinker is None and side == turn and side != self.stale_blinker
-        and nav.instruction is not None and not lane_turning and self.tracker.distance <= signal_distance(v_ego)):
-      self.route_blinker, self.blinker_turned, self.called_off, self.auto_off = side, False, False, False
+        and nav.instruction is not None and not lane_turning and self.tracker.distance <= approach_distance(v_ego)):
+      self.route_blinker, self.blinker_turned, self.reviving = side, False, True
+    if self.reviving and self.tracker.distance <= signal_distance(v_ego):
+      self.called_off = self.auto_off = self.reviving = False
     self.route_turn_signal = self.route_blinker is not None
 
     # before the turn starts, the driver calls off its automatic turn, and its slowdown with the gas, the other blinker or
@@ -420,7 +493,7 @@ class NavDesireController:
     if pending and not self.started and self.tracker.distance <= approach_distance(v_ego):
       other_blinker = side is not None and side != turn and side != self.stale_blinker
       if carstate.gasPressed or other_blinker or (self.auto_enabled and not nav.long_active):
-        self.called_off = True
+        self.called_off, self.reviving = True, False
         self.pins.pop(self.maneuver_id, None)
       self.auto_off |= self.called_off or not lateral_active
 
@@ -438,23 +511,49 @@ class NavDesireController:
   def _time_to_steer(self, nav: NavInputs, distance: float, v_ego: float) -> float:
     return time_to_steer(distance, v_ego, nav.long_active and self.slowing)
 
+  def _crawl_room(self, nav: NavInputs, left: bool) -> float:
+    """m before the maneuver point a car at a crawl needs to start the turn from: a near side turn needs to start short of
+    the intersection, a far side one only short of the point."""
+    return NAV_TURN_NEAR_CRAWL_DISTANCE if left != nav.right_hand_traffic else 0.
+
   def _can_make_turn(self, carstate, nav: NavInputs, v_ego: float, left: bool, max_speed: float) -> bool:
-    """Whether the car can still make the turn: at a crawl while lined up with the approach, or moving, before the steering
-    point and slow enough to be down to turn speed by it, on the nearer of dead reckoning's and navd's distance. Never
-    while navd puts the turn clearly farther: the car may have left the route, or the distance is off."""
-    if self.tracker.residual > NAV_AGREE_DISTANCE:
+    """Whether the car can still make the turn: while lined up with the approach, at a crawl short of the maneuver point
+    (a near side turn short of the intersection), or moving, far enough before the steering point to steer from it and
+    slow enough to be down to turn speed by it, on the nearer of dead reckoning's and navd's distance. Never while navd
+    puts the turn clearly farther: the car may have left the route, or the distance is off. Nor, without openpilot's
+    speed control, while the car's own cruise is set faster than turning speed."""
+    stock_speed = NAV_TURN_STOCK_NEAR_SPEED if left != nav.right_hand_traffic else NAV_TURN_STOCK_FAR_SPEED
+    if self.tracker.residual > NAV_AGREE_DISTANCE or not self.lined_up:
       return False
-    if carstate.standstill or v_ego <= NAV_TURN_CRAWL_SPEED:
-      return self.lined_up
+    if not nav.long_active and carstate.cruiseState.enabled and carstate.cruiseState.speed > stock_speed:
+      return False
     distance = self.tracker.nearest
-    if distance <= NAV_TURN_STEER_DISTANCE:
+    if carstate.standstill or v_ego <= NAV_TURN_CRAWL_SPEED:
+      return distance > self._crawl_room(nav, left)
+    if distance <= NAV_TURN_STEER_DISTANCE + NAV_TURN_LAG * v_ego:  # the desire takes that long to steer the car
       return False
     if nav.long_active:
-      braking = max(distance - NAV_TURN_STEER_DISTANCE - NAV_TURN_LAG * v_ego, 0.)
+      if v_ego > NAV_TURN_SPEED + NAV_TURN_REACH_MARGIN and nav.accel > NAV_TURN_START_ACCEL:
+        return False
+      braking = distance - NAV_TURN_STEER_DISTANCE - NAV_TURN_LAG * v_ego
       max_speed = min(max_speed, math.sqrt(NAV_TURN_SPEED ** 2 + 2 * NAV_TURN_REACH_DECEL * braking) + NAV_TURN_REACH_MARGIN)
     else:
-      max_speed = min(max_speed, NAV_TURN_STOCK_NEAR_SPEED if left != nav.right_hand_traffic else NAV_TURN_STOCK_FAR_SPEED)
+      max_speed = min(max_speed, stock_speed)
     return v_ego <= max_speed
+
+  def _may_pulse_again(self, carstate, nav: NavInputs, v_ego: float, left: bool) -> bool:
+    """Whether a started turn may pulse again, only to keep it in the model's desire history: NAV_TURN_REPULSE_TIME after
+    its last pulse, while the car is still lined up with the approach and waits at a crawl short of the maneuver point (a
+    near side turn short of the intersection), or is still far enough from the steering point to take it as a first
+    pulse. Never as it rolls into the turn, nor once it has turned in."""
+    blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
+    if ((self.frame - self.pulse_frame) * DT_MDL < NAV_TURN_REPULSE_TIME or blindspot or self.gap > NAV_INSTRUCTION_GRACE
+        or not self.lined_up):
+      return False
+    distance = self.tracker.nearest
+    if carstate.standstill or v_ego <= NAV_TURN_CRAWL_SPEED:
+      return distance > self._crawl_room(nav, left)
+    return distance > NAV_TURN_STEER_DISTANCE and self._time_to_steer(nav, distance, v_ego) >= NAV_TURN_REFRESH_LEAD
 
   def _start_turn(self, carstate, nav: NavInputs, v_ego: float, left: bool, lane_changing: bool) -> None:
     # never during a lane change, into the blind spot, or while another maneuver's turn is still under way
@@ -462,6 +561,11 @@ class NavDesireController:
         or any(maneuver != self.maneuver_id for maneuver in self.pins)):
       return
     if self._time_to_steer(nav, self.tracker.distance, v_ego) > NAV_TURN_TRIGGER_TIME:
+      return
+    # the model already has this turn: a blinker latched again, or a start after reset(), only pulses it again as a
+    # keep-alive would. Else the latch stays, and with it the slowdown, but the desire does not resume: that would be a
+    # new rising edge, a second turn command.
+    if self.pulsed_maneuver == self.maneuver_id and not self._may_pulse_again(carstate, nav, v_ego, left):
       return
 
     if self.route_blinker == left and not self.blinker_turned and self._can_make_turn(carstate, nav, v_ego, left, NAV_TURN_MAX_SPEED):
@@ -471,7 +575,7 @@ class NavDesireController:
       self.turn_by_blinker = False
     else:
       return
-    self.started, self.turning, self.pulse_frame = True, left, self.frame
+    self.started, self.turning, self.pulsed_maneuver, self.pulse_frame = True, left, self.maneuver_id, self.frame
     self._pin()
     self.turn_direction = TurnDirection.turnLeft if left else TurnDirection.turnRight
 
@@ -488,19 +592,9 @@ class NavDesireController:
       self.turning = None
       return
 
-    # a fresh pulse only keeps the turn in the model's desire history: while the car waits at a crawl still lined up with
-    # the approach, or while it is still far enough from the steering point to take it as a first pulse, never as it rolls
-    # into the turn
-    blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
-    if (self.frame - self.pulse_frame) * DT_MDL >= NAV_TURN_REPULSE_TIME and not blindspot and self.gap <= NAV_INSTRUCTION_GRACE:
-      if carstate.standstill or v_ego <= NAV_TURN_CRAWL_SPEED:
-        refresh = self.lined_up
-      else:
-        distance = self.tracker.nearest
-        refresh = distance > NAV_TURN_STEER_DISTANCE and self._time_to_steer(nav, distance, v_ego) >= NAV_TURN_REFRESH_LEAD
-      if refresh:
-        self.pulse_frame = self.frame + 1  # no desire for this frame, so the next one is a new rising edge
-        return
+    if self._may_pulse_again(carstate, nav, v_ego, left):
+      self.pulse_frame = self.frame + 1  # no desire for this frame, so the next one is a new rising edge
+      return
     self.turn_direction = TurnDirection.turnLeft if left else TurnDirection.turnRight
 
   def _auto_turn_allowed(self, nav: NavInputs, left: bool) -> bool:
@@ -509,9 +603,11 @@ class NavDesireController:
     return nav.long_active and left != nav.right_hand_traffic and self.outer_lane_time[0 if left else 1] >= OUTER_LANE_TIME - 1e-6
 
   def _pin(self) -> None:
-    """Pin the current maneuver's point on the odometer, at the nearest it has been."""
+    """Pin the current maneuver's point on the odometer, at the nearest and the farthest it has been: a distance pulled in
+    and taken back again brings the slowdown forward, but cannot end the turn speed early."""
     point = self.odometer + max(self.tracker.distance, 0.)
-    self.pins[self.maneuver_id] = min(self.pins.get(self.maneuver_id, math.inf), point)
+    nearest, farthest = self.pins.get(self.maneuver_id, (math.inf, -math.inf))
+    self.pins[self.maneuver_id] = (min(nearest, point), max(farthest, point))
 
   def _update_speed_limit(self, carstate, pending: bool, turn: bool | None) -> None:
     # the route turn's slowdown: a started turn's until the car passes it, whatever the route gap, else every turn's with
@@ -522,8 +618,9 @@ class NavDesireController:
     self.slowing = through or (pending and not self.called_off and ((self.auto_enabled and no_blinker) or self.route_blinker == turn))
     if self.slowing and self.tracker.distance <= NAV_TURN_MARGIN:
       self._pin()
-    # every pinned turn point keeps its profile, and turn speed to NAV_TURN_HOLD past it, even once navd moved on
-    limits = [turn_speed_limit(point - self.odometer) for point in self.pins.values()]
+    # every pinned turn point keeps its profile from the nearest it has been, and turn speed to NAV_TURN_HOLD past the
+    # farthest, even once navd moved on
+    limits = [turn_speed_limit(nearest - self.odometer) for nearest, _ in self.pins.values()]
     if self.slowing:
       limits.append(turn_speed_limit(self.tracker.distance))
     limit = min(limits, default=math.inf)

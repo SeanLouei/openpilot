@@ -61,18 +61,25 @@ class DesireHelper:
       self.route_blinker_side = None
     route_owned = self.nav_desire.owns_turn_desire or self.route_blinker_side is not None
     lane_turning = self.desire in (log.Desire.turnLeft, log.Desire.turnRight) and not route_owned
+    failed = False
     try:
       self.nav_desire.update(carstate, lateral_active, nav, self.lane_change_state == LaneChangeState.laneChangeStarting, lane_turning)
     except Exception:
       if not self.nav_desire_failed:
         cloudlog.exception("desire_helper.nav_desire_failed")
-      self.nav_desire_failed = True
+      self.nav_desire_failed = failed = True
       self.nav_desire.reset()
     if self.nav_desire.owns_turn_desire and side is not None:
       self.route_blinker_side = side
     route_turning = self.nav_desire.turning is not None
     if self.nav_desire.owns_turn_desire or self.route_blinker_side is not None:
       self.lane_turn_direction = self.nav_desire.turn_direction
+    elif self.nav_desire.route_active and not failed and not (lane_turning and TURN_DESIRES[self.lane_turn_direction] == self.desire):
+      # with route turns on and a route, the route has the turns: a lane turn desire for a blinker the route cannot latch
+      # yet (steering off, beyond the signal distance, the last turn not yet behind) would turn at once, then keep the route
+      # from latching that blinker at all. One that went out while there was no route keeps going, and keeps the route off
+      # that blinker, which would pulse again.
+      self.lane_turn_direction = TurnDirection.none
 
     # a route turn holds the lane change off, so no lane change waits hidden behind its turn desire
     if (not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX or self.alc.lane_change_set_timer == AutoLaneChangeMode.OFF

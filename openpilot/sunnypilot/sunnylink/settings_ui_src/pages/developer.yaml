@@ -52,8 +52,10 @@ sections:
   - key: NavigationEnabled
     widget: toggle
     title: Navigation (Alpha)
-    description: Turn-by-turn navigation with a route map. Set a destination from a phone on the device's network, at the
-      device's IP address on port 8082.
+    description: Turn-by-turn navigation with a route map. Set a destination from your phone at http://<device IP>:8082, with
+      both on your phone's hotspot or your home Wi-Fi. The page has no password, and anyone on the same Wi-Fi network can open
+      it and change your destination, so never use the comma's own hotspot or public Wi-Fi. It is served only over Wi-Fi,
+      never over the comma's cellular data.
     visibility:
     - {type: capability, field: device_type, equals: mici}
     - $ref: '#/macros/release_branches_hide'

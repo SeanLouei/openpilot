@@ -84,8 +84,12 @@ class DeveloperLayoutMici(NavScroller):
                                         description="Use alpha openpilot longitudinal control instead of stock ACC. This may disable Automatic Emergency " +
                                                     "Braking (AEB).")
     self._navigation_toggle = BigParamControl("navigation (alpha)", "NavigationEnabled",
-                                              description="Turn-by-turn navigation with a route map. Set a destination from a phone " +
-                                                          "on the device's network, at the device's IP address on port 8082.")
+                                              description="Turn-by-turn navigation with a route map. Set a destination from your phone " +
+                                                          "at http://<device IP>:8082, with both on your phone's hotspot or your home " +
+                                                          "Wi-Fi. The page has no password, and anyone on the same Wi-Fi network can " +
+                                                          "open it and change your destination, so never use the comma's own hotspot " +
+                                                          "or public Wi-Fi. It is served only over Wi-Fi, never over the comma's " +
+                                                          "cellular data.")
     self._debug_mode_toggle = BigParamControl("ui debug mode", "ShowDebugInfo",
                                               toggle_callback=lambda checked: (gui_app.set_show_touches(checked), gui_app.set_show_fps(checked)),
                                               description="Show touch locations and the UI frame rate.")
