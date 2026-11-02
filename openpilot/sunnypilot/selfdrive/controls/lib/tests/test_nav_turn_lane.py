@@ -4,12 +4,13 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Automatic turn lanes: from the outermost lane on the turn's side, the car moves by itself into a turn lane that opens beside
-it before the route's turn, and the automatic turn then starts from that lane; where it must not, how the driver ends it,
-and that every approach still gives the driving model at most one lane change and one turn command. Closed loop through
-the real DesireHelper, on real model, route, car and plan messages of a synthetic road.
+Automatic turn lanes: from the curb lane, before a near side turn, the car moves by itself into a turn lane that opens beside
+it, and the automatic turn then starts from that lane; where it must not (never on the far side, where a median's end looks
+just like a bay), how the driver ends it, and that every approach still gives the driving model at most one lane change and
+one turn command. Closed loop through the real DesireHelper, on real model, route, car and plan messages of a synthetic road.
 """
 import ast
+import copy
 import dataclasses
 import json
 import math
@@ -35,7 +36,7 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
-from openpilot.selfdrive.selfdrived.events import Events
+from openpilot.selfdrive.selfdrived.events import EVENTS, Events
 from openpilot.selfdrive.ui import soundd
 from openpilot.selfdrive.controls.lib.desire_helper import LANE_CHANGE_TIME_MAX, DesireHelper, LaneChangeState
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -55,6 +56,7 @@ from openpilot.sunnypilot.sunnylink.tools.compile_settings_ui import DEFAULT_OUT
 EventName = log.OnroadEvent.EventName
 EventNameSP = custom.OnroadEventSP.EventName
 AudibleAlert = log.SelfdriveState.AudibleAlert
+AudibleAlertSP = custom.SelfdriveStateSP.AudibleAlert
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
 VisualAlert = car.CarControl.HUDControl.VisualAlert
@@ -75,6 +77,9 @@ RIGHT_LANE = guidance((('straight',), None), (('straight',), None), (('right',),
 LEFT_BAY = guidance((('left',), 'left'), (('straight',), None), (('straight', 'right'), None))
 RIGHT_FROM_ANOTHER_LANE = guidance((('straight',), None), (('right',), 'right'), (('straight',), None))
 LEFT_FROM_ANOTHER_LANE = guidance((('straight',), None), (('left',), 'left'), (('straight', 'right'), None))
+# a two-lane road's: a shared left and through lane, or a left-only lane (curbed or painted)
+SHARED_LEFT = guidance((('left', 'straight'), 'left'), (('straight', 'right'), None))
+LEFT_ONLY = guidance((('left',), 'left'), (('straight', 'right'), None))
 
 
 class Road:
@@ -132,6 +137,46 @@ class Road:
     return msg
 
 
+class TwoWay(Road):
+  """A two-way road where traffic keeps right, seen toward the left: the car's left lane line is the center line, one
+  oncoming lane (`width`) beyond it and the far curb beyond that, with no lane line seen beyond the oncoming lane (`beyond_prob`,
+  a faint far edge line at most). Beside the car from `median[0]` down to `median[1]` m before the maneuver point, a raised
+  median or an island, its curb `gutter` beyond the center line, ends in a nose `nose` m long, the edge unsure while the car
+  passes it; and over `crossing` (from, to) the car crosses an intersection straight, with no lane lines and unsure edges.
+  To the model, the oncoming lane beyond a median's or an island's end is a turn lane opening beside the car, with every
+  number a curbed bay has."""
+
+  def __init__(self, median=(math.inf, math.inf), nose=8., crossing=None, **road):
+    super().__init__(**({'left': True, 'width': LANE} | road))
+    self.median, self.nose, self.crossing = median, nose, crossing
+
+  def edge(self, d: float) -> float:
+    curb = LANE / 2 + self.gutter
+    start, end = self.median
+    if end <= d <= start:
+      return curb
+    if end - self.nose < d < end:
+      return curb + self.width * (end - d) / self.nose
+    return curb + self.width
+
+  def message(self, d: float, offset: float):
+    msg = super().message(d, offset)
+    if self.median[1] - self.nose < d < self.median[1]:
+      msg.roadEdgeStds = [0.6, msg.roadEdgeStds[1]]
+    if self.crossing is not None and self.crossing[1] <= d <= self.crossing[0]:
+      msg.laneLineProbs, msg.roadEdgeStds = [0.05] * 4, [0.9, 0.9]
+    return msg
+
+
+class Crossing(Road):
+  """Through an intersection, turning: no lane lines, both edges unsure."""
+
+  def message(self, d: float, offset: float):
+    msg = super().message(d, offset)
+    msg.laneLineProbs, msg.roadEdgeStds = [0.05] * 4, [0.9, 0.9]
+    return msg
+
+
 def turn_lane_helper(lanes=True, far=True, turns=True, auto=True, lane_change=AutoLaneChangeMode.NUDGE):
   """DesireHelper with route turns, automatic turns, automatic far side turns and automatic turn lanes as set, read from
   params as the drive starts, from parked."""
@@ -150,7 +195,8 @@ class Approach:
   (unless follow=False: something ahead holds the car at the set speed), and the driving model moves the car over as a
   lane change desire's rising edge asks, LANE_CHANGE_TIME to the next lane's center, its lane change probability high
   meanwhile; the driver steering against it brings the car back. The route turns `modifier`, toward the turn lane's side
-  unless given."""
+  unless given, `position` m before the destination (a new position is another maneuver). driver_alert: whether driver
+  monitoring warns, or a function of the drive giving it."""
 
   def __init__(self, road, dh=None, mph=25., start=220., modifier=None, maneuver_type='turn', lanes=(), limit=MPH35, rht=True,
                long_active=True, driver_alert=False, follow=True, navd=None, navd_error=None):
@@ -158,7 +204,7 @@ class Approach:
     self.v_set = mph * MPH
     self.d, self.v, self.a, self.a_plan, self.offset, self.t = start, self.v_set, 0., 0., 0., 0.
     self.modifier = modifier if modifier is not None else ('left' if road.left else 'right')
-    self.maneuver_type, self.lanes, self.limit, self.rht = maneuver_type, lanes, limit, rht
+    self.maneuver_type, self.lanes, self.limit, self.rht, self.position = maneuver_type, lanes, limit, rht, 1000.
     self.long_active, self.driver_alert, self.follow = long_active, driver_alert, follow
     self.navd = navd or (lambda s: True)  # whether navd has a fix and a route now
     self.navd_error = navd_error or (lambda s: 0.)  # m navd's distance to the maneuver is off by
@@ -170,12 +216,12 @@ class Approach:
     instruction = messaging.new_message('navInstruction').navInstruction
     instruction.maneuverType, instruction.maneuverModifier = self.maneuver_type, self.modifier
     reported = self.d + self.navd_error(self)
-    instruction.maneuverDistance, instruction.distanceRemaining = reported, reported + 1000.
+    instruction.maneuverDistance, instruction.distanceRemaining = reported, reported + self.position
     instruction.lanes = list(self.lanes)
     car_control = messaging.new_message('carControl').carControl
     car_control.longActive, car_control.actuators.accel = self.long_active and not gas, self.a_plan
     dm = messaging.new_message('driverMonitoringState').driverMonitoringState
-    dm.isRHD, dm.alertLevel = not self.rht, 'one' if self.driver_alert else 'none'
+    dm.isRHD, dm.alertLevel = not self.rht, 'one' if self.warning() else 'none'
     plan = messaging.new_message('longitudinalPlanSP').longitudinalPlanSP
     plan.speedLimit.resolver.speedLimit, plan.speedLimit.resolver.speedLimitValid = self.limit, self.limit > 0.
     now = time.monotonic()
@@ -183,6 +229,10 @@ class Approach:
                          recv_time={'navInstruction': now, 'longitudinalPlanSP': now},
                          data={'navInstruction': instruction, 'carControl': car_control, 'carState': car_state(aEgo=self.a),
                                'driverMonitoringState': dm, 'longitudinalPlanSP': plan})
+
+  def warning(self) -> bool:
+    """Whether driver monitoring warns now."""
+    return bool(self.driver_alert(self) if callable(self.driver_alert) else self.driver_alert)
 
   def run(self, seconds=40., car=None, lateral=None, edge_block=None, until=lambda s: s.d < -5.):
     """Drive on for `seconds`, or until until(self). car(self) gives the car's state fields, lateral(self) whether steering
@@ -220,7 +270,7 @@ class Approach:
       self.frames.append({'d': self.d, 'v': self.v, 't': self.t, 'desire': desire, 'state': self.dh.lane_change_state,
                           'direction': self.dh.lane_change_direction, 'turn_lane': self.dh.turn_lane_change is not None, 'offset': self.offset,
                           'carry': c.lane_carry, 'limit': c.speed_limit, 'prompt': c.signal_prompt, 'across': c.turn_across,
-                          'turn': self.dh.lane_turn_direction})
+                          'turn': self.dh.lane_turn_direction, 'dm': self.warning()})
 
       # the car's speed: the set speed, the route turn's slowdown as plannerd follows it, or the driver's gas
       wanted = [float(np.clip(self.v_set - self.v, -0.5, 1.))]
@@ -387,20 +437,15 @@ class TestTurnLaneMoves(OpenpilotTestCase):
   def test_sharp_right(self):
     self.one_move_and_turn(Approach(Road(), modifier='sharp right').run(), left=False, across=False)
 
-  @parameterized.expand([(mph, opens) for mph in (20, 25, 30) for opens in (80., 90., 120.)])
-  def test_left_turn_bay(self, mph, opens):
-    # from the lane beside a raised median, the median opening into a curbed bay, with the route's lane guidance for it
-    frames = Approach(Road(left=True, opens=opens), mph=mph, lanes=LEFT_BAY).run()
-    self.one_move_and_turn(frames, left=True, across=True)
-
   def test_slow_traffic(self):
     # crawling up to the turn lane at 6 mph, the move ends long before the turn
     self.one_move_and_turn(Approach(Road(opens=60.), mph=6., start=120.).run(60.), left=False, across=False)
 
-  def test_long_bay(self):
-    # a long bay opening 250 m out: the car moves over once within POCKET_MAX_DISTANCE of the turn
-    frames = Approach(Road(left=True, opens=250.), mph=25., start=320., lanes=LEFT_BAY).run(60.)
-    self.one_move_and_turn(frames, left=True, across=True)
+  def test_long_turn_lane_within_the_memory(self):
+    # a turn lane opening 185 m out: the car moves over once within POCKET_MAX_DISTANCE of the turn, while the curb lane it
+    # left at the taper is still within POCKET_MEMORY behind it
+    frames = Approach(Road(opens=185.), mph=25., start=260.).run(60.)
+    self.one_move_and_turn(frames, left=False, across=False)
     assert moves(frames)[0]['d'] <= POCKET_MAX_DISTANCE
 
   def test_blind_spot_on_the_other_side(self):
@@ -464,6 +509,12 @@ class TestNoTurnLaneMove(OpenpilotTestCase):
     ('going straight on', {}, {'modifier': 'straight'}, {}, {}),
     ('an exit', {}, {'maneuver_type': 'off ramp', 'modifier': 'slight right'}, {}, {}),
     ('too far from the turn', {'opens': 400.}, {'start': 480., 'mph': 25.}, {}, {'until': lambda s: s.d < POCKET_MAX_DISTANCE + 5.}),
+    # the turn lane open beside the car from 250 m out: an open turn lane does not keep the curb lane in memory, which is
+    # 100 m behind the car by the time it is near enough
+    ('a long turn lane: the curb lane too far behind', {'opens': 250.}, {'start': 320.}, {}, {}),
+    # the move's chime is driver monitoring's first warning's: none while that warns, nor for POCKET_DM_QUIET after
+    ('driver monitoring warning', {}, {'driver_alert': True}, {}, {}),
+    ('driver monitoring warning until the turn lane opens, quiet too late', {}, {'driver_alert': lambda s: s.d > 100.}, {}, {}),
   ])
   def test_no_move(self, name, road, approach, settings, run):
     approach = {'mph': 25.} | approach
@@ -504,14 +555,20 @@ class TestNoTurnLaneMove(OpenpilotTestCase):
 
   def test_one_move_per_turn(self):
     # a move into a first bay ended by steering against it, the car back in its lane, the curb lane seen again after the bay,
-    # then a second bay for the same turn: no second move
+    # then a second bay for the same turn: no second move, though the second bay is open beside the confirmed curb lane, as
+    # long as a move would need, and while one could still come
     class TwoBays(Road):
       def edge(self, d):
         return max(Road(opens=135., length=35.).edge(d), Road(opens=70.).edge(d))
     approach = Approach(TwoBays(), mph=6., start=170., follow=False)
-    frames = approach.run(60., car=lambda s: {'steeringPressed': True, 'steeringTorque': 1.} if 0.2 <= since_move(s) < 0.6 else {},
-                          until=lambda s: s.d < 30.)
-    assert len(moves(frames)) == 1 and approach.dh.nav_desire.curb_confirmed[1]
+
+    def car(s):
+      return {'steeringPressed': True, 'steeringTorque': 1.} if 0.2 <= since_move(s) < 0.6 else {}
+    frames = approach.run(60., car=car, until=lambda s: s.d < 60.)
+    c = approach.dh.nav_desire
+    assert len(moves(frames)) == 1 and c.curb_confirmed[1] and c.pocket_time[1] >= 1.
+    frames += approach.run(60., car=car, until=lambda s: s.d < 30.)
+    assert len(moves(frames)) == 1
 
   def test_turn_command_in_the_desire_history(self):
     # the last turn's command, made just before this turn's turn lane opens (two turns a block apart), still in the model's
@@ -525,13 +582,12 @@ class TestNoTurnLaneMove(OpenpilotTestCase):
       frames += approach.run()
       assert len(moves(frames)) == expected, last_turn
 
-  @parameterized.expand([(False,), (True,)])
-  def test_turn_lane_not_the_outermost(self, left):
+  def test_turn_lane_not_the_outermost(self):
     # in the turn lane, the model sees a lane line beyond it after all (a second turn lane opening there): the car is not in
-    # the outermost lane, so the turn does not start by itself from there; a left turn asks for the blinker
-    frames = Approach(Road(left=left, beyond_inside=0.6), lanes=LEFT_BAY if left else ()).run()
+    # the outermost lane, so the turn does not start by itself from there
+    frames = Approach(Road(beyond_inside=0.6)).run()
     assert len(moves(frames)) == 1 and sum(f['carry'] is not None for f in frames) <= 1
-    assert not rises(frames, TURN_DESIRES) and any(f['prompt'] for f in frames) == left
+    assert not rises(frames, TURN_DESIRES) and not any(f['prompt'] for f in frames)
 
   def test_stays_in_lane_after_a_late_turn_lane(self):
     # no move: the car keeps to its lane, and with the curb lane gone beside it, no automatic right turn from there, as today
@@ -543,6 +599,93 @@ class TestNoTurnLaneMove(OpenpilotTestCase):
     # a left turn bay opening too late: the car stays beside it, the curb gone, and asks for the blinker, as today
     frames = Approach(Road(left=True, opens=60.), lanes=LEFT_BAY).run()
     assert not moves(frames) and any(f['prompt'] for f in frames) and not rises(frames, TURN_DESIRES)
+
+
+def no_move_as_today(test, approach_args, road, run=None):
+  """Drives the approach with the setting on and off: no route lane change and no lane change command at all, at most one
+  turn command, and every output the same as with the setting off, frame by frame. Returns the frames."""
+  run = {'seconds': 60.} | (run or {})
+  frames = Approach(road(), **approach_args).run(**run)
+  off = Approach(road(), dh=turn_lane_helper(lanes=False), **approach_args).run(**run)
+  assert not moves(frames) and not rises(frames, LANE_CHANGE_DESIRES), test
+  assert len(rises(frames, TURN_DESIRES)) <= 1, test
+  assert [outputs(f) for f in frames] == [outputs(f) for f in off], test
+  return frames
+
+
+def two_turns(left, b_road, a_lanes=(), b_lanes=(), crossing=30., b_dist=150., car=None):
+  """Turn A from the outermost lane on its side (beside a raised median for a far side turn, in the curb lane for a near
+  side one), `crossing` m through its intersection, then B's street, a new maneuver `b_dist` m on, as navd reports once the
+  car leaves A's intersection. Returns the drive's frames up to B's street, and from there."""
+  approach = Approach(Road(left=left, opens=None), mph=25., start=200., lanes=a_lanes)
+  a = approach.run(60., car=car, until=lambda s: s.d < 0.)
+  approach.road, approach.position, approach.d = Crossing(left=left, opens=None), 600., b_dist + crossing
+  a += approach.run(30., until=lambda s: s.d < b_dist)
+  approach.road, approach.lanes = b_road, b_lanes
+  return a, approach.run(60.)
+
+
+class TestNoFarSideMove(OpenpilotTestCase):
+  """Never a move on the far side (left where traffic keeps right): where a raised median or an island ends and the road
+  goes on two-way, its oncoming lane looks to the model just like a curbed bay opening out of the median, and a lane change
+  into it, and a turn from it, would be the worst there is. So the car stays beside a real bay too, as without the setting."""
+
+  @parameterized.expand([(mph, opens) for mph in (20, 25, 30) for opens in (80., 90., 120.)])
+  def test_curbed_bay(self, mph, opens):
+    # a curbed bay opening out of the median, with the route's lane guidance for it: the car stays in its lane, and with the
+    # median gone from beside it, the left turn asks for the blinker
+    frames = no_move_as_today((mph, opens), {'mph': mph, 'lanes': LEFT_BAY}, lambda: Road(left=True, opens=opens))
+    assert any(f['prompt'] for f in frames) and not rises(frames, TURN_DESIRES)
+
+  def test_long_bay(self):
+    no_move_as_today('long bay', {'mph': 25., 'start': 320., 'lanes': LEFT_BAY}, lambda: Road(left=True, opens=250.))
+
+  @parameterized.expand([
+    # (name, the road, the route's lane guidance, start, mph)
+    ('a median ending 130 m out', TwoWay(median=(1e9, 130.)), SHARED_LEFT, 250., 25.),
+    ('a median ending 110 m out', TwoWay(median=(1e9, 110.)), LEFT_ONLY, 230., 25.),
+    ('a median ending 95 m out', TwoWay(median=(1e9, 95.)), LEFT_ONLY, 215., 25.),
+    ('a median ending 110 m out, at 20 mph', TwoWay(median=(1e9, 110.)), LEFT_ONLY, 230., 20.),
+    ('a median ending 120 m out, at 30 mph', TwoWay(median=(1e9, 120.)), SHARED_LEFT, 250., 30.),
+    ('a median ending 110 m out, a 3 m oncoming lane, a faint far edge line', TwoWay(median=(1e9, 110.), width=3., beyond_prob=0.15),
+     LEFT_ONLY, 230., 25.),
+    ('a median ending 600 m out', TwoWay(median=(1e9, 600.)), LEFT_ONLY, 720., 25.),
+    ('a median ending at an intersection 260 m out', TwoWay(median=(1e9, 262.), crossing=(262., 240.)), LEFT_ONLY, 330., 25.),
+    ('a 25 m island 230 m out', TwoWay(median=(230., 205.), nose=2.), LEFT_ONLY, 330., 25.),
+    ('a 20 m island 230 m out, at 20 mph', TwoWay(median=(230., 210.), nose=2.), LEFT_ONLY, 330., 20.),
+    ('a 14 m island 230 m out, at 15 mph', TwoWay(median=(230., 216.), nose=2.), SHARED_LEFT, 330., 15.),
+  ])
+  def test_median_or_island_ends(self, name, road, lanes, start, mph):
+    # the car beside the median or the island long enough for an automatic left turn's curb run, which then ends, the road
+    # two-way from there: the double yellow line surely seen, the far curb a lane beyond it, nothing beyond that
+    frames = no_move_as_today(name, {'mph': mph, 'start': start, 'lanes': lanes}, lambda: road, {'seconds': 90.})
+    assert not rises(frames, TURN_DESIRES) and all(f['offset'] == 0. for f in frames)
+
+  @parameterized.expand([('automatic', None), ('signaled', lambda s: {'leftBlinker': s.d < 60.})])
+  def test_left_turn_onto_a_two_way_street(self, _name, car):
+    # left turn A from beside a raised median, then left turn B 150 m along a two-way street with one oncoming lane: nothing
+    # moves the car into B's oncoming lane, and B, with no curb beside the car, asks for the blinker
+    a, b = two_turns(True, TwoWay(), a_lanes=LEFT_BAY, b_lanes=LEFT_ONLY, car=car)
+    assert [f['desire'] for f in rises(a, TURN_DESIRES)] == [log.Desire.turnLeft]
+    assert not moves(a + b) and not rises(b, LANE_CHANGE_DESIRES + TURN_DESIRES) and any(f['prompt'] for f in b)
+    assert all(f['offset'] == 0. for f in b)
+
+  def test_far_side_where_traffic_keeps_left(self):
+    # where traffic keeps left the far side is the right: a right turn bay beside a median, with lane guidance for it
+    lanes = guidance((('straight', 'left'), None), (('straight',), None), (('right',), 'right'))
+    frames = no_move_as_today('right bay', {'rht': False, 'lanes': lanes}, Road)
+    assert any(f['prompt'] for f in frames)
+
+
+def gas_with_controls_late(s):
+  """The gas from 1 s into the move for half a second, and controlsd giving openpilot's speed control back 0.1 s later."""
+  s.long_active = not 1. <= since_move(s) < 1.6
+  return {'gasPressed': 1. <= since_move(s) < 1.5}
+
+
+def speed_control_off_a_moment(s):
+  s.long_active = not 1. <= since_move(s) < 1.5
+  return {}
 
 
 class TestTurnLaneEnds(OpenpilotTestCase):
@@ -563,7 +706,8 @@ class TestTurnLaneEnds(OpenpilotTestCase):
 
   @parameterized.expand([(0.3,), (0.6,)])
   def test_blind_spot_before_the_car_moved(self, after):
-    # a car coming up in the turn lane: it ends the move, for good, while the car has not yet moved over
+    # a car coming up in the turn lane while the car has not yet moved over: it ends the route's lane change, for good (the
+    # driving model, which has its pulse, may still move the car over: only the driver steering against it stops that)
     def car(s):
       return {'rightBlindspot': since_move(s) >= after}
     frames, start = self.run_and_end(car)
@@ -587,6 +731,35 @@ class TestTurnLaneEnds(OpenpilotTestCase):
       return fields if 1. <= since_move(s) < 1.5 else {}
     frames, start = self.run_and_end(car)
     self.ended_early(frames, start['t'] + 1. + DT_MDL)
+
+  @parameterized.expand([
+    ('the gas', lambda s: {'gasPressed': 1. <= since_move(s) < 1.5}),
+    ('the other blinker', lambda s: {'leftBlinker': 1. <= since_move(s) < 1.5}),
+    ('the other blinker, held to the corner', lambda s: {'leftBlinker': since_move(s) >= 1.}),
+    ('the gas, controlsd late to give the speed control back', gas_with_controls_late),
+    ('the speed control off for a moment', speed_control_off_a_moment),
+  ])
+  def test_calls_off_only_the_automatic_turn(self, _name, car):
+    # once the route moved the car toward the turn lane, the driving model finishes that lane change unless the driver steers
+    # against it: the gas, the other blinker or the speed control going off ends the route's lane change and calls off the
+    # automatic turn, never the slowdown, so the car reaches the corner at turning speed, in the turn lane, and turns only
+    # if the driver signals for it
+    approach = Approach(Road(), mph=25.)
+    frames = approach.run(car=car)
+    c = approach.dh.nav_desire
+    corner = min(frames, key=lambda f: abs(f['d']))
+    assert len(moves(frames)) == 1 and len(rises(frames, LANE_CHANGE_DESIRES)) == 1 and not rises(frames, TURN_DESIRES)
+    assert math.isclose(corner['offset'], LANE / 2 + POCKET / 2, abs_tol=1e-6) and corner['v'] <= NAV_TURN_SPEED + 0.05
+    assert c.auto_off and not c.called_off and c.maneuver_id in c.pins
+
+  def test_signaling_after_the_gas_takes_the_turn(self):
+    # the gas called the automatic turn off once the car started moving over: signaling for the turn takes it, from the turn
+    # lane, as any signaled turn
+    approach = Approach(Road(), mph=25.)
+    frames = approach.run(car=lambda s: {'gasPressed': 1. <= since_move(s) < 1.5, 'rightBlinker': s.d < 45.})
+    turns = rises(frames, TURN_DESIRES)
+    assert len(rises(frames, LANE_CHANGE_DESIRES)) == 1 and [f['desire'] for f in turns] == [log.Desire.turnRight]
+    assert math.isclose(turns[0]['offset'], LANE / 2 + POCKET / 2, abs_tol=1e-6) and turns[0]['v'] <= 7.
 
   def test_ending_blinker_starts_no_lane_change(self):
     # with nudgeless lane changes, the blinker that ends the move, held on, starts no lane change: it was on before
@@ -671,16 +844,11 @@ class TestTurnLaneEnds(OpenpilotTestCase):
 
 
 class TestTurnLaneLeftHandTraffic(OpenpilotTestCase):
-  # where traffic keeps left the near side is the left: a left turn lane from the curb lane; the far side the right, a
-  # right turn bay beside a median, with the far side's gates
+  # where traffic keeps left the near side is the left: a left turn lane from the curb lane; the far side the right, where
+  # it never moves (TestNoFarSideMove)
   def test_near_side_left(self):
     frames = Approach(Road(left=True), rht=False).run()
     TestTurnLaneMoves().one_move_and_turn(frames, left=True, across=False)
-
-  def test_far_side_right(self):
-    lanes = guidance((('straight', 'left'), None), (('straight',), None), (('right',), 'right'))
-    frames = Approach(Road(), rht=False, lanes=lanes).run()
-    TestTurnLaneMoves().one_move_and_turn(frames, left=False, across=True)
 
   @parameterized.expand([
     ('far side without automatic far side turns', {}, {'lanes': RIGHT_LANE}, {'far': False}),
@@ -709,25 +877,79 @@ class TestTurnLaneMemory(OpenpilotTestCase):
       c.update(car_state(vEgo=4.), True, NavInputs(outer_lanes=nav_desire.outer_lanes(msg), road=road_view(msg)))
     assert c.curb_confirmed[1] and math.isclose(c.curb_baseline[1], LANE / 2 + 0.2, rel_tol=1e-6)
 
-  @parameterized.expand([('lane change', {'lane_changing': True}, {}), ('steering off', {'lateral_active': False}, {}),
-                         ('far side: a car in the blind spot', {}, {'leftBlindspot': True})])
-  def test_forgotten(self, _name, update, fields):
-    left = 'leftBlindspot' in fields
+  @parameterized.expand([('lane change', {'lane_changing': True}), ('steering off', {'lateral_active': False})])
+  def test_forgotten(self, _name, update):
     c = NavDesireController()
-    c.turn_enabled = c.auto_enabled = c.lane_enabled = c.far_enabled = True
+    c.turn_enabled = c.auto_enabled = c.lane_enabled = True
     c.param_read_counter = 1
-    road = Road(left=left, opens=None)
+    road = Road(opens=None)
 
-    def frame(**kwargs):
+    def frame(lateral_active=True, lane_changing=False):
       msg = road.message(120., 0.)
       nav = NavInputs(outer_lanes=nav_desire.outer_lanes(msg), far_lanes=nav_desire.far_lanes(msg), road=road_view(msg))
-      c.update(car_state(**({'vEgo': 8.} | kwargs.pop('fields', {}))), kwargs.pop('lateral_active', True), nav, **kwargs)
+      c.update(car_state(vEgo=8.), lateral_active, nav, lane_changing)
     for _ in range(round(3. / DT_MDL)):
       frame()
-    side = 0 if left else 1
-    assert c.curb_confirmed[side]
-    frame(fields=fields, **update)
-    assert not c.curb_confirmed[side] and math.isnan(c.curb_baseline[side])
+    assert c.curb_confirmed[1]
+    frame(**update)
+    assert not c.curb_confirmed[1] and math.isnan(c.curb_baseline[1])
+
+  @parameterized.expand([(True,), (False,)])
+  def test_never_on_the_far_side(self, rht):
+    # beside a raised median on the far side for longer than an automatic far side turn's curb run needs: never confirmed
+    # there, whichever side traffic keeps to; beside the curb on the near side, the same drive mirrored, it is
+    for left, confirmed in ((rht, False), (not rht, True)):
+      c = NavDesireController()
+      c.turn_enabled = c.auto_enabled = c.lane_enabled = c.far_enabled = True
+      c.param_read_counter = 1
+      road = Road(left=left, opens=None)
+      for _ in range(round(3. / DT_MDL)):
+        msg = road.message(120., 0.)
+        nav = NavInputs(outer_lanes=nav_desire.outer_lanes(msg), far_lanes=nav_desire.far_lanes(msg), right_hand_traffic=rht,
+                        road=road_view(msg))
+        c.update(car_state(vEgo=8.), True, nav)
+      side = 0 if left else 1
+      assert c.outer_lane_time[side] >= 1. and c.far_lane_time[side] >= 1.5 and c.curb_confirmed[side] == confirmed, (rht, left)
+
+  def test_forgotten_once_the_turn_starts(self):
+    # in the curb lane up to the turn, no turn lane: confirmed until the route's turn starts, and forgotten from then on
+    approach = Approach(Road(opens=None), mph=25.)
+    c = approach.dh.nav_desire
+    approach.run(until=lambda s: s.dh.nav_desire.started)
+    assert c.curb_confirmed[1]
+    approach.run(1.)
+    assert c.started and not c.curb_confirmed[1] and math.isnan(c.curb_baseline[1])
+
+  @parameterized.expand([(3.4,), (2.7,)])
+  def test_forgotten_for_the_next_maneuver(self, width):
+    # right turn A from the curb lane, then right turn B 150 m along the next street, the car in that street's second lane, a
+    # travel lane (3.4 m) or a marked parking lane (2.7 m) beyond its right lane line: the curb lane seen before A says
+    # nothing about B's street, so the car stays in its lane there
+    a, b = two_turns(False, Road(opens=1e5, taper=1., width=width))
+    assert [f['desire'] for f in rises(a, TURN_DESIRES)] == [log.Desire.turnRight]
+    assert not moves(a + b) and not rises(a + b, LANE_CHANGE_DESIRES) and all(f['offset'] == 0. for f in b)
+
+  def test_forgotten_for_the_next_maneuver_after_no_turn(self):
+    # in the curb lane up to a maneuver that is no turn (the road's name changes), so no turn starts to forget the curb lane
+    # by, then the right turn 140 m on, the road wider from there, the car in its second lane beside a marked parking lane:
+    # the curb lane seen for the maneuver before is not this one's
+    approach = Approach(Road(opens=None), mph=25., start=200., maneuver_type='new name', modifier='straight')
+    frames = approach.run(until=lambda s: s.d < 0.)
+    assert approach.dh.nav_desire.curb_confirmed[1]
+    approach.road, approach.position, approach.d = Road(opens=1e5, taper=1., width=2.7), 600., 140.
+    approach.maneuver_type, approach.modifier = 'turn', 'right'
+    frames += approach.run()
+    assert not moves(frames) and not rises(frames, LANE_CHANGE_DESIRES) and all(f['offset'] == 0. for f in frames)
+
+  def test_turn_lane_carried_for_its_maneuver_only(self):
+    # the move done, the turn lane counts as the curb lane for that maneuver's turn; navd's next maneuver drops that
+    approach = Approach(Road(), mph=25.)
+    approach.run(until=lambda s: s.dh.nav_desire.lane_carry is not None)
+    c = approach.dh.nav_desire
+    assert c.lane_carry is False
+    approach.position = 600.
+    approach.run(DT_MDL)
+    assert c.lane_carry is None
 
   def test_memory_ends(self):
     # the edge gone from beside the car for POCKET_MEMORY, with no turn lane open there: the curb lane is forgotten
@@ -996,8 +1218,9 @@ class TestTurnLaneUnchanged(OpenpilotTestCase):
         assert traces[0] == traces[1], (seed, turns, auto, far)
 
   def test_invariants_with_the_setting_on(self):
-    # random drives past random turn lanes with the setting on: the route's lane change only toward the turn's side, at
-    # most one per maneuver, never while a blinker is on, and never a second lane change command while one is under way
+    # random drives past random turn lanes with the setting on: the route's lane change only toward the turn's side, and only
+    # for a near side turn (right: these drives keep right), at most one per maneuver, never while a blinker is on or driver
+    # monitoring warns, and never a second lane change command while one is under way
     for seed in range(10):
       dh = self.helper(DesireHelper, True, True, True, True)
       drive = random_drive(seed, 60.)
@@ -1009,7 +1232,7 @@ class TestTurnLaneUnchanged(OpenpilotTestCase):
         dh.update(carstate, lat, prob, edge[0], edge[1], NavInputs(**inputs, road=view))
         if dh.turn_lane_change is not None and not was_moving:
           turn = c.tracker.turn()
-          assert turn is not None and dh.turn_lane_change == turn and not (carstate.leftBlinker or carstate.rightBlinker)
+          assert turn is False and dh.turn_lane_change == turn and not (carstate.leftBlinker or carstate.rightBlinker) and not inputs['driver_alert']
           assert last_move != c.maneuver_id
           last_move = c.maneuver_id
         if was_moving and dh.desire in LANE_CHANGE_DESIRES and prev_desire not in LANE_CHANGE_DESIRES:
@@ -1127,21 +1350,25 @@ class TestTurnLaneWiring(OpenpilotTestCase):
     events.add(event)
     assert [a.alert_type for a in events.create_alerts([ET.WARNING])] == [f'navTurnLane/{ET.WARNING}']
 
-  @parameterized.expand([(20,), (25,), (30,)])
-  def test_shows_and_chimes_while_it_moves(self, mph):
-    # closed loop: the route's lane change (modeld), the slowdown and its Slowing for Route Turn (plannerd), selfdrived's
-    # alerts and soundd's own rule for when a sound plays. Moving to Turn Lane shows for the whole move, over Slowing for
-    # Route Turn where that shows too, and its sound plays as it starts
-    frames = Approach(Road(), mph=mph).run()
+  @staticmethod
+  def alerts_and_sounds(frames, pay_attention=0.1):
+    """Closed loop over a drive's frames: the route's lane change and turn speed (modeld, modelDataV2SP as it publishes
+    them), the slowdown and its Slowing for Route Turn (plannerd), selfdrived's alerts at 100 Hz, with driver monitoring's
+    first warning, Pay Attention, while the drive's driver monitoring warns (shown for at least `pay_attention` s: 0.1 s,
+    and 2 s on the comma 4), and soundd's own rule for when a sound plays. Per frame: the alert shown, the sound started
+    (None for none), and whether plannerd raised Slowing for Route Turn."""
     turn_speed = NavTurnSpeedController(SimpleNamespace(openpilotLongitudinalControl=True))
     manager, sound = AlertManager(), object.__new__(soundd.Soundd)
     sound.current_alert, sound.current_sound_frame, sound.pending_stop = AudibleAlert.none, 0, False
     sound.loaded_sounds = {k: np.zeros(int(0.4 * soundd.SAMPLE_RATE), dtype=np.float32) for k in soundd.sound_list}  # only their lengths matter
-    a_prev, shown, chimed = 0., [], None
+    warning = copy.copy(EVENTS[EventName.driverDistracted1][ET.PERMANENT])
+    warning.duration, warning.alert_type, warning.event_type = int(pay_attention / DT_CTRL), f'driverDistracted1/{ET.PERMANENT}', ET.PERMANENT
+    a_prev, out = 0., []
     for i, f in enumerate(frames):
       plan = EventsSP()
-      model = FakeSubMaster(seen={'modelDataV2SP': True}, recv_time={'modelDataV2SP': time.monotonic()},
-                            data={'modelDataV2SP': SimpleNamespace(navTurnSpeed=f['limit'])})
+      msg = messaging.new_message('modelDataV2SP').modelDataV2SP
+      msg.navTurnSpeed, msg.navTurnLane = f['limit'], f['turn_lane']
+      model = FakeSubMaster(seen={'modelDataV2SP': True}, recv_time={'modelDataV2SP': time.monotonic()}, data={'modelDataV2SP': msg})
       turn_speed.update(model, True, False, f['v'], a_prev, plan)
       a_prev = turn_speed.a_target if turn_speed.active else 0.
       for k in range(i * 5, i * 5 + 5):  # selfdrived at 100 Hz
@@ -1151,30 +1378,88 @@ class TestTurnLaneWiring(OpenpilotTestCase):
         if f['turn_lane']:
           events.add(EventNameSP.navTurnLane)
           events.remove(EventNameSP.navTurnSlowing)
-        manager.add_many(k, events.create_alerts([ET.WARNING], [None, None, None, False, 0, None]))
+        manager.add_many(k, events.create_alerts([ET.WARNING], [None, None, None, False, 0, None]) + ([warning] if f['dm'] else []))
         manager.process_alerts(k, set())
-      shown.append(manager.current_alert.alert_type)
       before = (sound.current_alert, sound.current_sound_frame)
       sound.update_alert(int(manager.current_alert.audible_alert))
-      if chimed is None and f['turn_lane']:
-        chimed = sound.current_alert == log.SelfdriveState.AudibleAlert.preAlert and sound.current_sound_frame == 0 and before != (sound.current_alert, 0)
+      started = sound.current_alert if sound.current_sound_frame == 0 and before != (sound.current_alert, 0) else None
+      out.append((manager.current_alert.alert_type, started, EventNameSP.navTurnSlowing in plan.names))
       sound.current_sound_frame += int(0.05 * soundd.SAMPLE_RATE)
-    assert any(f['turn_lane'] for f in frames) and chimed
-    assert all(s == f'navTurnLane/{ET.WARNING}' for s, f in zip(shown, frames, strict=True) if f['turn_lane'])
+    return out
 
-  @parameterized.expand([(2.,), (0.,)])
-  def test_driver_monitoring_shows_over_it(self, dm_from):
+  @parameterized.expand([(20,), (25,), (30,)])
+  def test_shows_and_chimes_while_it_moves(self, mph):
+    # Moving to Turn Lane shows for the whole move, over Slowing for Route Turn where that shows too, and its sound plays as
+    # it starts; Slowing for Route Turn shows on the approach, with its sound
+    frames = Approach(Road(), mph=mph).run()
+    out = self.alerts_and_sounds(frames)
+    first = next(i for i, f in enumerate(frames) if f['turn_lane'])
+    assert out[first][1] == AudibleAlert.preAlert
+    assert all(s == f'navTurnLane/{ET.WARNING}' for (s, _, _), f in zip(out, frames, strict=True) if f['turn_lane'])
+    slowing = [i for i, (s, _, _) in enumerate(out) if s == f'navTurnSlowing/{ET.WARNING}']
+    assert slowing and out[slowing[0]][1] == AudibleAlertSP.promptSingleHigh
+
+  # where the slowdown starts while the car moves over (these turn lanes and speeds), plannerd raised its one Slowing for
+  # Route Turn then, and selfdrived dropped it: it now waits for the move to end, and shows
+  @parameterized.expand([(20, 85.), (25, 95.), (25, 105.), (25, 115.), (30, 135.), (30, 145.)])
+  def test_slowing_shows_after_the_move(self, mph, opens):
+    frames = Approach(Road(opens=opens), mph=mph, start=260.).run()
+    out = self.alerts_and_sounds(frames)
+    moving = [i for i, f in enumerate(frames) if f['turn_lane']]
+    raised = [i for i, (_, _, slowing) in enumerate(out) if slowing]
+    assert moving and len(raised) == 1 and raised[0] > moving[-1]
+    assert out[raised[0]][0] == f'navTurnSlowing/{ET.WARNING}' and out[raised[0]][1] == AudibleAlertSP.promptSingleHigh
+    assert frames[raised[0]]['v'] > NAV_TURN_SPEED + 0.5
+
+  def test_slowing_waits_for_the_move(self):
+    # plannerd, on real modelDataV2SP messages: no Slowing for Route Turn while the route's lane change is under way, then
+    # its one alert
+    c = NavTurnSpeedController(SimpleNamespace(openpilotLongitudinalControl=True))
+    msg = messaging.new_message('modelDataV2SP').modelDataV2SP
+    msg.navTurnSpeed, msg.navTurnLane = 6., True
+    sm = FakeSubMaster(seen={'modelDataV2SP': True}, recv_time={'modelDataV2SP': time.monotonic()}, data={'modelDataV2SP': msg})
+    names = []
+    for _ in range(20):
+      events = EventsSP()
+      c.update(sm, True, False, 10., 0., events)
+      names += events.names
+    assert c.active and not names and not c.alerted
+    msg.navTurnLane = False
+    for _ in range(20):
+      events = EventsSP()
+      c.update(sm, True, False, 10., 0., events)
+      names += events.names
+    assert names == [EventNameSP.navTurnSlowing]
+
+  @parameterized.expand([(0.1,), (2.,)])
+  def test_waits_for_driver_monitoring_and_chimes(self, pay_attention):
+    # driver monitoring's first warning, whose sound the move's alert shares, until the turn lane has opened: the move waits
+    # until it has been quiet for 3 s, so Pay Attention is gone, also where it shows for 2 s, and the move's chime plays
+    frames = Approach(Road(opens=125.), mph=25., start=280., driver_alert=lambda s: 138. < s.d <= 150.).run()
+    out = self.alerts_and_sounds(frames, pay_attention)
+    quiet = next(f['t'] for f in frames if f['d'] <= 138.)
+    first = next(i for i, f in enumerate(frames) if f['turn_lane'])
+    assert len(moves(frames)) == 1 and frames[first]['t'] >= quiet + 3. - DT_MDL
+    assert out[first][1] == AudibleAlert.preAlert and out[first][0] == f'navTurnLane/{ET.WARNING}'
+    # and the same drive with the warning a moment later: no move while it warns, nor for 3 s after
+    frames = Approach(Road(opens=125.), mph=25., start=280., driver_alert=lambda s: 130. < s.d <= 132.).run()
+    assert len(moves(frames)) == 1 and moves(frames)[0]['t'] >= next(f['t'] for f in frames if f['d'] <= 130.) + 3. - DT_MDL
+
+  # driver monitoring's warnings show over it: its later ones whenever they come, and its first one, of the same priority,
+  # when it comes during the move (the move never starts while it warns)
+  @parameterized.expand([(EventName.driverDistracted2, 2.), (EventName.driverDistracted2, 0.), (EventName.driverDistracted1, 2.)])
+  def test_driver_monitoring_shows_over_it(self, warning, dm_from):
     manager, events, events_sp = AlertManager(), Events(), EventsSP()
     for k in range(round(6. / DT_CTRL)):
       t = k * DT_CTRL
       events.clear()
       events_sp.clear()
       if t >= dm_from:
-        events.add(EventName.driverDistracted2)
+        events.add(warning)
       if t >= 2. - dm_from:
         events_sp.add(EventNameSP.navTurnLane)
       args = [None, None, None, False, 0, None]
       manager.add_many(k, events.create_alerts([ET.PERMANENT, ET.WARNING], args) + events_sp.create_alerts([ET.PERMANENT, ET.WARNING], args))
       manager.process_alerts(k, set())
       if t >= 2.:
-        assert manager.current_alert.alert_type == f'driverDistracted2/{ET.PERMANENT}', (t, manager.current_alert.alert_type)
+        assert manager.current_alert.alert_type == f'{events.get_event_name(warning)}/{ET.PERMANENT}', (t, manager.current_alert.alert_type)

@@ -27,7 +27,8 @@ class NavTurnSpeedController:
   """Slows for the route's turn while openpilot controls the speed, following the speed limit modeld's NavDesireController
   publishes, so the slowdown and the turn desire share one state: which turns it slows for, and what calls them off.
   An acceleration candidate that may slow harder than the gentle cruise limit, within a jerk limit, whatever the set
-  speed, and an alert when it starts slowing the car, once per approach."""
+  speed, and an alert when it starts slowing the car, once per approach (once the car has moved into a turn lane, when it
+  starts while the car moves over)."""
 
   def __init__(self, CP):
     self.CP = CP
@@ -58,9 +59,12 @@ class NavTurnSpeedController:
       self.a_target = max(a_desired, a_prev - NAV_TURN_JERK * DT_MDL)
 
     # one alert per approach: it re-arms once the limit has let go of the car for a while, as between two turns, where the
-    # next turn's limit is far above the car's speed; holding turn speed through a turn keeps it
+    # next turn's limit is far above the car's speed; holding turn speed through a turn keeps it. While the car moves into a
+    # turn lane by itself, Moving to Turn Lane shows and selfdrived drops this one, so it waits for the move to end rather
+    # than being spent unseen.
     self.free_time = self.free_time + DT_MDL if a_desired > NAV_TURN_ALERT_DECEL else 0.
     self.alerted &= self.free_time < NAV_TURN_ALERT_RESET
-    if not self.alerted and a_desired < -NAV_TURN_ALERT_DECEL and v_ego > NAV_TURN_SPEED + NAV_TURN_ALERT_MARGIN:
+    moving_over = limit > 0. and bool(sm['modelDataV2SP'].navTurnLane)
+    if not self.alerted and a_desired < -NAV_TURN_ALERT_DECEL and v_ego > NAV_TURN_SPEED + NAV_TURN_ALERT_MARGIN and not moving_over:
       events_sp.add(EventNameSP.navTurnSlowing)
       self.alerted = True

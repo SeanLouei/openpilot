@@ -237,8 +237,11 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   # the route's own lane change into a turn lane: with no blinker, the driver's only notice that the car moves over. It shows
   # in place of Changing Lanes, while the lane change lasts. Its sound, the soft Pay Attention tone, is none of the other
-  # route alerts' sounds, so it plays also right after one of them (soundd plays a sound again only when it changes). Low
-  # priority, as the other route alerts: driver monitoring's warnings show over it.
+  # route alerts' sounds, so it plays also right after one of them (soundd plays a sound again only when it changes); it is
+  # the sound of driver monitoring's first warning, though, so the move never starts while driver monitoring warns, nor
+  # for a few seconds after, while that warning may still show. Low priority, as the other route alerts: driver
+  # monitoring's later warnings show over it, and its first one, of the same priority, shows over it when it comes during
+  # the move, as the newer alert, but makes no sound then: soundd is already on that sound.
   EventNameSP.navTurnLane: {
     ET.WARNING: Alert(
       "Moving to Turn Lane",

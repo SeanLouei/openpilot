@@ -183,7 +183,7 @@ class TestEvents(OpenpilotTestCase):
         c.update(car_state(vEgo=v), True, dataclasses.replace(far_nav(distance=d), accel=a_plan))
         events = EventsSP()
         model = FakeSubMaster(seen={'modelDataV2SP': True}, recv_time={'modelDataV2SP': time.monotonic()},
-                              data={'modelDataV2SP': SimpleNamespace(navTurnSpeed=c.speed_limit)})
+                              data={'modelDataV2SP': SimpleNamespace(navTurnSpeed=c.speed_limit, navTurnLane=False)})
         turn_speed.update(model, True, False, v, a_plan, events)
         plan_events = events.names
       events = EventsSP()

@@ -130,14 +130,16 @@ class ModelsLayoutMici(NavScroller):
                                                               "turns steering off: finish the turn yourself). Turn it on while parked; with auto " +
                                                               "route turns switched on while driving, it comes on at the next stop."))
     self.nav_turn_lane_toggle = BigParamControl(tr("auto turn lanes (alpha)"), "NavAutoTurnLane",
-                                                description=tr("Needs auto route turns, and auto left turns for left turns. From the curb " +
-                                                               "lane (for a left turn, the lane beside a raised median), moves by itself into " +
-                                                               "a turn lane that opens beside it before a route turn, showing Moving to Turn " +
-                                                               "Lane, then turns from it. It doesn't signal, which is illegal in most places: " +
-                                                               "signal yourself where you can. It can take a bike lane, parking or a bus bay " +
-                                                               "for a turn lane: watch every move, and steer, signal or press the gas to stop " +
-                                                               "it (on a Tesla, braking turns steering off). Set up without real drives yet: " +
-                                                               "full attention at first. Turn it on while parked."))
+                                                description=tr("Needs auto route turns. Right turns only (left where traffic keeps left): " +
+                                                               "from the curb lane, moves by itself into a turn lane that opens beside it " +
+                                                               "before a route turn, showing Moving to Turn Lane, then turns from it. Never " +
+                                                               "for left turns: to the camera, an oncoming lane can look like a left turn bay. " +
+                                                               "It doesn't signal, which is illegal in most places: signal yourself where you " +
+                                                               "can. It can take a bike lane, parking or a bus bay for a turn lane: watch every " +
+                                                               "move. Once it moves, only steering against it keeps you in your lane (on a " +
+                                                               "Tesla, braking turns steering off); the gas or the other blinker then calls off " +
+                                                               "only the turn, and the car still slows for the corner. Set up without real " +
+                                                               "drives yet: full attention at first. Turn it on while parked."))
     self.nav_exit_toggle = BigParamControl(tr("nav exit desires (alpha)"), "NavExitDesire",
                                            description=tr("Near a route exit or fork with lane guidance, a light steering nudge toward it has the car " +
                                                           "keep to that side of the split. Above 20 mph with your blinker on, a nudge " +

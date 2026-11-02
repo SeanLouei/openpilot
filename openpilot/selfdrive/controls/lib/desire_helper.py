@@ -90,7 +90,9 @@ class DesireHelper:
     # A route turn lane: the route's own lane change toward the turn into the turn lane opening beside the car, with no
     # blinker and at any speed it allows, through the same states as any other. It ends early, and for good, as the route
     # says: the driver signaling, pressing the gas, steering against it or calling the turn off, or a car in that blind spot
-    # before the car moved. The blinker that ends it never starts a lane change of its own: it is no new blinker after.
+    # before the car moved. That ends this lane change and its alert, not the driving model's, which already has its one
+    # pulse: only the driver steering against it holds the car in its lane. The blinker that ends it never starts a lane
+    # change of its own: it is no new blinker after.
     turn_lane = self.nav_desire.turn_lane
     turn_lane_completed = False
 
