@@ -12,6 +12,7 @@ import http.client
 import io
 import ipaddress
 import json
+import math
 import re
 import socket
 import struct
@@ -59,6 +60,14 @@ MAPBOX_ERRORS = {
   429: "Too many searches: try again shortly",
 }
 MAPBOX_FAILED = "Mapbox isn't answering right now: try again shortly"
+
+GPS_SERVICES = ('gpsLocation', 'gpsLocationExternal')
+SERVICES = [*GPS_SERVICES, 'navInstruction', 'managerState', 'ubloxGnss']
+# Comma devices with a u-blox chip on /dev/ttyHS0 run pigeond, which talks to the chip, and ubloxd, which decodes what it
+# sends; the others run qcomgpsd, for the GPS in the Quectel modem. The manager runs them only while the car is on.
+RECEIVERS = {'u-blox': (('pigeond', 'ubloxd'), 'gpsLocationExternal'), 'Quectel modem': (('qcomgpsd',), 'gpsLocation')}
+GPS_PROCESSES = tuple(name for names, _ in RECEIVERS.values() for name in names)
+ANTENNA = {'ok': 'antenna OK', 'short': 'antenna short-circuited', 'open': 'antenna not connected'}  # what the u-blox's antenna check says
 
 
 class Place(NamedTuple):
@@ -261,12 +270,222 @@ def device_host(host: str) -> bool:
   return True
 
 
+def field(struct, name: str):
+  """struct.name, else None: for a field this build's schema lacks, a union member that isn't set, or no struct at all."""
+  try:
+    return getattr(struct, name)
+  except Exception:  # AttributeError, or capnp's KjException for a union member that isn't set
+    return None
+
+
+def entry(table, key: str):
+  """table[key], else None: for a table, or a SubMaster, without it."""
+  try:
+    return table[key]
+  except Exception:  # KeyError, or TypeError for no table at all
+    return None
+
+
+def known(value, kind: type) -> bool | int | float | None:
+  """value as kind (bool, int or float) when it's one, else None, which the page shows as unknown. Never NaN or infinity,
+  which aren't JSON: the page couldn't read its state."""
+  if kind is bool or isinstance(value, bool):
+    return value if kind is bool and isinstance(value, bool) else None
+  if not isinstance(value, (int, float)) or (isinstance(value, float) and not math.isfinite(value)):
+    return None
+  try:
+    return kind(value)
+  except OverflowError:  # an integer too big for a float
+    return None
+
+
+def name_of(read) -> str | None:
+  """The name read() gives, such as a capnp enum's value or the member of a union that's set, else None."""
+  try:
+    value = read()
+    return None if value is None else str(value)
+  except Exception:  # a field this build's schema lacks, a union member that isn't set, or a value it doesn't name
+    return None
+
+
+def received(sm, service: str) -> float | None:
+  """When sm last received a message of service (monotonic seconds), else None: also before it ever has."""
+  return known(entry(field(sm, 'recv_time'), service), float) if entry(field(sm, 'seen'), service) is True else None
+
+
+def location(sm, service: str, used: bool) -> dict:
+  """The last message of a location service as the page shows it, used: whether latest_gps_source took the position from it."""
+  seen = known(entry(field(sm, 'seen'), service), bool)
+  message = entry(sm, service) if seen else None  # before the first message, a SubMaster has a placeholder
+  return {'seen': seen, 'valid': known(entry(field(sm, 'valid'), service), bool) if seen else None,
+          'hasFix': known(field(message, 'hasFix'), bool), 'satelliteCount': known(field(message, 'satelliteCount'), int),
+          'horizontalAccuracy': known(field(message, 'horizontalAccuracy'), float),
+          'verticalAccuracy': known(field(message, 'verticalAccuracy'), float), 'speed': known(field(message, 'speed'), float), 'used': used}
+
+
+def gps_processes(manager_state) -> dict[str, dict | None]:
+  """Each GPS process as the manager last reported it, None for one it didn't list."""
+  processes: dict[str, dict | None] = dict.fromkeys(GPS_PROCESSES)
+  try:
+    listed = list(field(manager_state, 'processes') or [])
+  except TypeError:  # not a list
+    listed = []
+  for process in listed:
+    name = field(process, 'name')
+    if isinstance(name, str) and name in processes:
+      processes[name] = {'running': known(field(process, 'running'), bool), 'shouldBeRunning': known(field(process, 'shouldBeRunning'), bool),
+                         'exitCode': known(field(process, 'exitCode'), int)}
+  return processes
+
+
+def age(now: float, then: float | None) -> float | None:
+  return None if then is None else round(now - then, 2)
+
+
+class GpsDetails:
+  """What the page shows of the GPS, to tell apart why there's no fix: the receiver's processes not running, running without
+  sending anything, messages without a fix, or a fix that latest_gps_source rejects. It only reads, and never raises: what
+  it can't read is unknown, None."""
+
+  def __init__(self):
+    self.locations = {service: (None, location(None, service, False)) for service in GPS_SERVICES}  # (when received, the message)
+    self.processes: dict[str, dict | None] | None = None  # from the manager's last managerState
+    self.processes_time: float | None = None
+    self.ublox_time: float | None = None  # ubloxd sends only what it decodes from the chip's data
+    self.satellites: int | None = None  # in the last measurement report: those the chip receives
+    self.satellites_time: float | None = None
+    self.antenna: str | None = None
+
+  def update(self, sm, source: str | None) -> None:
+    """After each update of sm, with the service latest_gps_source took the position from."""
+    for service in GPS_SERVICES:
+      self.locations[service] = received(sm, service), location(sm, service, source == service)
+    if entry(field(sm, 'updated'), 'managerState') is True:
+      self.processes, self.processes_time = gps_processes(entry(sm, 'managerState')), received(sm, 'managerState')
+    if entry(field(sm, 'updated'), 'ubloxGnss') is True:
+      # ubloxGnss carries reports of several kinds, and the SubMaster only keeps the last message: each of these is from
+      # the last report of its kind
+      gnss = entry(sm, 'ubloxGnss')
+      self.ublox_time = received(sm, 'ubloxGnss')
+      kind = name_of(lambda: gnss.which())
+      if kind == 'measurementReport':
+        self.satellites, self.satellites_time = known(field(field(gnss, kind), 'numMeas'), int), self.ublox_time
+      elif kind == 'hwStatus':
+        self.antenna = name_of(lambda: gnss.hwStatus.aStatus)
+
+  def state(self, started: bool | None, ublox_available: bool | None) -> dict:
+    now = time.monotonic()
+    details = {'started': started, 'ubloxAvailable': ublox_available, 'processes': self.processes, 'processesAge': age(now, self.processes_time),
+               **{service: {**message, 'age': age(now, then)} for service, (then, message) in self.locations.items()},
+               'ubloxGnss': {'seen': self.ublox_time is not None, 'age': age(now, self.ublox_time), 'satellites': self.satellites,
+                             'satellitesAge': age(now, self.satellites_time), 'antenna': self.antenna}}
+    return {**details, 'summary': gps_summary(details)}
+
+
+def duration(seconds: float) -> str:
+  """seconds in words: 0.4 s, 25 s, 12 min or 3 h."""
+  if seconds < 10:
+    return f'{seconds:.1f} s'
+  if seconds < 120:
+    return f'{seconds:.0f} s'
+  if seconds < 7200:
+    return f'{seconds / 60:.0f} min'
+  return f'{seconds / 3600:.0f} h'
+
+
+def length(meters: float) -> str:
+  return f'{meters:.0f} m' if meters < 1000 else f'{meters / 1000:.0f} km'
+
+
+def plural(count: int, noun: str) -> str:
+  return f'{count} {noun}' + ('' if count == 1 else 's')
+
+
+def stopped(name: str, process: dict | None) -> str:
+  """Why a GPS process that should run doesn't, in words."""
+  if process is None:
+    return f"{name} isn't in the process list"
+  code = process['exitCode']
+  if code is None:
+    return f'{name} stopped'
+  # multiprocessing gives a process that a signal ended the signal's number, negated
+  return f'{name} was killed by signal {-code}' if code < 0 else f'{name} stopped with exit code {code}'
+
+
+def processes_words(processes: dict[str, dict | None] | None, names: tuple[str, ...]) -> str:
+  """Whether the manager runs these processes, in words."""
+  if processes is None:  # no managerState yet
+    return 'process state unknown'
+  if all(processes[name] is not None and processes[name]['running'] for name in names):
+    return 'running'
+  # the manager never restarts a process that ended: until the car is turned off, it's one that should run and doesn't
+  ended = [stopped(name, process) for name in names if (process := processes[name]) is None or (process['shouldBeRunning'] and not process['running'])]
+  return ', '.join(['not running', *ended])
+
+
+def receiver_words(details: dict, receiver: str) -> list[str]:
+  """What a GPS receiver is doing, in words: whether its processes run, when its last message came, and what it said."""
+  names, service = RECEIVERS[receiver]
+  message, gnss = details[service], details['ubloxGnss']
+  ublox = receiver == 'u-blox'  # only ubloxd reports satellites and the antenna: qcomgpsd's satelliteCount is always 0
+  words = [processes_words(details['processes'], names)]
+  if message['age'] is not None:
+    words.append(f"last message {duration(message['age'])} ago")
+  elif ublox and gnss['age'] is not None:  # ubloxd decodes data from the chip, but no position
+    words.append(f"no position messages yet, but data {duration(gnss['age'])} ago")
+  else:
+    words.append('no messages yet')
+
+  if message['hasFix'] is False:
+    words.append('no fix yet')
+  elif message['hasFix'] and message['used']:
+    words.append('has a fix')
+  elif message['hasFix']:  # latest_gps_source takes a fix only from a valid message under 2 s old
+    words.append("has a fix, but it's marked invalid" if message['valid'] is False else "has a fix, but it's too old to use")
+
+  if ublox and message['satelliteCount'] is not None:
+    words.append(f"{plural(message['satelliteCount'], 'satellite')} used" + ('' if gnss['satellites'] is None else f", {gnss['satellites']} heard"))
+  elif ublox and gnss['satellites'] is not None:
+    words.append(f"{plural(gnss['satellites'], 'satellite')} heard")
+  if (message['horizontalAccuracy'] or 0) > 0:
+    words.append(f"accuracy {length(message['horizontalAccuracy'])}")
+  elif (message['verticalAccuracy'] or 0) > 0:  # all that qcomgpsd reports
+    words.append(f"vertical accuracy {length(message['verticalAccuracy'])}")
+  if ublox and gnss['antenna'] in ANTENNA:
+    words.append(ANTENNA[gnss['antenna']])
+  return words
+
+
+def heard_from(details: dict, receiver: str) -> bool:
+  """Whether a GPS receiver's processes run or should, or it has sent anything."""
+  names, service = RECEIVERS[receiver]
+  processes = details['processes'] or {}
+  runs = any(processes.get(name) and (processes[name]['running'] or processes[name]['shouldBeRunning']) for name in names)
+  return bool(runs or details[service]['seen'] or (receiver == 'u-blox' and details['ubloxGnss']['seen']))
+
+
+def gps_summary(details: dict) -> list[str]:
+  """The GPS details in plain words, a line each: whether the car is on, then what the GPS receiver is doing."""
+  lines = []
+  if details['started'] is not None:
+    lines.append('Car on' if details['started'] else 'Car off: the GPS only runs while the car is on')
+  if details['ubloxAvailable'] is not None:  # which receiver the manager found on the device
+    receivers = ['u-blox' if details['ubloxAvailable'] else 'Quectel modem']
+  else:
+    receivers = [receiver for receiver in RECEIVERS if heard_from(details, receiver)]
+  lines += [f'GPS receiver ({receiver}): ' + ' · '.join(receiver_words(details, receiver)) for receiver in receivers]
+  if not receivers:
+    lines.append(f"GPS receiver: {processes_words(details['processes'], GPS_PROCESSES)} · no messages yet")
+  return lines
+
+
 class NavWeb:
   def __init__(self, params: Params | None = None):
     self.params = params if params is not None else Params()
     self.lock = threading.Lock()
     self.position: tuple[float, float] | None = None  # (latitude, longitude)
     self.instruction: dict | None = None
+    self.gps = GpsDetails()
 
   def update(self, sm) -> None:
     source = latest_gps_source(sm)
@@ -277,9 +496,17 @@ class NavWeb:
         'text': instruction.maneuverPrimaryText, 'distance': instruction.maneuverDistance,
         'distanceRemaining': instruction.distanceRemaining, 'timeRemaining': instruction.timeRemaining,
       }
+      self.gps.update(sm, source)
 
   def token(self) -> str:
     return (self.params.get("MapboxToken") or '').strip()
+
+  def flag(self, key: str) -> bool | None:
+    """A boolean param, else None: unset or unreadable."""
+    try:
+      return known(self.params.get(key), bool)
+    except Exception:  # a key this build doesn't have
+      return None
 
   def near(self) -> tuple[float, float] | None:
     """Where to search near: the live GPS fix, else the last one saved, so that searches offroad are local too."""
@@ -289,10 +516,13 @@ class NavWeb:
 
   def state(self) -> dict:
     token = self.token()
+    # the manager writes both: IsOffroad when the car turns on or off, and UbloxAvailable for whether the device has a u-blox
+    offroad, ublox_available = self.flag("IsOffroad"), self.flag("UbloxAvailable")
     with self.lock:
       return {'destination': self.params.get("NavDestination"), 'navigationEnabled': self.params.get_bool("NavigationEnabled"),
               'isMetric': self.params.get_bool("IsMetric"), 'tokenHint': f'…{token[-4:]}' if token else '',
-              'gps': self.position is not None, 'instruction': self.instruction}
+              'gps': self.position is not None, 'instruction': self.instruction,
+              'gpsDetails': self.gps.state(None if offroad is None else not offroad, ublox_available)}
 
   def search(self, body: dict) -> tuple[int, dict]:
     query = str(body.get('query', '')).strip()
@@ -521,6 +751,8 @@ PAGE = """<!doctype html>
            background: #3a1416; border: 1px solid var(--danger); color: #ffd6d6; font-size: 14px; }
   .error:empty { display: none; }
   .value { font-size: 18px; font-weight: 600; word-break: break-word; }
+  .gps { padding-left: 10px; border-left: 2px solid var(--line); color: var(--muted); font-size: 13px; word-break: break-word; }
+  .gps strong { display: block; color: var(--text); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -530,6 +762,7 @@ PAGE = """<!doctype html>
     <h2>Destination</h2>
     <div class="value" id="destination">None</div>
     <div class="muted" id="status"></div>
+    <div class="gps"><strong>GPS details</strong><div id="gps-details"></div></div>
     <div class="row"><button class="secondary" id="clear">Clear destination</button></div>
   </section>
   <section>
@@ -586,6 +819,12 @@ function render(state) {
     parts.push('Route: waiting (needs GPS, internet, and a token or comma routing)');
   }
   $('status').textContent = parts.join(' · ');
+  // a line each, as text: never read as HTML
+  $('gps-details').replaceChildren(...(state.gpsDetails?.summary ?? []).map((line) => {
+    const item = document.createElement('div');
+    item.textContent = line;
+    return item;
+  }));
   $('token-state').textContent = state.tokenHint
     ? `Saved (${state.tokenHint}). Paste a new one to replace it, or save empty to remove it.`
     : 'Not set. Create a free access token at mapbox.com.';
@@ -645,7 +884,7 @@ def main():
   threading.Thread(target=server.serve_forever, daemon=True).start()
   cloudlog.warning(f"navweb serving on port {PORT}")
 
-  sm = messaging.SubMaster(['gpsLocation', 'gpsLocationExternal', 'navInstruction'])
+  sm = messaging.SubMaster(SERVICES)
   while True:
     sm.update(1000)
     navweb.update(sm)

@@ -7,6 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 import errno
 import http.client
 import json
+import math
 import select
 import socket
 import threading
@@ -19,12 +20,13 @@ from urllib.parse import urljoin
 import requests
 
 import openpilot.cereal.messaging as messaging
+from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.parameterized import parameterized
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.sunnypilot.navd.navweb import (LINK_FAILED, MAPBOX_ERRORS, MAPBOX_FAILED, MAX_BODY, MAX_CONNECTIONS, MAX_HEADERS, MAX_REDIRECTS, OFFLINE,
-                                              PORT, SIOCGIFADDR, WIFI_INTERFACE, LinkError, NavWeb, Place, Server, geocode, main, make_handler,
-                                              place_from_text, read_link, resolve_link, search_text)
+from openpilot.sunnypilot.navd.navweb import (GPS_PROCESSES, LINK_FAILED, MAPBOX_ERRORS, MAPBOX_FAILED, MAX_BODY, MAX_CONNECTIONS, MAX_HEADERS,
+                                              MAX_REDIRECTS, OFFLINE, PAGE, PORT, SERVICES, SIOCGIFADDR, WIFI_INTERFACE, GpsDetails, LinkError, NavWeb,
+                                              Place, Server, geocode, main, make_handler, place_from_text, read_link, resolve_link, search_text)
 
 COSTCO = 'Costco Wholesale, 1600 El Camino Real, South San Francisco, CA 94080'
 COSTCO_ADDRESS = '1600 El Camino Real, South San Francisco, CA 94080'
@@ -174,6 +176,62 @@ def raw_request(port, method, path, headers, body=None):
   connection.endheaders(body)
   response = connection.getresponse()
   return response.status, response.read()
+
+
+T = 1000.  # s, monotonic: the time of the tests' first message
+RUNNING = {'running': True, 'shouldBeRunning': True, 'pid': 1234}
+UNKNOWN = {'seen': False, 'age': None, 'valid': None, 'hasFix': None, 'satelliteCount': None, 'horizontalAccuracy': None, 'verticalAccuracy': None,
+           'speed': None, 'used': False}
+
+
+def submaster():
+  """navweb's SubMaster, which gets its messages from the test instead of from sockets."""
+  with patch.object(messaging, 'sub_sock'):
+    return messaging.SubMaster(SERVICES)
+
+
+def receive(navweb, sm, now, *messages):
+  """A turn of navweb's loop at monotonic time now, with these messages received, or none: sm.update times out after a
+  second without any. now only goes forward, as the SubMaster's frequency checks expect."""
+  with patch('time.monotonic', return_value=now):
+    sm.update_msgs(now, [messaging.log_from_bytes(m.to_bytes()) for m in messages])
+    navweb.update(sm)
+
+
+def position(service, valid=True, **fields):
+  """A location message, as ubloxd sends gpsLocationExternal and qcomgpsd gpsLocation."""
+  msg = messaging.new_message(service, valid=valid)
+  setattr(msg, service, fields)
+  return msg
+
+
+def manager_state(**processes):
+  """The manager's report of its processes, these with their states."""
+  msg = messaging.new_message('managerState', valid=True)
+  msg.managerState.processes = [{'name': name, **state} for name, state in processes.items()]
+  return msg
+
+
+def measurement_report(satellites):
+  """ubloxd's report of the chip's measurements, one for each satellite it receives."""
+  msg = messaging.new_message('ubloxGnss', valid=True)
+  report = msg.ubloxGnss.init('measurementReport')
+  report.numMeas = satellites
+  report.init('measurements', satellites)
+  return msg
+
+
+def hardware_status(antenna):
+  """ubloxd's report of the chip's hardware, with what its antenna check says."""
+  msg = messaging.new_message('ubloxGnss', valid=True)
+  msg.ubloxGnss.init('hwStatus').aStatus = antenna
+  return msg
+
+
+def page_state(navweb, now):
+  """The state as the page gets it at monotonic time now: JSON, which has no NaN or infinity."""
+  with patch('time.monotonic', return_value=now):
+    return json.loads(json.dumps(navweb.state(), allow_nan=False))
 
 
 class TestLinks(OpenpilotTestCase):
@@ -435,6 +493,148 @@ class TestNavWeb(OpenpilotTestCase):
       assert proximity(navweb) is None
 
 
+class TestGpsDetails(OpenpilotTestCase):
+  def test_nothing_received(self):
+    navweb, sm = NavWeb(FakeParams()), submaster()
+    receive(navweb, sm, T)
+    details = page_state(navweb, T)['gpsDetails']
+    assert details['gpsLocation'] == details['gpsLocationExternal'] == UNKNOWN
+    # the SubMaster's placeholder for ubloxGnss is an empty measurement report, never taken for one of no satellites
+    assert details['ubloxGnss'] == {'seen': False, 'age': None, 'satellites': None, 'satellitesAge': None, 'antenna': None}
+    assert [details[key] for key in ('started', 'ubloxAvailable', 'processes', 'processesAge')] == [None] * 4
+    assert details['summary'] == ['GPS receiver: process state unknown · no messages yet']
+
+  def test_ublox_without_a_fix(self):
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond=RUNNING, ubloxd=RUNNING, qcomgpsd={}))
+    receive(navweb, sm, T + 0.2, measurement_report(9), position('gpsLocationExternal', hasFix=False, satelliteCount=3, horizontalAccuracy=48.25,
+                                                                 verticalAccuracy=70.5, speed=0.25, source='ublox'))
+    receive(navweb, sm, T + 0.3, hardware_status('ok'))  # a report of another kind: the satellites stay the measurement report's
+    state = page_state(navweb, T + 0.6)
+    details = state['gpsDetails']
+    assert not state['gps'] and details['started'] is True and details['ubloxAvailable'] is True and details['processesAge'] == 0.6
+    assert details['processes'] == {'pigeond': {'running': True, 'shouldBeRunning': True, 'exitCode': 0},
+                                    'ubloxd': {'running': True, 'shouldBeRunning': True, 'exitCode': 0},
+                                    'qcomgpsd': {'running': False, 'shouldBeRunning': False, 'exitCode': 0}}
+    assert details['gpsLocationExternal'] == {'seen': True, 'age': 0.4, 'valid': True, 'hasFix': False, 'satelliteCount': 3,
+                                              'horizontalAccuracy': 48.25, 'verticalAccuracy': 70.5, 'speed': 0.25, 'used': False}
+    assert details['gpsLocation'] == UNKNOWN
+    assert details['ubloxGnss'] == {'seen': True, 'age': 0.3, 'satellites': 9, 'satellitesAge': 0.4, 'antenna': 'ok'}
+    assert details['summary'] == ['Car on', 'GPS receiver (u-blox): running · last message 0.4 s ago · no fix yet · 3 satellites used, 9 heard · ' +
+                                  'accuracy 48 m · antenna OK']
+
+  def test_ublox_running_without_messages(self):
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond=RUNNING, ubloxd=RUNNING, qcomgpsd={}))
+    assert page_state(navweb, T)['gpsDetails']['summary'][1] == 'GPS receiver (u-blox): running · no messages yet'
+    # ubloxd decodes data from the chip, without a position in it
+    receive(navweb, sm, T + 0.1, hardware_status('open'))
+    assert page_state(navweb, T + 0.3)['gpsDetails']['summary'][1] == ('GPS receiver (u-blox): running · no position messages yet, but data 0.2 s ago · ' +
+                                                                       'antenna not connected')
+
+  def test_fixes(self):
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond=RUNNING, ubloxd=RUNNING, qcomgpsd={}))
+    fix = {'hasFix': True, 'latitude': 37.6559, 'longitude': -122.4077, 'satelliteCount': 11, 'horizontalAccuracy': 3.25, 'source': 'ublox'}
+    receive(navweb, sm, T + 0.1, measurement_report(14), position('gpsLocationExternal', **fix))
+    state = page_state(navweb, T + 0.2)
+    assert state['gps'] and state['gpsDetails']['gpsLocationExternal']['used'] and navweb.position == (37.6559, -122.4077)
+    assert state['gpsDetails']['summary'][1] == ('GPS receiver (u-blox): running · last message 0.1 s ago · has a fix · 11 satellites used, 14 heard · ' +
+                                                 'accuracy 3 m')
+
+    # fixes latest_gps_source rejects, and why
+    receive(navweb, sm, T + 0.3, position('gpsLocationExternal', valid=False, **fix))
+    state = page_state(navweb, T + 0.4)
+    external = state['gpsDetails']['gpsLocationExternal']
+    assert not state['gps'] and external['valid'] is False and external['hasFix'] and not external['used']
+    assert "· last message 0.1 s ago · has a fix, but it's marked invalid ·" in state['gpsDetails']['summary'][1]
+    receive(navweb, sm, T + 0.5, position('gpsLocationExternal', **fix))
+    receive(navweb, sm, T + 5.5)  # nothing since
+    state = page_state(navweb, T + 5.5)
+    external = state['gpsDetails']['gpsLocationExternal']
+    assert not state['gps'] and external['valid'] and external['hasFix'] and not external['used'] and external['age'] == 5
+    assert "· last message 5.0 s ago · has a fix, but it's too old to use ·" in state['gpsDetails']['summary'][1]
+
+  def test_quectel(self):
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=False)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond={}, ubloxd={}, qcomgpsd=RUNNING))
+    # qcomgpsd counts no satellites, and has only a vertical accuracy: 500 m, its limit, without a fix
+    receive(navweb, sm, T + 0.1, position('gpsLocation', hasFix=False, verticalAccuracy=500., source='qcomdiag'))
+    details = page_state(navweb, T + 0.6)['gpsDetails']
+    assert details['gpsLocation']['seen'] and details['gpsLocation']['satelliteCount'] == 0 and details['gpsLocationExternal'] == UNKNOWN
+    assert details['summary'] == ['Car on', 'GPS receiver (Quectel modem): running · last message 0.5 s ago · no fix yet · vertical accuracy 500 m']
+    receive(navweb, sm, T + 1.1, position('gpsLocation', hasFix=True, latitude=37.6559, longitude=-122.4077, verticalAccuracy=3.25, source='qcomdiag'))
+    state = page_state(navweb, T + 1.6)
+    assert state['gps'] and state['gpsDetails']['gpsLocation']['used']
+    assert state['gpsDetails']['summary'][1] == 'GPS receiver (Quectel modem): running · last message 0.5 s ago · has a fix · vertical accuracy 3 m'
+
+  def test_receiver_from_what_runs(self):
+    # The manager writes UbloxAvailable only when it differs from what's saved, so a device that never had a u-blox may have
+    # none: the receiver is then the one that runs, or has sent anything
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond={}, ubloxd={}, qcomgpsd=RUNNING))
+    assert page_state(navweb, T)['gpsDetails']['summary'] == ['Car on', 'GPS receiver (Quectel modem): running · no messages yet']
+    receive(navweb, sm, T + 0.5, manager_state(pigeond={}, ubloxd={}, qcomgpsd={}), position('gpsLocationExternal', hasFix=False))
+    assert page_state(navweb, T + 0.5)['gpsDetails']['summary'][1] == ('GPS receiver (u-blox): not running · last message 0.0 s ago · no fix yet · ' +
+                                                                       '0 satellites used')
+
+  def test_stopped_processes(self):
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond=RUNNING, ubloxd=RUNNING, qcomgpsd={}))
+    receive(navweb, sm, T + 0.1, position('gpsLocationExternal', hasFix=True, satelliteCount=11, horizontalAccuracy=3.25))
+    # the manager never restarts a process that ended: until the car is turned off, it's one that should run and doesn't
+    receive(navweb, sm, T + 30.1, manager_state(pigeond={'shouldBeRunning': True, 'pid': 1234, 'exitCode': 1}, ubloxd=RUNNING, qcomgpsd={}))
+    details = page_state(navweb, T + 30.1)['gpsDetails']
+    assert details['processes']['pigeond'] == {'running': False, 'shouldBeRunning': True, 'exitCode': 1}
+    assert details['summary'] == ['Car on', 'GPS receiver (u-blox): not running, pigeond stopped with exit code 1 · last message 30 s ago · ' +
+                                  "has a fix, but it's too old to use · 11 satellites used · accuracy 3 m"]
+    receive(navweb, sm, T + 30.6, manager_state(pigeond=RUNNING, ubloxd={'shouldBeRunning': True, 'pid': 1235, 'exitCode': -11}, qcomgpsd={}))
+    assert page_state(navweb, T + 30.6)['gpsDetails']['summary'][1].startswith('GPS receiver (u-blox): not running, ubloxd was killed by signal 11 · ')
+
+  def test_car_off(self):
+    navweb, sm = NavWeb(FakeParams(IsOffroad=True, UbloxAvailable=True)), submaster()
+    receive(navweb, sm, T, manager_state(pigeond={}, ubloxd={}, qcomgpsd={}))
+    details = page_state(navweb, T)['gpsDetails']
+    assert details['started'] is False
+    assert details['summary'] == ['Car off: the GPS only runs while the car is on', 'GPS receiver (u-blox): not running · no messages yet']
+
+  def test_malformed_or_missing_fields(self):
+    navweb, sm = NavWeb(FakeParams(IsOffroad='no', UbloxAvailable=1)), submaster()
+    # NaN and infinity aren't JSON: with them, the page couldn't read its state
+    receive(navweb, sm, T, position('gpsLocationExternal', hasFix=False, horizontalAccuracy=math.nan, verticalAccuracy=math.inf, speed=-math.inf))
+    receive(navweb, sm, T + 0.1, manager_state(card=RUNNING))  # as from a build without the GPS processes
+    details = page_state(navweb, T + 0.1)['gpsDetails']
+    assert details['started'] is None and details['ubloxAvailable'] is None and details['processes'] == dict.fromkeys(GPS_PROCESSES)
+    assert [details['gpsLocationExternal'][key] for key in ('hasFix', 'horizontalAccuracy', 'verticalAccuracy', 'speed')] == [False, None, None, None]
+    assert details['summary'] == ["GPS receiver (u-blox): not running, pigeond isn't in the process list, ubloxd isn't in the process list · " +
+                                  'last message 0.1 s ago · no fix yet · 0 satellites used']
+
+  def test_never_raises(self):
+    # what isn't a SubMaster, one without its messages, or messages without the fields: all unknown
+    other = messaging.log_from_bytes(messaging.new_message('navInstruction').to_bytes()).navInstruction
+    for sm in (None, object(), FakeSubMaster(data={}),
+               FakeSubMaster(seen=dict.fromkeys(SERVICES, True), updated=dict.fromkeys(SERVICES, True), valid=dict.fromkeys(SERVICES, 'yes'),
+                             recv_time=dict.fromkeys(SERVICES, 'now'), data=dict.fromkeys(SERVICES, other))):
+      gps = GpsDetails()
+      gps.update(sm, None)
+      details = json.loads(json.dumps(gps.state(None, None), allow_nan=False))
+      assert details['processes'] in (None, dict.fromkeys(GPS_PROCESSES)) and details['ubloxGnss']['satellites'] is None
+      assert all(details[service][key] is None for service in ('gpsLocation', 'gpsLocationExternal')
+                 for key in ('age', 'valid', 'hasFix', 'satelliteCount', 'horizontalAccuracy', 'verticalAccuracy', 'speed'))
+      assert details['summary'][-1].startswith('GPS receiver')
+
+  def test_page_shows_the_details(self):
+    with serving(NavWeb(FakeParams(IsOffroad=True))) as port:
+      status, page = request(port, 'GET', '/')
+      assert status == 200 and b'GPS details' in page and b'id="gps-details"' in page
+      status, body = request(port, 'GET', '/api/state')
+    assert status == 200 and json.loads(body)['gpsDetails']['summary'] == ['Car off: the GPS only runs while the car is on',
+                                                                          'GPS receiver: process state unknown · no messages yet']
+    # its lines go in as text, which the browser never reads as HTML
+    assert "$('gps-details').replaceChildren(...(state.gpsDetails?.summary ?? [])" in PAGE and 'item.textContent = line' in PAGE
+    assert 'innerHTML' not in PAGE
+
+
 class TestServer(OpenpilotTestCase):
   def test_requests(self):
     params = FakeParams()
@@ -602,9 +802,12 @@ class TestServer(OpenpilotTestCase):
     class Stop(Exception):
       pass
 
-    with patch('openpilot.sunnypilot.navd.navweb.Server') as server, patch.object(messaging, 'SubMaster', side_effect=Stop), self.assertRaises(Stop):
+    with patch('openpilot.sunnypilot.navd.navweb.Server') as server, patch.object(messaging, 'SubMaster', side_effect=Stop) as sub_master, \
+         self.assertRaises(Stop):
       main()
     assert server.call_args.args[0] == ('0.0.0.0', PORT)
+    # the GPS details read the manager's process list and ubloxd's reports too
+    assert sub_master.call_args.args[0] == SERVICES and {'managerState', 'ubloxGnss'} <= set(SERVICES) <= set(SERVICE_LIST)
 
   def test_failed_search_keeps_token_out_of_logs(self):
     with serving(NavWeb(FakeParams(MapboxToken='pk.secret'))) as port, \
