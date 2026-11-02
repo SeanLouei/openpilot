@@ -299,6 +299,21 @@ def cold_start(pigeon: TTYPigeon) -> None:
   pigeon.send(add_ubx_checksum(b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00"))
 
 
+def factory_reset(pigeon: TTYPigeon) -> None:
+  """Erase what the chip keeps across power cycles, its saved configuration and its flash backup of navigation data (which
+  init_pigeon would otherwise restore), then restart it on its defaults for init_pigeon to configure."""
+  cloudlog.warning("Factory resetting ublox")
+  try:
+    if not pigeon.reset_device():
+      cloudlog.error("failed to clear the ublox backup")
+  except Exception:
+    cloudlog.exception("failed to factory reset ublox")
+  # restart it (cold, hardware reset), so it runs on the defaults instead of the configuration it loaded before it was cleared
+  pigeon.send(b"\xb5\x62\x06\x04\x04\x00\xff\xff\x00\x00\x0c\x5d")
+  time.sleep(1)
+  init_baudrate(pigeon)
+
+
 def init(pigeon: TTYPigeon) -> None:
   # register exit handler
   signal.signal(signal.SIGINT, lambda sig, frame: deinitialize_and_exit(pigeon))
@@ -310,6 +325,8 @@ def init(pigeon: TTYPigeon) -> None:
   time.sleep(0.5)
 
   init_baudrate(pigeon)
+  if COLD_START:
+    factory_reset(pigeon)
   init_pigeon(pigeon)
 
   if COLD_START:
