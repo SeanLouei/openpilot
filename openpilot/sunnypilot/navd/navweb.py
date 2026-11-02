@@ -124,7 +124,11 @@ def read_link(link: str) -> Place:
 
   pairs = COORDINATES.findall(stop)
   if kind == 'dir':
-    pairs += [(latitude, longitude) for longitude, latitude in GOOGLE_STOP.findall(path)[-1:]]
+    # stops have their pairs in order, but only when they have one: with fewer pairs than stops the last pair may be an
+    # earlier stop's, even the start, so it's only the destination's when every stop has one
+    stop_pairs = GOOGLE_STOP.findall(path)
+    if len(stop_pairs) >= len(stops):
+      pairs += [(latitude, longitude) for longitude, latitude in stop_pairs[-1:]]
   pairs += GOOGLE_PLACE.findall(path)[-1:]
   for key in COORDINATE_KEYS:
     pairs += COORDINATES.findall(query.get(key, ''))

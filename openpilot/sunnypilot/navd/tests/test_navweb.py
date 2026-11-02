@@ -170,6 +170,8 @@ class TestLinks(OpenpilotTestCase):
     # the viewport of a search or directions is only where the map was
     ('https://www.google.com/maps/search/costco/@37.6,-122.4,12z', 'costco'),
     ('https://www.google.com/maps/dir/37.70,-122.40/Costco+Wholesale,+South+San+Francisco/@37.68,-122.41,13z', 'Costco Wholesale, South San Francisco'),
+    # only the start has a stop pair: it is never taken for the destination, which is looked up instead
+    ('https://www.google.com/maps/dir/Home/Costco/@37.6,-122.4,12z/data=!4m8!4m7!1m2!2m2!1d-122.3!2d37.5!1m0', 'Costco'),
   ])
   def test_text_only_links(self, link, query):
     place = read_link(link)
