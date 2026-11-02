@@ -127,7 +127,22 @@ class TestNavTurnSpeed(OpenpilotTestCase):
     step(c, submaster(distance=500., modifier='left'), NAV_TURN_SPEED, frames=10)  # navd moved on: still through the turn
     assert c.v_target == NAV_TURN_SPEED
     step(c, submaster(distance=500., modifier='left'), NAV_TURN_SPEED, frames=100)  # 20 m later
-    assert math.isclose(c.v_target, turn_speed_limit(500.), rel_tol=1e-4) and c.hold == 0.
+    assert math.isclose(c.v_target, turn_speed_limit(c.tracker.distance), rel_tol=1e-4) and c.hold == 0.
+
+  def test_signal_latches_while_slowing(self):
+    c = controller(auto=False, turns=True)
+    step(c, submaster(distance=200., blinkers=(False, True)), 20.)  # within 15 m + 12 s at 20 m/s
+    assert c.active
+    step(c, submaster(distance=160., blinkers=(False, True)), 10., frames=20)  # slowing shrinks that distance to 135 m
+    assert c.active
+    step(c, submaster(distance=150.), 10.)  # until the blinker goes off
+    assert not c.active
+
+  def test_completed_turn_is_not_slowed_for_again(self):
+    c = controller()
+    step(c, submaster(distance=5.), NAV_TURN_SPEED, frames=40)  # through the maneuver point
+    step(c, submaster(distance=1.), NAV_TURN_SPEED, frames=100)  # navd still reports it just ahead, for 22 m
+    assert c.tracker.passed and c.hold == 0. and not c.active
 
   def test_below_cruise_only(self):
     c = controller()

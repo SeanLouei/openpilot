@@ -57,8 +57,9 @@ class RouteEngine:
 
     self.recompute_hold = 0
     self.reroute_counter = 0
+    self.gps_ok = True
 
-    self.api = Api(self.params.get("DongleId")) if os.environ.get("MAPBOX_TOKEN") is None else None
+    self.api = Api(self.params.get("DongleId")) if not os.environ.get("MAPBOX_TOKEN") else None
 
   def update(self):
     self.sm.update(0)
@@ -67,6 +68,8 @@ class RouteEngine:
     if source is not None:
       gps = self.sm[source]
       self.last_position, self.last_bearing = (gps.longitude, gps.latitude), gps.bearingDeg
+    # without a fresh fix the distance to the maneuver is frozen, so the instruction is not valid for steering on
+    self.gps_ok = source is not None
     route = self.route
     try:
       self.recompute_route(gps_ok=source is not None)
@@ -153,7 +156,7 @@ class RouteEngine:
   def send_instruction(self):
     msg = messaging.new_message('navInstruction', valid=True)
 
-    if self.step_idx is None:
+    if self.step_idx is None or not self.gps_ok:
       msg.valid = False
       self.pm.send('navInstruction', msg)
       return

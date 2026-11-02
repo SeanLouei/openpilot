@@ -30,27 +30,28 @@ import numpy as np
 
 from openpilot.cereal import log, custom
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import EDGE_CLEARANCE, EDGE_PROB, NEARSIDE_PROB, VEHICLE_EDGE_MARGIN
 
 TurnDirection = custom.ModelDataV2SP.TurnDirection
 
 NAV_INSTRUCTION_MAX_AGE = 2.5  # s, navd publishes once a second
 
-# The model gets a single desire pulse and decides itself when the turn is done, so a route turn only starts
-# its desire once the intersection is close: the pulse then lands on the route's intersection, not an earlier one.
-NAV_TURN_MAX_SPEED = 14.0  # m/s
-NAV_TURN_PREVIEW_TIME = 6.0  # s
-NAV_TURN_PREVIEW_DISTANCE = (35.0, 90.0)  # m
-# An automatic turn, with no blinker to confirm it, also waits until the car has slowed to turning speed
-AUTO_TURN_MAX_SPEED = 7.0  # m/s
-# A started turn holds until just past its maneuver point; navd moves on to the next maneuver 10 m past it
-NAV_TURN_RELEASE_DISTANCE = -5.0  # m
-NAV_NEW_MANEUVER_JUMP = 30.0  # m; the distance growing this much means a different maneuver, after a reroute
+# The model gets a desire as a one-frame pulse and only remembers it for the 5 s its desire history covers, so a route
+# turn pulses about 3 s before the car starts steering into it, and again every 4 s while the car waits short of it
+NAV_TURN_TRIGGER_TIME = 3.0  # s
+NAV_TURN_STEER_DISTANCE = 8.0  # m before the maneuver point where steering into an intersection turn starts
+NAV_TURN_TRIGGER_MIN_SPEED = 0.5  # m/s; a car stopped short of the turn waits, one stopped at it fires
+NAV_TURN_REPULSE_TIME = 4.0  # s
+NAV_TURN_MAX_SPEED = 9.0  # m/s (20 mph); openpilot's lateral acceleration cap leaves faster turns running wide
+AUTO_TURN_MAX_SPEED = 7.0  # m/s; an automatic turn, with no blinker to confirm it, also waits for turning speed
 
-# Drivers signal well before slowing for a turn: a matching blinker this far out is for the route turn, not a lane change
+# A blinker for the route's next turn within this distance is its turn signal, not a lane change, for as long as it stays on
 NAV_TURN_SIGNAL_TIME = 12.0  # s
 NAV_TURN_SIGNAL_BASE_DISTANCE = 15.0  # m
 NAV_TURN_SIGNAL_DISTANCE = (30.0, 250.0)  # m
+
+NAV_NEW_MANEUVER_JUMP = 30.0  # m; the distance growing this much means a different maneuver, after a reroute
 
 # Exits and forks get their keep desire close to the split, closer still when the exit shares lanes with the road
 NAV_KEEP_SPEED_BP = [0.0, 15.0, 30.0]  # m/s
@@ -58,7 +59,8 @@ NAV_KEEP_DISTANCE_V = [25.0, 90.0, 160.0]  # m
 NAV_KEEP_AMBIGUOUS_SPLIT_SCALE = 0.6
 NAV_KEEP_SMALL_SPLIT_MAX_OTHER_LANES = 2
 
-TURN_TYPES = ('turn', 'end of road', 'on ramp')  # Mapbox maneuver types that are turns at an intersection when sided
+# Mapbox maneuver types that are turns at an intersection with a left or right modifier; 'continue' stays on its road
+TURN_TYPES = ('turn', 'end of road', 'on ramp', 'continue')
 SPLIT_TYPES = ('off ramp', 'fork')
 TURN_LEFT, TURN_RIGHT = ('left', 'sharpLeft'), ('right', 'sharpRight')
 LEFT_DIRECTIONS, RIGHT_DIRECTIONS = ('slightLeft', 'left', 'sharpLeft'), ('slightRight', 'right', 'sharpRight')
@@ -118,32 +120,61 @@ def nav_inputs(sm, model) -> NavInputs:
   return NavInputs(instruction, age, bool(sm['carControl'].longActive), outer_lanes(model), not sm['driverMonitoringState'].isRHD)
 
 
-def route_turn(instruction, age: float, v_ego: float) -> tuple[bool, float] | None:
-  """(left, distance in m) of the route's next maneuver when it is a turn at an intersection, else None.
-  navd only updates once a second, so the distance is dead reckoned since then."""
-  maneuver_type = str(instruction.maneuverType).strip().lower()
-  direction = normalize_direction(instruction.maneuverModifier)
-  distance = float(instruction.maneuverDistance) - max(v_ego, 0.) * max(age, 0.)
-  if maneuver_type not in TURN_TYPES or direction not in TURN_LEFT + TURN_RIGHT or not math.isfinite(distance):
-    return None
-  return direction in TURN_LEFT, distance
+def signal_distance(v_ego: float) -> float:
+  return float(np.clip(NAV_TURN_SIGNAL_BASE_DISTANCE + max(v_ego, 0.) * NAV_TURN_SIGNAL_TIME, *NAV_TURN_SIGNAL_DISTANCE))
 
 
-def signals_route_turn(carstate, left: bool, distance: float, v_ego: float) -> bool:
-  """Whether the driver's blinker is for the route turn this far ahead, rather than for a lane change."""
-  blinker = (carstate.leftBlinker and not carstate.rightBlinker) if left else (carstate.rightBlinker and not carstate.leftBlinker)
-  signal_distance = np.clip(NAV_TURN_SIGNAL_BASE_DISTANCE + max(v_ego, 0.) * NAV_TURN_SIGNAL_TIME, *NAV_TURN_SIGNAL_DISTANCE)
-  return bool(blinker and 0. <= distance <= signal_distance)
+def blinker_side(carstate) -> bool | None:
+  """The side (left) of a single blinker, or None with neither or both (hazards)."""
+  return bool(carstate.leftBlinker) if bool(carstate.leftBlinker) != bool(carstate.rightBlinker) else None
+
+
+class ManeuverTracker:
+  """The route's next maneuver and the distance to it, dead reckoned between navd's 1 Hz updates. For one maneuver the
+  distance only ever shrinks, so a frozen or late navd distance never moves it back over a threshold, and once the car
+  passes the maneuver point it stays passed until navd reports a different maneuver."""
+
+  def __init__(self):
+    self.maneuver: tuple[str, str] | None = None  # (type, direction)
+    self.distance = math.inf
+    self.reported = math.inf  # navd's last distance, dead reckoned to when it arrived
+    self.passed = False
+
+  def update(self, instruction, age: float, v_ego: float) -> bool:
+    """Advance one frame, along the last maneuver while there is no instruction. True when a different maneuver began."""
+    v_ego = max(v_ego, 0.)
+    self.distance -= v_ego * DT_MDL
+    new = False
+    if instruction is not None:
+      maneuver = (str(instruction.maneuverType).strip().lower(), normalize_direction(instruction.maneuverModifier))
+      reported = float(instruction.maneuverDistance) - v_ego * max(age, 0.)
+      if math.isfinite(reported):
+        # a reroute jumps navd's distance up; a frozen one, or a turn navd still reports just ahead after it, does not
+        new = maneuver != self.maneuver or reported > self.reported + NAV_NEW_MANEUVER_JUMP
+        if new:
+          self.maneuver, self.distance, self.passed = maneuver, reported, False
+        else:
+          self.distance = min(self.distance, reported)
+        self.reported = reported
+    self.passed |= self.distance < 0.
+    return new
+
+  def turn(self) -> bool | None:
+    """The side (left) of the maneuver when it is a turn at an intersection, else None."""
+    if self.maneuver is None or self.maneuver[0] not in TURN_TYPES or self.maneuver[1] not in TURN_LEFT + TURN_RIGHT:
+      return None
+    return self.maneuver[1] in TURN_LEFT
 
 
 class NavDesireController:
   """Desires from the navigation route.
 
-  Turns: a blinker matching the route's next turn starts a turn desire once that intersection is close. Until then,
-  that blinker is held back from starting a nudgeless lane change or an early lane turn desire. With automatic turns
-  on, openpilot in control of the speed, and the car slowed to turning speed in a lane it can
-  turn from, the turn desire starts without the blinker. A turn desire starts once per maneuver and holds until its
-  maneuver point; after that, only switching the blinker on again restarts it.
+  Turns: a blinker for the route's next turn is that turn's signal until it goes off: it never starts a nudgeless lane
+  change, and it holds back the lane turn desire. About 3 s before the car starts steering into the turn, below 20 mph,
+  the turn desire starts. With automatic turns on, openpilot in control of the speed, and the car slowed to turning speed
+  in a lane it can turn from, it starts without the blinker. A maneuver's turn desire starts once, holds until the
+  maneuver point, and pulses again every 4 s while the car waits short of the turn; after it is called off, only the
+  blinker coming on again restarts it.
   Exits and forks: a nudge toward the side the route's lane guidance takes gives a keep desire near the split.
   """
 
@@ -155,16 +186,21 @@ class NavDesireController:
     self.exit_enabled = False
     self.read_params()
 
+    self.tracker = ManeuverTracker()
+    self.frame = 0
+    self.prev_blinkers = (False, False)
+    self.reset()
+
+  def reset(self) -> None:
+    """Forget any route turn: no desire, no turn signal, nothing held."""
     self.turn_direction = TurnDirection.none
     self.route_turn_signal = False
     self.keep_desire = log.Desire.none
-
-    self.maneuver: tuple[str, str] | None = None  # (type, direction) of the route's current maneuver
-    self.maneuver_distance = math.inf
-    self.started = False  # a turn desire has already started for the current maneuver
-    self.holding: bool | None = None  # the turn being held, as left, while its desire is on
-    self.held_by_blinker = False
-    self.prev_blinkers = (False, False)
+    self.route_blinker: bool | None = None  # the side (left) of a blinker latched as the route turn's signal
+    self.turning: bool | None = None  # the side (left) of the turn desire being held
+    self.turn_by_blinker = False
+    self.started = False  # the current maneuver's turn desire has started
+    self.pulse_frame = 0
 
   def read_params(self) -> None:
     self.turn_enabled = self.params.get_bool("NavTurnDesire")
@@ -176,61 +212,74 @@ class NavDesireController:
       self.read_params()
     self.param_read_counter += 1
 
-  def update(self, carstate, lateral_active: bool, nav: NavInputs | None) -> None:
+  def update(self, carstate, lateral_active: bool, nav: NavInputs | None, lane_changing: bool = False, lane_turning: bool = False) -> None:
+    """lane_changing: a lane change is under way, so no turn starts. lane_turning: the lane turn desire already went out
+    for this blinker, so the route does not take the blinker over, which would end that desire and pulse again."""
+    self.frame += 1
     self.turn_direction = TurnDirection.none
-    self.route_turn_signal = False
     self.keep_desire = log.Desire.none
     blinkers = (bool(carstate.leftBlinker), bool(carstate.rightBlinker))
     prev_blinkers, self.prev_blinkers = self.prev_blinkers, blinkers
+    side = blinker_side(carstate)
 
-    instruction = nav.instruction if nav is not None else None
-    if instruction is None or not lateral_active:
-      self.holding = None  # the maneuver is remembered, so a short gap never restarts a turn already started
-      return
-
+    nav = nav if nav is not None else NavInputs()
     v_ego = max(float(carstate.vEgo), 0.)
-    distance = float(instruction.maneuverDistance) - v_ego * max(nav.age, 0.)
-    maneuver = (str(instruction.maneuverType).strip().lower(), normalize_direction(instruction.maneuverModifier))
-    if maneuver != self.maneuver or not distance <= self.maneuver_distance + NAV_NEW_MANEUVER_JUMP:
-      self.started, self.holding = False, None
-    self.maneuver, self.maneuver_distance = maneuver, distance
+    if self.tracker.update(nav.instruction, nav.age, v_ego):
+      self.started, self.turning = False, None
+    turn = self.tracker.turn()
+    route_turns = self.turn_enabled or self.auto_enabled
 
-    turn = route_turn(instruction, nav.age, v_ego)
-    if turn is not None and (self.turn_enabled or self.auto_enabled):
-      self._update_turn(carstate, nav, v_ego, *turn, blinkers, prev_blinkers, instruction.lanes)
-    elif self.exit_enabled and maneuver[0] in SPLIT_TYPES and maneuver[1] in LEFT_DIRECTIONS + RIGHT_DIRECTIONS and math.isfinite(distance):
-      self._update_keep(carstate, v_ego, distance, instruction.lanes)
+    # the blinker stays the route turn's signal until it goes off or over to the other side, whatever the speed or route does
+    if side is None or side != self.route_blinker or not lateral_active:
+      self.route_blinker = None
+    if (route_turns and lateral_active and self.route_blinker is None and side is not None and side == turn and nav.instruction is not None
+        and not lane_turning and not self.tracker.passed and self.tracker.distance <= signal_distance(v_ego)):
+      self.route_blinker = side
+    self.route_turn_signal = self.route_blinker is not None
 
-  def _update_turn(self, carstate, nav: NavInputs, v_ego: float, left: bool, distance: float, blinkers, prev_blinkers, lanes) -> None:
-    blinker = blinkers == ((True, False) if left else (False, True))
-    blinker_on_again = blinker and not prev_blinkers[0 if left else 1]
-    self.route_turn_signal = signals_route_turn(carstate, left, distance, v_ego)
+    if self.turning is not None:
+      self._hold_turn(carstate, nav, lateral_active, side)
+    elif route_turns and turn is not None and lateral_active and not lane_changing and nav.instruction is not None:
+      self._start_turn(carstate, nav, v_ego, turn, side, prev_blinkers, nav.instruction.lanes)
 
-    if self.holding is not None:
-      if self.held_by_blinker:
-        called_off = not blinker  # the blinker went off, or over to the other side
-      else:
-        called_off = (any(blinkers) and not blinker) or not nav.long_active
-      if distance < NAV_TURN_RELEASE_DISTANCE or called_off:
-        self.holding = None
-      else:
-        self.turn_direction = TurnDirection.turnLeft if self.holding else TurnDirection.turnRight
-        return
+    if (self.exit_enabled and self.turning is None and nav.instruction is not None and self.tracker.maneuver is not None and lateral_active
+        and self.tracker.maneuver[0] in SPLIT_TYPES and self.tracker.maneuver[1] in LEFT_DIRECTIONS + RIGHT_DIRECTIONS):
+      self._update_keep(carstate, v_ego, self.tracker.distance, nav.instruction.lanes)
 
-    preview_distance = np.clip(v_ego * NAV_TURN_PREVIEW_TIME, *NAV_TURN_PREVIEW_DISTANCE)
-    blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
-    if not 0. <= distance <= preview_distance or carstate.standstill or blindspot:
+  def _start_turn(self, carstate, nav: NavInputs, v_ego: float, left: bool, side: bool | None, prev_blinkers, lanes) -> None:
+    if self.tracker.passed or (carstate.leftBlindspot if left else carstate.rightBlindspot):
       return
-    if self.started and not blinker_on_again:
+    if self.started and not (side == left and not prev_blinkers[0 if left else 1]):
+      return  # this maneuver already had its turn: only the blinker coming on again restarts it
+    time_to_steer = max(self.tracker.distance - NAV_TURN_STEER_DISTANCE, 0.) / max(v_ego, NAV_TURN_TRIGGER_MIN_SPEED)
+    if time_to_steer > NAV_TURN_TRIGGER_TIME:
       return
 
-    if blinker and v_ego < NAV_TURN_MAX_SPEED:
-      self.held_by_blinker = True
-    elif self.auto_enabled and not any(blinkers) and self._auto_turn_allowed(nav, v_ego, left, lanes):
-      self.held_by_blinker = False
+    if self.route_blinker == left and v_ego < NAV_TURN_MAX_SPEED:
+      self.turn_by_blinker = True
+    elif self.auto_enabled and not (carstate.leftBlinker or carstate.rightBlinker) and self._auto_turn_allowed(nav, v_ego, left, lanes):
+      self.turn_by_blinker = False
     else:
       return
-    self.started, self.holding = True, left
+    self.started, self.turning, self.pulse_frame = True, left, self.frame
+    self.turn_direction = TurnDirection.turnLeft if left else TurnDirection.turnRight
+
+  def _hold_turn(self, carstate, nav: NavInputs, lateral_active: bool, side: bool | None) -> None:
+    left = self.turning
+    if self.turn_by_blinker:
+      called_off = side != left  # the blinker went off, or over to the other side
+    else:
+      called_off = ((carstate.leftBlinker or carstate.rightBlinker) and side != left) or not nav.long_active
+    if called_off or not lateral_active or self.tracker.passed:
+      self.turning = None
+      return
+
+    # while the car waits short of the turn, a fresh pulse keeps it inside the model's desire history
+    waiting = self.tracker.distance > NAV_TURN_STEER_DISTANCE or carstate.standstill
+    blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
+    if waiting and not blindspot and (self.frame - self.pulse_frame) * DT_MDL >= NAV_TURN_REPULSE_TIME:
+      self.pulse_frame = self.frame + 1  # no desire for this frame, so the next one is a new rising edge
+      return
     self.turn_direction = TurnDirection.turnLeft if left else TurnDirection.turnRight
 
   @staticmethod

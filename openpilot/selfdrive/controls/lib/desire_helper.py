@@ -1,6 +1,7 @@
 from openpilot.cereal import log, custom
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
+from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeController, AutoLaneChangeMode
 from openpilot.sunnypilot.selfdrive.controls.lib.lane_turn_desire import LaneTurnController
 from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NavDesireController
@@ -30,6 +31,7 @@ class DesireHelper:
     self.lane_turn_controller = LaneTurnController(self)
     self.lane_turn_direction = TurnDirection.none
     self.nav_desire = NavDesireController()
+    self.nav_desire_failed = False
 
   @staticmethod
   def get_lane_change_direction(CS):
@@ -48,12 +50,24 @@ class DesireHelper:
                                                left_blinker=carstate.leftBlinker, right_blinker=carstate.rightBlinker, v_ego=v_ego)
     self.lane_turn_direction = self.lane_turn_controller.get_turn_direction()
 
-    # A blinker for the route's next turn gets its turn desire once that intersection is close, and not before
-    self.nav_desire.update(carstate, lateral_active, nav)
-    if self.nav_desire.turn_direction != TurnDirection.none or self.nav_desire.route_turn_signal:
+    # Route turns: a blinker for the route's next turn gets that turn's desire shortly before it, and no other desire.
+    # A route message the controller cannot read must never stop the driving model, so it only drops the route turn.
+    lane_turning = self.desire in (log.Desire.turnLeft, log.Desire.turnRight) and self.nav_desire.turning is None \
+                   and not self.nav_desire.route_turn_signal
+    try:
+      self.nav_desire.update(carstate, lateral_active, nav, self.lane_change_state == LaneChangeState.laneChangeStarting, lane_turning)
+    except Exception:
+      if not self.nav_desire_failed:
+        cloudlog.exception("desire_helper.nav_desire_failed")
+      self.nav_desire_failed = True
+      self.nav_desire.reset()
+    route_turning = self.nav_desire.turning is not None
+    if route_turning or self.nav_desire.route_turn_signal:
       self.lane_turn_direction = self.nav_desire.turn_direction
 
-    if not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX or self.alc.lane_change_set_timer == AutoLaneChangeMode.OFF:
+    # a route turn holds the lane change off, so no lane change waits hidden behind its turn desire
+    if (not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX or self.alc.lane_change_set_timer == AutoLaneChangeMode.OFF
+        or route_turning):
       self.lane_change_state = LaneChangeState.off
       self.lane_change_direction = LaneChangeDirection.none
       self.lane_change_timer = 0.0

@@ -581,8 +581,8 @@
               "key": "NavTurnDesire",
               "widget": "toggle",
               "title": "Navigation Turn Desires",
-              "description": "With a route, signal for its next turn. When openpilot controls the speed, the car slows to turning speed; it plans the turn once the intersection is close, below 31 mph (50 km/h). That blinker never starts a nudgeless lane change, though a nudge still changes lanes.",
-              "details": "With the car's own cruise control, slow to turning speed yourself. The model chooses the opening to turn into, so stay ready to steer.",
+              "description": "With a route, signal for its next turn. The car plans the turn about 3 seconds before it, below 20 mph (32 km/h), and slows to turning speed when openpilot controls the speed. While that blinker is on it never starts an automatic lane change, though a nudge still changes lanes before the turn begins.",
+              "details": "With the car's own cruise control, slow to turning speed yourself. Route turns need a GPS fix. The model chooses the opening to turn into, so stay ready to steer.",
               "enablement": [
                 {
                   "type": "param",
@@ -609,7 +609,7 @@
               "key": "NavExitDesire",
               "widget": "toggle",
               "title": "Navigation Exit Desires (Alpha)",
-              "description": "Near a route exit or fork with lane guidance, a light steering nudge toward it, without the opposite blinker, has the car keep to that side of the split.",
+              "description": "Near a route exit or fork with lane guidance, a light steering nudge toward it has the car keep to that side of the split. Above 20 mph with your blinker on, a nudge changes lanes instead.",
               "enablement": [
                 {
                   "type": "param",

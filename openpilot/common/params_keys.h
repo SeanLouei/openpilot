@@ -264,7 +264,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"NavTurnDesire", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // navigation
-    {"MapboxToken", {PERSISTENT, STRING}},
+    {"MapboxToken", {PERSISTENT | DONT_LOG, STRING}},
 
     // mapd
     {"MapAdvisorySpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, FLOAT}},
