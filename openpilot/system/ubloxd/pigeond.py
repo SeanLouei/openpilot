@@ -283,18 +283,16 @@ def deinitialize_and_exit(pigeon: TTYPigeon | None):
   set_power(False)
   sys.exit(0)
 
-# A comma 4 whose u-blox answers but hears no satellites at all (0 measured, normal noise and gain, no jamming), where the
-# same pigeond got fixes before: start the receiver cold and without aiding, so nothing it saved or is given (navigation data,
-# almanac backup, time, position, AssistNow) can keep it from searching the whole sky, and start its GNSS explicitly, since
-# pigeond stops it on exit and the power cycle may not reach the chip.
-COLD_START = True
+# A comma 4's u-blox answered but heard no satellites at all (0 measured, normal noise and gain, no jamming) through a power
+# cut, a cold start and a cold start without aiding, while the same pigeond got fixes before; a factory reset (saved
+# configuration and flash backup erased) brought the satellites back. So at every start, erase what the chip keeps across
+# power cycles before configuring it, and start its GNSS explicitly, since pigeond stops it on exit and the power cycle may
+# not reach the chip. The usual aiding (time, last position, AssistNow) follows: through a windshield, a receiver without it
+# hears satellites it can't use until it decodes their orbits itself.
+FACTORY_RESET = True
 
 
-def cold_start(pigeon: TTYPigeon) -> None:
-  cloudlog.warning("Cold starting ublox")
-  # UBX-CFG-RST: clear all navigation data (cold start), controlled software reset of the GNSS only (the configuration stays)
-  pigeon.send(add_ubx_checksum(b"\xB5\x62\x06\x04\x04\x00\xFF\xFF\x02\x00"))
-  time.sleep(1)
+def start_gnss(pigeon: TTYPigeon) -> None:
   # UBX-CFG-RST: controlled GNSS start
   pigeon.send(add_ubx_checksum(b"\xB5\x62\x06\x04\x04\x00\x00\x00\x09\x00"))
 
@@ -325,13 +323,13 @@ def init(pigeon: TTYPigeon) -> None:
   time.sleep(0.5)
 
   init_baudrate(pigeon)
-  if COLD_START:
+  if FACTORY_RESET:
     factory_reset(pigeon)
   init_pigeon(pigeon)
+  if FACTORY_RESET:
+    start_gnss(pigeon)
 
-  if COLD_START:
-    cold_start(pigeon)
-  elif system_time_valid():
+  if system_time_valid():
     try:
       send_time(pigeon)
       send_position(pigeon)
@@ -363,7 +361,7 @@ def run_receiving(duration: int = 0):
   threading.Thread(target=download_assistnow, daemon=True).start()
 
   while (duration == 0) or (time.monotonic() - start_time < duration):
-    if assist_messages is not None and not assist_attempted and not COLD_START:
+    if assist_messages is not None and not assist_attempted:
       assist_attempted = True
       try:
         for msg in assist_messages:
