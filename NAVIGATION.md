@@ -332,7 +332,7 @@ navigation can use your iPhone's GPS instead. It's off by default.
 
 Its limits:
 
-- The app must keep running. If iOS stops it, or the comma leaves the hotspot, the phone's fixes stop, and within 2
+- The app must keep running. If iOS stops it, or the comma leaves the hotspot, the phone's fixes stop, and within about 3
   seconds navigation goes back to the comma's own GPS, then to the phone again once its fixes come back. When one of the
   phone's fixes isn't used, navigation may take the comma's own GPS for a moment too, until the phone's next.
 - The phone's fixes reach the comma about a second after they were taken, while the car drives on. As long as the
@@ -520,7 +520,7 @@ Its limits:
   While the phone's clock agrees with the comma's (a fix's NMEA time from 1 s after its arrival on the comma's clock to
   `PHONE_MAX_DELAY`, 2 s, before it), the fix goes out with that time as `unixTimestampMillis`, and navd adds `fix_delay`
   (`helpers.py`: the comma's clock at the arrival less that time) to the fix's age, counted from `logMonoTime` (its arrival)
-  and clamped to 1.5 s; one taken 2 to 10 s before it arrived is dropped (`delayed`). Otherwise the clocks differ: the fix
+  and clamped to 3 s; one taken 2 to 10 s before it arrived is dropped (`delayed`). Otherwise the clocks differ: the fix
   goes out with the arrival's time, a `fix_delay` of 0, so a clock difference never moves a position, and the navigation
   page says so (`PhoneGpsStatus`'s `clock`). A fix arriving more than 1.5 s later than the phone's fastest lately, against
   the monotonic clock, is dropped (`late`). After 5 s without a fix, two in a row must agree in time and place before one
@@ -528,6 +528,8 @@ Its limits:
   course at 1 m/s and up), a jump beyond 1.5 times the faster speed's travel plus 30 m. Its link, what comes in and
   whether the clocks agree go to `PhoneGpsStatus` for navweb's Phone GPS line.
   `latest_gps_source` takes a fresh phone fix over the u-blox's while it lasts, so the two don't alternate at every fix;
-  once the phone's last is 2 s old, as when the one after it was dropped, it takes the u-blox's until the phone's next.
+  once navd received the phone's last 2 s ago, as when the one after it was dropped, it takes the u-blox's until the
+  phone's next. navd receives a fix at its next update, up to a second after it arrived, so a phone fix may be in use until
+  3 s after its arrival: its age is clamped to 3 s (`PHONE_MAX_FIX_AGE`), a u-blox fix's still to 1.5 s.
 - Params: `NavTurnDesire`, `NavAutoTurn`, `NavAutoTurnFarSide` and `NavAutoTurnLane` (neither backed up), `NavExitDesire`,
   `MapboxToken` (not logged), `PhoneGps` (backed up), `PhoneGpsPort`, `PhoneGpsHost`, `PhoneGpsStatus` (phonegpsd's). Events: `navTurnSlowing`, `navTurnAcross`, `navTurnSignal`, `navTurnLane`.

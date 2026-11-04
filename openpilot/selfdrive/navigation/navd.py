@@ -11,7 +11,7 @@ from openpilot.common.api import API_HOST, Api
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.navigation.helpers import fix_delay, latest_gps_source
+from openpilot.selfdrive.navigation.helpers import PHONE, fix_delay, latest_gps_source
 from openpilot.selfdrive.navigation.route import bearing, cumulative_distance, local_meters, nearest_segment, point_along, project_onto_path
 
 REROUTE_DISTANCE = 25
@@ -21,6 +21,9 @@ REROUTE_COUNTER_MIN = 3
 ROUTE_RESEND_PERIOD = 10  # updates (seconds); a restarted mapsd gets the route within this
 RECOMPUTE_HOLD = 10  # updates (seconds) between route requests
 MAX_FIX_AGE = 1.5  # s; navd may read a fix a second late, so the published distances count the car's travel since, up to this
+# A phone fix stays in use until 2 s after navd received it (latest_gps_source), up to a second after it was published, so
+# it may be up to 3 s old: the car's travel counts for all of that, or the distance to the turn would come out long
+PHONE_MAX_FIX_AGE = 3.  # s
 
 # The next step of a U-turn, a sharp turn or a roundabout turnaround runs right beside the road the car comes on, so the car
 # takes a maneuver only once it reached the maneuver point and heads along the route after it
@@ -180,6 +183,7 @@ class RouteEngine:
     self.last_speed = 0.  # m/s
     self.fix_time = None  # monotonic s the last fix was published
     self.fix_delay = 0.  # s it was taken before that
+    self.max_fix_age = MAX_FIX_AGE  # s since then its age counts up to, by its source
 
     self.nav_destination = None  # the destination of the route
     self.requested_destination = None  # the destination of the last route request, also when it failed
@@ -226,6 +230,7 @@ class RouteEngine:
       self.last_position, self.last_bearing, self.last_speed = (gps.longitude, gps.latitude), gps.bearingDeg, gps.speed
       self.last_bearing_accuracy = gps.bearingAccuracyDeg
       self.fix_time, self.fix_delay = self.sm.logMonoTime[source] * 1e-9, fix_delay(self.sm, source)
+      self.max_fix_age = PHONE_MAX_FIX_AGE if gps.source == PHONE else MAX_FIX_AGE
     # without a fresh fix the distance to the maneuver is frozen, so the instruction is not valid for steering on
     self.gps_ok = source is not None
     route = self.route
@@ -353,7 +358,7 @@ class RouteEngine:
 
     # Current instruction, for where the car is as it goes out: the fix may be a second old as navd reads it, and the phone's
     # was taken about a second before it was published, which counts too (fix_delay)
-    fix_age = float(np.clip(time.monotonic() - self.fix_time, 0., MAX_FIX_AGE)) + self.fix_delay if self.fix_time is not None else 0.
+    fix_age = float(np.clip(time.monotonic() - self.fix_time, 0., self.max_fix_age)) + self.fix_delay if self.fix_time is not None else 0.
     maneuver_distance = distance_to_maneuver - self.last_speed * fix_age
     msg.navInstruction.maneuverDistance = maneuver_distance
     set_banner(msg.navInstruction, banner_step['bannerInstructions'], maneuver_distance)

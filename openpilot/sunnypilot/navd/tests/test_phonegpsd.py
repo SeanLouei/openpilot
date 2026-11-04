@@ -25,7 +25,7 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.navigation.helpers import PHONE_MAX_DELAY, latest_gps_source
-from openpilot.selfdrive.navigation.navd import MAX_FIX_AGE
+from openpilot.selfdrive.navigation.navd import MAX_FIX_AGE, PHONE_MAX_FIX_AGE
 from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE
 from openpilot.sunnypilot.navd import phonegpsd
 from openpilot.sunnypilot.navd.navweb import NavWeb
@@ -364,15 +364,22 @@ class TestClockDifference(OpenpilotTestCase):
   allow for that while the comma's clock and the phone's agree, and not change with their difference otherwise, also a
   large one before the comma has had network time."""
 
-  def instruction(self, offset: float, delay: float, latency: float = .3, speed: float = 10.) -> tuple[float, float, int]:
+  def instruction(self, offset: float, delay: float, latency: float = .3, speed: float = 10., received: float = 0.,
+                  ublox: bool = False) -> tuple[float, float, int]:
     """navd's distance to the route's first turn delay s after the phone's third fix arrived, the fixes arriving latency s
-    after they were taken, with the comma's clock offset s from the phone's; the car's own distance then, driving on at
-    speed (m/s); and that fix's unixTimestampMillis."""
+    after they were taken, with the comma's clock offset s from the phone's, and navd receiving that fix received s after it
+    arrived; the car's own distance then, driving on at speed (m/s); and that fix's unixTimestampMillis. ublox: the same fix
+    comes from the u-blox instead, on gpsLocationExternal."""
     fixes = PhoneFixes()
     *_, message = drive(fixes, 3, latency=latency, offset=offset, speed=speed)
+    fix = message.gpsLocation
+    if ublox:
+      message = messaging.new_message('gpsLocationExternal', valid=True, logMonoTime=message.logMonoTime)
+      message.gpsLocationExternal = fix
+      message.gpsLocationExternal.source = 'ublox'
     arrived = R0 + 2 + latency
     sm, pm = gps_submaster(), MagicMock()
-    sm.update_msgs(arrived, [messaging.log_from_bytes(message.to_bytes())])
+    sm.update_msgs(arrived + received, [messaging.log_from_bytes(message.to_bytes())])
     engine = route_engine({'NavDestination': {'latitude': 500 / METERS_PER_DEGREE, 'longitude': 200 / METERS_PER_DEGREE}}, sm, pm)
     response = MagicMock(status_code=200)
     response.json.return_value = {'routes': [{'legs': [{'steps': ROUTE}]}]}  # 300 m north to a right turn
@@ -381,7 +388,7 @@ class TestClockDifference(OpenpilotTestCase):
       engine.update()
     instruction = next(call.args[1] for call in reversed(pm.send.call_args_list) if call.args[0] == 'navInstruction')
     assert instruction.valid
-    return instruction.navInstruction.maneuverDistance, 300. - (100. + speed * (2 + latency + delay)), message.gpsLocation.unixTimestampMillis
+    return instruction.navInstruction.maneuverDistance, 300. - (100. + speed * (2 + latency + delay)), fix.unixTimestampMillis
 
   def test_delay_allowed_for(self):
     # with the clocks agreeing, navd counts a fix's age from when it was taken: its distance is the car's, however long the
@@ -395,12 +402,28 @@ class TestClockDifference(OpenpilotTestCase):
       distance, true, _ = self.instruction(offset, .6)
       assert abs(distance - true) <= 10. * abs(offset) + .01, (offset, distance, true)
 
+  def test_phone_fixes_stop(self):
+    # the phone's fixes stop after one navd received at its next update, up to a second after it was published. navd goes
+    # on with it for 2 s after that (latest_gps_source): a second later and, as its updates jitter, just under 2 s later, up
+    # to 3 s after it was published. All of that counts, where 1.5 s did and the distance came out up to 35 m long.
+    for received, delay in ((.6, 1.6), (.6, 2.55), (.95, 1.95), (.95, 2.9)):
+      for speed in (8., 15., 25.):
+        distance, true, _ = self.instruction(0., delay, speed=speed, received=received)
+        assert abs(distance - true) < .5, (received, delay, speed, distance, true)
+
+  def test_ublox_age_unchanged(self):
+    # the same fix from the u-blox, read as late: its age counts up to MAX_FIX_AGE, as before
+    for received, delay in ((0., .6), (.6, 1.6), (.6, 2.55), (.95, 1.95), (.95, 2.9)):
+      for speed in (8., 15., 25.):
+        distance, true, _ = self.instruction(0., delay, 0., speed, received, ublox=True)
+        assert abs(distance - (true + speed * max(delay - MAX_FIX_AGE, 0.))) < .01, (received, delay, speed, distance, true)
+
   def test_comma_clock_off(self):
     # clocks that differ more: a fix counts from its arrival, the same whatever the difference
-    for delay in (.6, 1.9):  # the age navd counts the car's travel for, up to MAX_FIX_AGE
+    for delay in (.6, 1.9):  # the age navd counts the car's travel for, up to PHONE_MAX_FIX_AGE
       distances = {offset: self.instruction(offset, delay)[0] for offset in (CLOCK_DIFFERENCE + .5, 60., -5., -60.)}
       assert len(set(distances.values())) == 1, distances
-      assert abs(distances[60.] - (180. - 10. * min(delay, MAX_FIX_AGE))) < .01, distances
+      assert abs(distances[60.] - (180. - 10. * min(delay, PHONE_MAX_FIX_AGE))) < .01, distances
     # a difference that could as well be a delay (test_delayed_fixes): no fix goes out
     fixes = PhoneFixes()
     assert drive(fixes, 3, offset=5.) == [] and fixes.data_state(R0 + 2.3) == 'delayed'
