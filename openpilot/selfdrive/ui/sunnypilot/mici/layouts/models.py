@@ -144,10 +144,17 @@ class ModelsLayoutMici(NavScroller):
                                            description=tr("Near a route exit or fork with lane guidance, a light steering nudge toward it has the car " +
                                                           "keep to that side of the split. Above 20 mph with your blinker on, a nudge " +
                                                           "changes lanes instead."))
+    self.phone_gps_toggle = BigParamControl(tr("phone GPS (alpha)"), "PhoneGps",
+                                            description=tr("Navigation uses your iPhone's GPS in place of the comma's own, which " +
+                                                           "hears little in some cars, and the comma's whenever the phone's stops. " +
+                                                           "Needs an iPhone app that shares its GPS over Wi-Fi, such as GPS2IP in " +
+                                                           "socket mode on port 11123, kept running in the background, and the " +
+                                                           "comma on the iPhone's hotspot. Check it on the navigation page's GPS " +
+                                                           "details."))
 
     self.main_items = [self.current_model_info, self.select_model_btn, self.cancel_download_btn, self.refresh_btn, self.clear_cache_btn,
                        self.blendful_toggle, self.nav_turn_toggle, self.nav_auto_turn_toggle, self.nav_far_turn_toggle, self.nav_turn_lane_toggle,
-                       self.nav_exit_toggle]
+                       self.nav_exit_toggle, self.phone_gps_toggle]
     self._scroller.add_widgets(self.main_items)
 
   @property
@@ -265,6 +272,7 @@ class ModelsLayoutMici(NavScroller):
     self.nav_far_turn_toggle.refresh()
     self.nav_turn_lane_toggle.refresh()
     self.nav_exit_toggle.refresh()
+    self.phone_gps_toggle.refresh()
 
   def _update_state(self):
     super()._update_state()
@@ -299,6 +307,12 @@ class ModelsLayoutMici(NavScroller):
     self.nav_turn_lane_toggle.set_enabled(navigation and auto_turns and (ui_state.is_offroad() or lane_checked))
     if self.nav_turn_lane_toggle.value != far_value:
       self.nav_turn_lane_toggle.set_value(far_value)
+    # phone GPS works only with navigation on, and shows as off without it, whatever the param says
+    self.phone_gps_toggle.set_checked(navigation and ui_state.params.get_bool("PhoneGps"))
+    self.phone_gps_toggle.set_enabled(navigation)
+    phone_value = "" if navigation else tr("needs navigation")
+    if self.phone_gps_toggle.value != phone_value:
+      self.phone_gps_toggle.set_value(phone_value)
 
     manager = self.model_manager
     self._download_frame += 1

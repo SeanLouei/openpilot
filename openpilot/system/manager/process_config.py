@@ -69,6 +69,11 @@ def navigation_web(started: bool, params: Params, CP: car.CarParams) -> bool:
   # offroad too, so a destination can be set before the drive starts
   return params.get_bool("NavigationEnabled")
 
+def phone_gps(started: bool, params: Params, CP: car.CarParams) -> bool:
+  # Only beside a u-blox, which publishes gpsLocationExternal: elsewhere qcomgpsd publishes gpsLocation, and the phone's
+  # fixes would mix with its own there, which more than navigation reads
+  return started and params.get_bool("NavigationEnabled") and params.get_bool("PhoneGps") and ublox_available()
+
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
@@ -186,6 +191,7 @@ procs += [
 
   # navigation
   PythonProcess("navweb", "openpilot.sunnypilot.navd.navweb", navigation_web),
+  PythonProcess("phonegpsd", "openpilot.sunnypilot.navd.phonegpsd", phone_gps),
 
   # mapd
   NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),

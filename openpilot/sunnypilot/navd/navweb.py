@@ -71,6 +71,32 @@ ANTENNA = {'ok': 'antenna OK', 'short': 'antenna short-circuited', 'open': 'ante
            'init': 'antenna check starting', 'dontknow': "antenna check not available on this chip"}
 ANTENNA_POWER = {'on': 'antenna powered', 'off': 'antenna not powered', 'dontknow': 'antenna power unknown'}
 AGC_FULL_SCALE = 8191  # the u-blox's gain control count at full scale: the weaker the signal from the antenna, the higher
+# Phone GPS: phonegpsd, which the manager runs while the car is on, with PhoneGps on beside a u-blox, publishes the phone's
+# fixes as gpsLocation (source iOS), and writes how it's linked to the phone and what comes in to PhoneGpsStatus
+PHONE_PROCESS = 'phonegpsd'
+PHONE_LINKS = {
+  'connected': 'connected to the phone at {host}',
+  'udp': 'receiving from the phone at {host} over UDP',
+  'connecting': 'connecting to the phone at {host}, port {port}',
+  'refused': 'not connected: the phone at {host} refuses port {port}: is the app sharing in socket mode on that port?',
+  'unreachable': "not connected: can't reach the phone at {host}: is the comma on the iPhone's hotspot?",
+  'timeout': "not connected: the phone at {host} doesn't answer on port {port}: is the app running?",
+  'closed': 'not connected: the phone closed the connection',
+  'silent': 'not connected: the connection went quiet',
+  'failed': 'not connected',
+  'no_wifi': "not connected: the comma isn't on Wi-Fi: join the iPhone's hotspot",
+  'no_gateway': "not connected: the comma's Wi-Fi has no gateway: join the iPhone's hotspot",
+}
+PHONE_DATA = {
+  'starting': 'checking its first fixes',
+  'inaccurate': 'its fixes are too inaccurate to use',
+  'late': 'its fixes arrive late, held up on the way: not used',
+  'jump': 'its fixes jump farther than the car could drive: not used',
+  'incomplete': 'its fixes have no speed or course: not used',
+  'no_fix': 'the phone has no GPS fix',
+  'no_rmc': "no RMC sentences, which have the speed and date: turn on RMC in the app's NMEA settings",
+  'unreadable': "its data can't be read as NMEA (with GPS2IP, set the iPhone to 24-hour time)",
+}
 
 
 class Place(NamedTuple):
@@ -326,9 +352,9 @@ def location(sm, service: str, used: bool) -> dict:
           'verticalAccuracy': known(field(message, 'verticalAccuracy'), float), 'speed': known(field(message, 'speed'), float), 'used': used}
 
 
-def gps_processes(manager_state) -> dict[str, dict | None]:
-  """Each GPS process as the manager last reported it, None for one it didn't list."""
-  processes: dict[str, dict | None] = dict.fromkeys(GPS_PROCESSES)
+def gps_processes(manager_state, names: tuple[str, ...] = GPS_PROCESSES) -> dict[str, dict | None]:
+  """Each of these processes as the manager last reported it, None for one it didn't list."""
+  processes: dict[str, dict | None] = dict.fromkeys(names)
   try:
     listed = list(field(manager_state, 'processes') or [])
   except TypeError:  # not a list
@@ -360,13 +386,21 @@ class GpsDetails:
     self.antenna: str | None = None
     self.hardware: dict | None = None  # the chip's last hardware report: antenna check and power, noise, gain and interference
     self.hardware_time: float | None = None
+    self.source: str | None = None  # where latest_gps_source took the position from: the phone or the comma, else None
+    self.phone_process: dict | None = None  # phonegpsd as the manager last reported it
+    self.phone_fix: tuple[float | None, dict] | None = None  # (when received, the message) of the phone's last fix
 
   def update(self, sm, source: str | None) -> None:
     """After each update of sm, with the service latest_gps_source took the position from."""
     for service in GPS_SERVICES:
       self.locations[service] = received(sm, service), location(sm, service, source == service)
+    phone = name_of(lambda: entry(sm, 'gpsLocation').source) == 'iOS'  # phonegpsd's, where qcomgpsd's would be on another device
+    self.source = None if source is None else 'phone' if source == 'gpsLocation' and phone else 'comma'
+    if phone and entry(field(sm, 'updated'), 'gpsLocation') is True:
+      self.phone_fix = received(sm, 'gpsLocation'), location(sm, 'gpsLocation', self.source == 'phone')
     if entry(field(sm, 'updated'), 'managerState') is True:
       self.processes, self.processes_time = gps_processes(entry(sm, 'managerState')), received(sm, 'managerState')
+      self.phone_process = gps_processes(entry(sm, 'managerState'), (PHONE_PROCESS,))[PHONE_PROCESS]
     if entry(field(sm, 'updated'), 'ubloxGnss') is True:
       # ubloxGnss carries reports of several kinds, and the SubMaster only keeps the last message: each of these is from
       # the last report of its kind
@@ -383,13 +417,17 @@ class GpsDetails:
                          'interference': known(field(hardware, 'jamInd'), int)}
         self.hardware_time = self.ublox_time
 
-  def state(self, started: bool | None, ublox_available: bool | None) -> dict:
+  def state(self, started: bool | None, ublox_available: bool | None, phone_gps: bool = False, phone_status=None) -> dict:
+    """The details, and with phone GPS on (phone_gps), the phone's too: phone_status is what phonegpsd last wrote."""
     now = time.monotonic()
     details = {'started': started, 'ubloxAvailable': ublox_available, 'processes': self.processes, 'processesAge': age(now, self.processes_time),
                **{service: {**message, 'age': age(now, then)} for service, (then, message) in self.locations.items()},
                'ubloxGnss': {'seen': self.ublox_time is not None, 'age': age(now, self.ublox_time), 'satellites': self.satellites,
                              'satellitesAge': age(now, self.satellites_time), 'antenna': self.antenna,
                              'hardware': self.hardware, 'hardwareAge': age(now, self.hardware_time)}}
+    if phone_gps:
+      fix = None if self.phone_fix is None else {**self.phone_fix[1], 'age': age(now, self.phone_fix[0])}
+      details['phone'] = {'process': self.phone_process, 'status': phone_state(phone_status), 'fix': fix, 'source': self.source}
     return {**details, 'summary': gps_summary(details)}
 
 
@@ -451,6 +489,8 @@ def receiver_words(details: dict, receiver: str) -> list[str]:
     words.append('no fix yet')
   elif message['hasFix'] and message['used']:
     words.append('has a fix')
+  elif message['hasFix'] and message['valid'] and (details.get('phone') or {}).get('source') == 'phone' and (message['age'] or 0) < 2:
+    words.append("has a fix, but navigation uses the phone's")  # while the phone has a fresh one: only with phone GPS on
   elif message['hasFix']:  # latest_gps_source takes a fix only from a valid message under 2 s old
     words.append("has a fix, but it's marked invalid" if message['valid'] is False else "has a fix, but it's too old to use")
 
@@ -495,6 +535,45 @@ def heard_from(details: dict, receiver: str) -> bool:
   return bool(runs or details[service]['seen'] or (receiver == 'u-blox' and details['ubloxGnss']['seen']))
 
 
+def phone_state(status) -> dict | None:
+  """PhoneGpsStatus as the page shows it, else None: never anything but its known words and an address and port."""
+  if not isinstance(status, dict) or status.get('link') not in PHONE_LINKS or (status.get('data') not in PHONE_DATA and
+                                                                                status.get('data') not in (None, 'fixes')):
+    return None
+  host, port = status.get('host'), known(status.get('port'), int)
+  return {'host': host if isinstance(host, str) and device_host(host) else None, 'port': port, 'link': status['link'], 'data': status.get('data')}
+
+
+def phone_words(details: dict) -> list[str]:
+  """The phone GPS's line and navigation's source, in words: whether phonegpsd runs, how it's linked to the phone, what
+  comes in, and the phone's last fix."""
+  phone = details['phone']
+  process, status, fix = phone['process'], phone['status'], phone['fix']
+  words = []
+  if details['ubloxAvailable'] is False:
+    words.append("not on this device: it needs the comma 4's u-blox GPS")
+  elif details['started'] is False:
+    words.append('off while the car is off')
+  elif process is not None and not process['running']:
+    words.append(processes_words({PHONE_PROCESS: process}, (PHONE_PROCESS,)))
+  elif status is not None:
+    words.append(PHONE_LINKS[status['link']].format(host=status['host'] or 'unknown', port=status['port'] or 'unknown'))
+    if status['data'] is None:
+      words.append('no data from the phone' + (': is the app running?' if status['link'] == 'connected' else ''))
+    elif status['data'] != 'fixes':
+      words.append(PHONE_DATA[status['data']])
+  if fix is not None and fix['age'] is not None:
+    words.append(f"last fix {duration(fix['age'])} ago")
+    if (fix['horizontalAccuracy'] or 0) > 0:
+      words.append(f"accuracy {length(fix['horizontalAccuracy'])}")
+    if fix['satelliteCount']:  # iOS tells apps no satellites: the app's own count
+      words.append(f"the app reports {plural(fix['satelliteCount'], 'satellite')}")
+  elif not words:
+    words.append('no fix from the phone yet')
+  sources = {'phone': "Navigation uses the phone's GPS", 'comma': "Navigation uses the comma's own GPS"}
+  return ['Phone GPS: ' + ' · '.join(words), sources.get(phone['source'] or '', 'Navigation has no GPS fix right now')]
+
+
 def gps_summary(details: dict) -> list[str]:
   """The GPS details in plain words, a line each: whether the car is on, then what the GPS receiver is doing."""
   lines = []
@@ -509,6 +588,8 @@ def gps_summary(details: dict) -> list[str]:
     lines.append(hardware)
   if not receivers:
     lines.append(f"GPS receiver: {processes_words(details['processes'], GPS_PROCESSES)} · no messages yet")
+  if 'phone' in details:
+    lines += phone_words(details)
   return lines
 
 
@@ -536,8 +617,12 @@ class NavWeb:
 
   def flag(self, key: str) -> bool | None:
     """A boolean param, else None: unset or unreadable."""
+    return known(self.param(key), bool)
+
+  def param(self, key: str):
+    """A param, else None: unset or unreadable."""
     try:
-      return known(self.params.get(key), bool)
+      return self.params.get(key)
     except Exception:  # a key this build doesn't have
       return None
 
@@ -551,11 +636,13 @@ class NavWeb:
     token = self.token()
     # the manager writes both: IsOffroad when the car turns on or off, and UbloxAvailable for whether the device has a u-blox
     offroad, ublox_available = self.flag("IsOffroad"), self.flag("UbloxAvailable")
+    phone_gps = self.flag("PhoneGps") is True
+    phone_status = self.param("PhoneGpsStatus") if phone_gps else None
     with self.lock:
       return {'destination': self.params.get("NavDestination"), 'navigationEnabled': self.params.get_bool("NavigationEnabled"),
               'isMetric': self.params.get_bool("IsMetric"), 'tokenHint': f'…{token[-4:]}' if token else '',
               'gps': self.position is not None, 'instruction': self.instruction,
-              'gpsDetails': self.gps.state(None if offroad is None else not offroad, ublox_available)}
+              'gpsDetails': self.gps.state(None if offroad is None else not offroad, ublox_available, phone_gps, phone_status)}
 
   def search(self, body: dict) -> tuple[int, dict]:
     query = str(body.get('query', '')).strip()

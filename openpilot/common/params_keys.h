@@ -267,6 +267,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
 
     // navigation
     {"MapboxToken", {PERSISTENT | DONT_LOG, STRING}},
+    {"PhoneGps", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"PhoneGpsHost", {PERSISTENT, STRING}},
+    {"PhoneGpsPort", {PERSISTENT, INT, "11123"}},
+    {"PhoneGpsStatus", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, JSON}},
 
     // mapd
     {"MapAdvisorySpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, FLOAT}},
