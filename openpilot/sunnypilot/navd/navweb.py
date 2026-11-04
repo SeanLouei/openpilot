@@ -29,7 +29,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.navigation.helpers import latest_gps_source
+from openpilot.selfdrive.navigation.helpers import PHONE_MAX_DELAY, fix_delay, latest_gps_source
 
 PORT = 8082
 WIFI_INTERFACE = 'wlan0'  # the comma's Wi-Fi, also its hotspot's; its cellular link is another interface
@@ -76,7 +76,6 @@ AGC_FULL_SCALE = 8191  # the u-blox's gain control count at full scale: the weak
 PHONE_PROCESS = 'phonegpsd'
 PHONE_LINKS = {
   'connected': 'connected to the phone at {host}',
-  'udp': 'receiving from the phone at {host} over UDP',
   'connecting': 'connecting to the phone at {host}, port {port}',
   'refused': 'not connected: the phone at {host} refuses port {port}: is the app sharing in socket mode on that port?',
   'unreachable': "not connected: can't reach the phone at {host}: is the comma on the iPhone's hotspot?",
@@ -90,6 +89,7 @@ PHONE_LINKS = {
 PHONE_DATA = {
   'starting': 'checking its first fixes',
   'inaccurate': 'its fixes are too inaccurate to use',
+  'delayed': f"its fixes arrive over {PHONE_MAX_DELAY:.0f} s after they were taken: not used (is the iPhone's time set automatically?)",
   'late': 'its fixes arrive late, held up on the way: not used',
   'jump': 'its fixes jump farther than the car could drive: not used',
   'incomplete': 'its fixes have no speed or course: not used',
@@ -388,7 +388,7 @@ class GpsDetails:
     self.hardware_time: float | None = None
     self.source: str | None = None  # where latest_gps_source took the position from: the phone or the comma, else None
     self.phone_process: dict | None = None  # phonegpsd as the manager last reported it
-    self.phone_fix: tuple[float | None, dict] | None = None  # (when received, the message) of the phone's last fix
+    self.phone_fix: tuple[float | None, dict] | None = None  # (when received, the message and its delay) of the phone's last fix
 
   def update(self, sm, source: str | None) -> None:
     """After each update of sm, with the service latest_gps_source took the position from."""
@@ -397,7 +397,7 @@ class GpsDetails:
     phone = name_of(lambda: entry(sm, 'gpsLocation').source) == 'iOS'  # phonegpsd's, where qcomgpsd's would be on another device
     self.source = None if source is None else 'phone' if source == 'gpsLocation' and phone else 'comma'
     if phone and entry(field(sm, 'updated'), 'gpsLocation') is True:
-      self.phone_fix = received(sm, 'gpsLocation'), location(sm, 'gpsLocation', self.source == 'phone')
+      self.phone_fix = received(sm, 'gpsLocation'), {**location(sm, 'gpsLocation', self.source == 'phone'), 'delay': phone_delay(sm)}
     if entry(field(sm, 'updated'), 'managerState') is True:
       self.processes, self.processes_time = gps_processes(entry(sm, 'managerState')), received(sm, 'managerState')
       self.phone_process = gps_processes(entry(sm, 'managerState'), (PHONE_PROCESS,))[PHONE_PROCESS]
@@ -541,7 +541,16 @@ def phone_state(status) -> dict | None:
                                                                                 status.get('data') not in (None, 'fixes')):
     return None
   host, port = status.get('host'), known(status.get('port'), int)
-  return {'host': host if isinstance(host, str) and device_host(host) else None, 'port': port, 'link': status['link'], 'data': status.get('data')}
+  return {'host': host if isinstance(host, str) and device_host(host) else None, 'port': port, 'link': status['link'], 'data': status.get('data'),
+          'clock': known(status.get('clock'), bool)}
+
+
+def phone_delay(sm) -> float | None:
+  """How long before it arrived the phone's last fix was taken, which navd counts its age from (fix_delay), else None."""
+  try:
+    return known(fix_delay(sm, 'gpsLocation'), float)
+  except Exception:  # a message without the fields: never one of phonegpsd's
+    return None
 
 
 def phone_words(details: dict) -> list[str]:
@@ -564,6 +573,12 @@ def phone_words(details: dict) -> list[str]:
       words.append(PHONE_DATA[status['data']])
   if fix is not None and fix['age'] is not None:
     words.append(f"last fix {duration(fix['age'])} ago")
+    # how long before it arrived it was taken, which navigation adds to its age: told only while the two clocks agree
+    clock = None if status is None else status['clock']
+    if clock is False:
+      words.append("the phone's clock differs from the comma's, so the time its fixes take to arrive isn't allowed for")
+    elif clock and (fix['delay'] or 0) >= .05:
+      words.append(f"taken {duration(fix['delay'])} before it arrived")
     if (fix['horizontalAccuracy'] or 0) > 0:
       words.append(f"accuracy {length(fix['horizontalAccuracy'])}")
     if fix['satelliteCount']:  # iOS tells apps no satellites: the app's own count

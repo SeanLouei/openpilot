@@ -24,14 +24,14 @@ from openpilot.cereal import log
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.selfdrive.navigation.helpers import latest_gps_source
+from openpilot.selfdrive.navigation.helpers import PHONE_MAX_DELAY, latest_gps_source
 from openpilot.selfdrive.navigation.navd import MAX_FIX_AGE
 from openpilot.selfdrive.navigation.route import METERS_PER_DEGREE
 from openpilot.sunnypilot.navd import phonegpsd
 from openpilot.sunnypilot.navd.navweb import NavWeb
-from openpilot.sunnypilot.navd.phonegpsd import (CLOCK_AGREEMENT, KNOTS, LATE_RESTART, MIN_ACCURACY, NOMINAL_ERROR, SPEED_ERROR, VDOP_RATIO, Gga,
-                                                 PhoneFixes, PhoneGps, default_gateway, host_param, parse_gga, parse_rmc, parse_vtg, port_param,
-                                                 sentence)
+from openpilot.sunnypilot.navd.phonegpsd import (CLOCK_AGREEMENT, CLOCK_DIFFERENCE, KNOTS, LATE_RESTART, MIN_ACCURACY, NOMINAL_ERROR, SPEED_ERROR,
+                                                 VDOP_RATIO, Gga, PhoneFixes, PhoneGps, default_gateway, host_param, parse_gga, parse_rmc, parse_vtg,
+                                                 port_param, sentence)
 from openpilot.sunnypilot.navd.tests.test_navd import ROUTE, route_engine
 from openpilot.sunnypilot.navd.tests.test_navweb import RUNNING, T, FakeParams, manager_state, page_state, position, receive, submaster
 from openpilot.sunnypilot.sunnylink.tools.compile_settings_ui import DEFAULT_OUT
@@ -88,6 +88,11 @@ def drive(fixes: PhoneFixes, count: int, start: int = 0, latency: float = .3, of
     if message is not None:
       published.append(message)
   return published
+
+
+def phone_clock() -> float:
+  """The phone's clock in the socket tests: the comma's own, as when both have network time."""
+  return time.time()  # noqa: TID251
 
 
 def gps_submaster():
@@ -284,25 +289,50 @@ class TestPublishing(OpenpilotTestCase):
     assert abs(accuracies[2.] - math.degrees(math.atan2(SPEED_ERROR, 2.))) < 1e-3 and accuracies[0.] == 90.
 
   def test_late_fixes(self):
-    # Fixes held up on the way, as when the link stalls, arrive late: where they were taken, the car no longer is
+    # Fixes held up on the way, as when the link stalls, arrive late: where they were taken, the car no longer is. With the
+    # two clocks differing, only the phone's fastest lately tells: one more than MAX_LATE (1.5 s) later than it is dropped
     fixes = PhoneFixes()
-    assert len(drive(fixes, 2)) == 1
+    assert len(drive(fixes, 2, offset=60.)) == 1
     published = []
-    for k, i in enumerate((2, 3, 4)):  # held up, arriving one after another once the link is back
-      message = take(fixes, epoch(T0 + i, north=100 + 10 * i), R0 + 4.3 + .05 * k, T0 + 4.3 + .05 * k)
-      published.append(message)
-    assert published[:2] == [None, None] and fixes.heard['late'] == R0 + 4.35
-    assert published[2] is not None and published[2].gpsLocation.unixTimestampMillis == (T0 + 4) * 1000  # on time again
+    for k, i in enumerate((2, 3, 4, 5)):  # held up, arriving one after another once the link is back
+      published.append(take(fixes, epoch(T0 + i, north=100 + 10 * i), R0 + 5.3 + .05 * k, T0 + 60. + 5.3 + .05 * k))
+    assert published[:2] == [None, None] and fixes.heard['late'] == R0 + 5.35  # 3 and 2.05 s later than the fastest
+    assert None not in published[2:]  # 1.1 s later, then on time again
+    assert published[3].gpsLocation.unixTimestampMillis == round((T0 + 60. + 5.45) * 1000)  # the arrival's: the clocks differ
     # a fix the phone kept from before, first after a while, never goes out: two in a row must agree first
     fixes = PhoneFixes()
     assert take(fixes, epoch(T0 - 300, north=50), R0, T0) is None
     assert drive(fixes, 1) == []
     assert len(drive(fixes, 1, start=1)) == 1
-    # nor do two held up and arriving together
+    # nor do two held up and arriving together: with the clocks differing as they don't agree, else as too old
+    for offset, reason in ((60., 'starting'), (0., 'delayed')):
+      fixes = PhoneFixes()
+      assert take(fixes, epoch(T0 - 10, north=0.5), R0, T0 + offset) is None
+      assert take(fixes, epoch(T0 - 9, north=10.5), R0 + .05, T0 + .05 + offset) is None
+      assert fixes.heard[reason] == R0 + .05 and fixes.published is None, offset
+
+  def test_timer_sending(self):
+    # An app that sends the newest fix on its own 1 s timer, the phone taking its fixes about when the timer fires: a fix
+    # taken just after it fired goes out a second later, the network's jitter on top, the next one taken just before at
+    # once, and one is sent twice or never. None of them is late, though a second later than the fastest lately.
     fixes = PhoneFixes()
-    assert take(fixes, epoch(T0 - 10, north=0.5), R0, T0) is None
-    assert take(fixes, epoch(T0 - 9, north=10.5), R0 + .05, T0 + .05) is None
-    assert fixes.heard['starting'] == R0 + .05 and fixes.published is None
+    sent = [(-.02, .03), (.98, 1.03), (.98, 2.03), (2.02, 3.1), (3.98, 4.03), (3.98, 5.03), (5.02, 6.12), (6.98, 7.03)]  # (taken, arrived) s
+    published = [take(fixes, epoch(T0 + taken, north=100 + 10 * taken), R0 + arrived, T0 + arrived) is not None for taken, arrived in sent]
+    assert published == [False, True, False, True, True, False, True, True] and 'late' not in fixes.heard
+
+  def test_delayed_fixes(self):
+    # While the two clocks agree, a fix's own time tells how long it took to arrive: one taken longer ago than navd allows
+    # for is never used, however steadily they all come so late, as from an app iOS holds back in the background
+    for latency in (PHONE_MAX_DELAY + .05, 3., 5., CLOCK_DIFFERENCE - .05):
+      fixes = PhoneFixes()
+      assert drive(fixes, 20, latency=latency) == [] and fixes.data_state(R0 + 19 + latency) == 'delayed', latency
+    # up to it, they go out with their own time, which navd counts their age from
+    fixes = PhoneFixes()
+    published = drive(fixes, 20, latency=PHONE_MAX_DELAY - .05)
+    assert len(published) == 19 and published[-1].gpsLocation.unixTimestampMillis == (T0 + 19) * 1000 and fixes.clocks_agree
+    # one held up past it among them is dropped, and the next goes out
+    assert take(fixes, epoch(T0 + 20, north=300), R0 + 22.1, T0 + 22.1) is None and fixes.heard['delayed'] == R0 + 22.1
+    assert len(drive(fixes, 1, start=21, latency=PHONE_MAX_DELAY - .05)) == 1
 
   def test_phone_clock_goes_back(self):
     # its fixes are then old, then late, until enough came on time to start over
@@ -330,38 +360,57 @@ class TestPublishing(OpenpilotTestCase):
 
 
 class TestClockDifference(OpenpilotTestCase):
-  """The comma's clock and the phone's may differ, also by a lot before the comma has had network time: navd's distance to
-  the turn must not change with it."""
+  """A phone fix reaches the comma a while after it was taken, while the car drives on: navd's distance to the turn must
+  allow for that while the comma's clock and the phone's agree, and not change with their difference otherwise, also a
+  large one before the comma has had network time."""
 
-  def instruction(self, offset: float, delay: float) -> tuple[float, int]:
-    """navd's distance to the route's first turn delay s after the phone's third fix arrived, and that fix's
-    unixTimestampMillis, with the comma's clock offset s from the phone's."""
+  def instruction(self, offset: float, delay: float, latency: float = .3, speed: float = 10.) -> tuple[float, float, int]:
+    """navd's distance to the route's first turn delay s after the phone's third fix arrived, the fixes arriving latency s
+    after they were taken, with the comma's clock offset s from the phone's; the car's own distance then, driving on at
+    speed (m/s); and that fix's unixTimestampMillis."""
     fixes = PhoneFixes()
-    *_, message = drive(fixes, 3, offset=offset)  # 120 m north, at 10 m/s
-    arrived = R0 + 2.3
+    *_, message = drive(fixes, 3, latency=latency, offset=offset, speed=speed)
+    arrived = R0 + 2 + latency
     sm, pm = gps_submaster(), MagicMock()
     sm.update_msgs(arrived, [messaging.log_from_bytes(message.to_bytes())])
     engine = route_engine({'NavDestination': {'latitude': 500 / METERS_PER_DEGREE, 'longitude': 200 / METERS_PER_DEGREE}}, sm, pm)
     response = MagicMock(status_code=200)
     response.json.return_value = {'routes': [{'legs': [{'steps': ROUTE}]}]}  # 300 m north to a right turn
-    with patch('requests.get', return_value=response), patch('time.monotonic', return_value=arrived + delay):
+    with patch('requests.get', return_value=response), patch('time.monotonic', return_value=arrived + delay), \
+         patch('time.time', return_value=T0 + 2 + latency + offset + delay):
       engine.update()
     instruction = next(call.args[1] for call in reversed(pm.send.call_args_list) if call.args[0] == 'navInstruction')
     assert instruction.valid
-    return instruction.navInstruction.maneuverDistance, message.gpsLocation.unixTimestampMillis
+    return instruction.navInstruction.maneuverDistance, 300. - (100. + speed * (2 + latency + delay)), message.gpsLocation.unixTimestampMillis
+
+  def test_delay_allowed_for(self):
+    # with the clocks agreeing, navd counts a fix's age from when it was taken: its distance is the car's, however long the
+    # fix took to arrive, up to PHONE_MAX_DELAY, where it went out late by speed times that before
+    for latency in (.05, .3, 1., PHONE_MAX_DELAY - .05):
+      for speed in (8., 15., 25.):
+        distance, true, _ = self.instruction(0., .6, latency, speed)
+        assert abs(distance - true) < .01, (latency, speed, distance, true)
+    # a difference within the agreement moves the distance by no more than the car drives in it
+    for offset in (-.5, .5):
+      distance, true, _ = self.instruction(offset, .6)
+      assert abs(distance - true) <= 10. * abs(offset) + .01, (offset, distance, true)
 
   def test_comma_clock_off(self):
+    # clocks that differ more: a fix counts from its arrival, the same whatever the difference
     for delay in (.6, 1.9):  # the age navd counts the car's travel for, up to MAX_FIX_AGE
-      distances = {offset: self.instruction(offset, delay)[0] for offset in (0., 5., 60., -5., -60.)}
+      distances = {offset: self.instruction(offset, delay)[0] for offset in (CLOCK_DIFFERENCE + .5, 60., -5., -60.)}
       assert len(set(distances.values())) == 1, distances
-      assert abs(distances[0.] - (180. - 10. * min(delay, MAX_FIX_AGE))) < .01, distances
+      assert abs(distances[60.] - (180. - 10. * min(delay, MAX_FIX_AGE))) < .01, distances
+    # a difference that could as well be a delay (test_delayed_fixes): no fix goes out
+    fixes = PhoneFixes()
+    assert drive(fixes, 3, offset=5.) == [] and fixes.data_state(R0 + 2.3) == 'delayed'
 
   def test_fix_time(self):
     # the phone's own time goes out only while the comma's clock agrees with it, else the arrival's on the comma's clock
-    assert self.instruction(0., .6)[1] == (T0 + 2) * 1000
-    assert self.instruction(CLOCK_AGREEMENT - .4, .6)[1] == (T0 + 2) * 1000
-    for offset in (5., 60., -60.):
-      assert self.instruction(offset, .6)[1] == round((T0 + 2.3 + offset) * 1000), offset
+    for offset in (0., CLOCK_AGREEMENT - .4, -CLOCK_AGREEMENT + .4, PHONE_MAX_DELAY - .4):
+      assert self.instruction(offset, .6)[2] == (T0 + 2) * 1000, offset
+    for offset in (CLOCK_DIFFERENCE + .5, 60., -5., -60.):
+      assert self.instruction(offset, .6)[2] == round((T0 + 2.3 + offset) * 1000), offset
 
 
 class TestGpsSource(OpenpilotTestCase):
@@ -474,10 +523,9 @@ class TestSources(OpenpilotTestCase):
 
   def send_fixes(self, gps: PhoneGps, send, count: int = 2) -> None:
     """count fixes, each taken as it's sent, 0.2 s apart, every one read before the next"""
-    self.start = time.monotonic()
     for i in range(count):
       before = gps.fixes.heard.get('rmc')
-      send(b''.join(epoch(T0 + time.monotonic() - self.start, north=100 + 2 * i)))
+      send(b''.join(epoch(phone_clock(), north=100 + 2 * i)))
       self.run_until(gps, lambda before=before: gps.fixes.heard.get('rmc') != before)
       time.sleep(.2)
 
@@ -490,10 +538,19 @@ class TestSources(OpenpilotTestCase):
     assert peer[0] == '127.0.0.1' and gps.phone == '127.0.0.1'
     self.send_fixes(gps, connection.sendall)
     assert len(self.published(gps)) == 1 and self.published(gps)[0].gpsLocation.source == PHONE
-    self.run_until(gps, lambda: gps.params.get('PhoneGpsStatus') == {'host': '127.0.0.1', 'port': gps.port, 'link': 'connected', 'data': 'fixes'})
+    status = {'host': '127.0.0.1', 'port': gps.port, 'link': 'connected', 'data': 'fixes', 'clock': True}
+    self.run_until(gps, lambda: gps.params.get('PhoneGpsStatus') == status)
+    # what the navigation page then says, reading the fix 0.3 s after it was taken on the comma's clock
+    message = self.published(gps)[0]
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True, PhoneGps=True, PhoneGpsStatus=status)), submaster()
+    with patch('time.time', return_value=message.gpsLocation.unixTimestampMillis / 1000 + .3):
+      receive(navweb, sm, message.logMonoTime * 1e-9, manager_state(pigeond=RUNNING, ubloxd=RUNNING, qcomgpsd={}, phonegpsd=RUNNING), message)
+    assert page_state(navweb, message.logMonoTime * 1e-9 + .2)['gpsDetails']['summary'][-2:] == [
+      'Phone GPS: connected to the phone at 127.0.0.1 · last fix 0.2 s ago · taken 0.3 s before it arrived · accuracy 4 m · the app reports 9 satellites',
+      "Navigation uses the phone's GPS"]
     # the tail of a line cut off, then the next fix a byte at a time
     connection.sendall(b'0.9,M,,*47\r\n')
-    data = b''.join(epoch(T0 + time.monotonic() - self.start, north=104))
+    data = b''.join(epoch(phone_clock(), north=104))
     for i in range(len(data)):
       connection.sendall(data[i:i + 1])
       gps.step(.002)
@@ -547,36 +604,29 @@ class TestSources(OpenpilotTestCase):
     server.close()
     self.run_until(gps, lambda: gps.problem == 'refused', timeout=15.)
 
-  def test_udp_only_from_the_gateway(self):
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    probe.bind(('127.0.0.1', 0))
-    port = probe.getsockname()[1]
-    probe.close()
+  def test_no_udp(self):
+    # Any device on the hotspot can fake a datagram's sender with a single packet: phonegpsd takes no UDP, not even from the
+    # phone's address, and holds no UDP socket
+    tree = source('openpilot.sunnypilot.navd.phonegpsd')
+    assert not {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)} & {'SOCK_DGRAM', 'recvfrom', 'recvmsg', 'recvfrom_into'}
+    server = self.server()
+    port = server.getsockname()[1]
+    gps = self.phone_gps(port)  # the phone is 127.0.0.1, where the datagrams come from too
+    self.run_until(gps, lambda: gps.connected)
+    connection, _ = server.accept()
+    self.addCleanup(connection.close)
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     self.addCleanup(sender.close)
-
-    gps = self.phone_gps(port, gateway='01FFFF0A')  # the phone is 10.255.255.1: datagrams from this test aren't its
-    self.run_until(gps, lambda: gps.udp is not None)
+    sender.bind(('127.0.0.1', 0))
     for i in range(3):
-      sender.sendto(b''.join(epoch(T0 + i, north=100 + 2 * i)), ('127.0.0.1', port))
+      sender.sendto(b''.join(epoch(phone_clock(), north=100 + 2 * i)), ('127.0.0.1', port))
       deadline = time.monotonic() + .3
       while time.monotonic() < deadline:
         gps.step(.02)
-    assert not self.published(gps) and not gps.fixes.heard and gps.link(time.monotonic()) != 'udp'
-    gps.close()
-
-    gps = self.phone_gps(port)
-    self.run_until(gps, lambda: gps.udp is not None)
-    self.send_fixes(gps, lambda data: sender.sendto(data, ('127.0.0.1', port)))
-    assert len(self.published(gps)) == 1 and gps.link(time.monotonic()) == 'udp'
-    # what the navigation page then says
-    self.run_until(gps, lambda: (gps.params.get('PhoneGpsStatus') or {}).get('link') == 'udp')
-    params = FakeParams(IsOffroad=False, UbloxAvailable=True, PhoneGps=True, PhoneGpsStatus=gps.params.get('PhoneGpsStatus'))
-    navweb, sm = NavWeb(params), submaster()
-    receive(navweb, sm, T, manager_state(pigeond=RUNNING, ubloxd=RUNNING, qcomgpsd={}, phonegpsd=RUNNING), self.published(gps)[0])
-    assert page_state(navweb, T + .2)['gpsDetails']['summary'][-2:] == [
-      'Phone GPS: receiving from the phone at 127.0.0.1 over UDP · last fix 0.2 s ago · accuracy 4 m · the app reports 9 satellites',
-      "Navigation uses the phone's GPS"]
+    assert gps.connected and not self.published(gps) and not gps.fixes.heard
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    self.addCleanup(probe.close)
+    probe.bind(('127.0.0.1', port))  # free: phonegpsd has no UDP socket on its port
 
 
 class TestNavweb(OpenpilotTestCase):
@@ -623,15 +673,39 @@ class TestNavweb(OpenpilotTestCase):
       ({'data': 'no_rmc'}, "connected to the phone at 172.20.10.1 · no RMC sentences, which have the speed and date: turn on RMC in the app's " +
        'NMEA settings'),
       ({'data': 'late'}, 'connected to the phone at 172.20.10.1 · its fixes arrive late, held up on the way: not used'),
-      ({'link': 'udp', 'data': 'inaccurate'}, 'receiving from the phone at 172.20.10.1 over UDP · its fixes are too inaccurate to use'),
+      ({'data': 'inaccurate'}, 'connected to the phone at 172.20.10.1 · its fixes are too inaccurate to use'),
+      ({'data': 'delayed'}, "connected to the phone at 172.20.10.1 · its fixes arrive over 2 s after they were taken: not used (is the iPhone's " +
+       'time set automatically?)'),
     ]
     for changes, words in cases:
       line, source = self.summary({**self.STATUS, **changes}, phone_fix=False)[-2:]
       assert line == f'Phone GPS: {words}' and source == "Navigation uses the comma's own GPS", changes
     # what phonegpsd wrote, never shown unless it's words the page knows
-    for status in ({**self.STATUS, 'link': '<b>'}, {**self.STATUS, 'data': 'other'}, 'connected', None):
+    for status in ({**self.STATUS, 'link': '<b>'}, {**self.STATUS, 'link': 'udp'}, {**self.STATUS, 'data': 'other'}, 'connected', None):
       assert self.summary(status, phone_fix=False)[-2] == 'Phone GPS: no fix from the phone yet'
     assert self.summary({**self.STATUS, 'host': '<script>'}, phone_fix=False)[-2].startswith('Phone GPS: connected to the phone at unknown')
+
+  def delay_line(self, clock: bool | None, delay: float) -> str:
+    """The Phone GPS line 0.4 s after a phone fix arrived, taken delay s before that on the comma's clock (as navd
+    counts it), with what phonegpsd last wrote of the two clocks: whether they agree."""
+    navweb, sm = NavWeb(FakeParams(IsOffroad=False, UbloxAvailable=True, PhoneGps=True, PhoneGpsStatus={**self.STATUS, 'clock': clock})), submaster()
+    receive(navweb, sm, T, manager_state(pigeond=RUNNING, ubloxd=RUNNING, qcomgpsd={}, phonegpsd=RUNNING))
+    fix = messaging.new_message('gpsLocation', valid=True, logMonoTime=int((T + .1) * 1e9))
+    fix.gpsLocation = {'hasFix': True, 'latitude': 37.6559, 'longitude': -122.4077, 'horizontalAccuracy': 6., 'source': 'iOS',
+                       'unixTimestampMillis': round((T0 - delay) * 1000)}
+    with patch('time.time', return_value=T0):  # the comma's clock as it arrives
+      receive(navweb, sm, T + .1, fix)
+    return page_state(navweb, T + .5)['gpsDetails']['summary'][-2]
+
+  def test_delay(self):
+    # how long before it arrived the phone's last fix was taken, which navigation allows for, while the two clocks agree
+    assert self.delay_line(True, 1.04) == 'Phone GPS: connected to the phone at 172.20.10.1 · last fix 0.4 s ago · taken 1.0 s before it arrived · ' + \
+      'accuracy 6 m'
+    assert self.delay_line(True, .02) == 'Phone GPS: connected to the phone at 172.20.10.1 · last fix 0.4 s ago · accuracy 6 m'
+    # else the fix went out with its arrival's time: the delay isn't told, nor allowed for
+    assert self.delay_line(False, 0.) == "Phone GPS: connected to the phone at 172.20.10.1 · last fix 0.4 s ago · the phone's clock differs from " + \
+      "the comma's, so the time its fixes take to arrive isn't allowed for · accuracy 6 m"
+    assert self.delay_line(None, 1.) == 'Phone GPS: connected to the phone at 172.20.10.1 · last fix 0.4 s ago · accuracy 6 m'
 
   def test_not_running(self):
     stopped = {'pigeond': RUNNING, 'ubloxd': RUNNING, 'qcomgpsd': {}, 'phonegpsd': {'shouldBeRunning': True, 'exitCode': 1}}

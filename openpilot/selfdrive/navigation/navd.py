@@ -11,7 +11,7 @@ from openpilot.common.api import API_HOST, Api
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.navigation.helpers import latest_gps_source
+from openpilot.selfdrive.navigation.helpers import fix_delay, latest_gps_source
 from openpilot.selfdrive.navigation.route import bearing, cumulative_distance, local_meters, nearest_segment, point_along, project_onto_path
 
 REROUTE_DISTANCE = 25
@@ -179,6 +179,7 @@ class RouteEngine:
     self.last_bearing_accuracy = 0.  # deg the receiver reports for its course, 0 when it reports none
     self.last_speed = 0.  # m/s
     self.fix_time = None  # monotonic s the last fix was published
+    self.fix_delay = 0.  # s it was taken before that
 
     self.nav_destination = None  # the destination of the route
     self.requested_destination = None  # the destination of the last route request, also when it failed
@@ -224,7 +225,7 @@ class RouteEngine:
       gps = self.sm[source]
       self.last_position, self.last_bearing, self.last_speed = (gps.longitude, gps.latitude), gps.bearingDeg, gps.speed
       self.last_bearing_accuracy = gps.bearingAccuracyDeg
-      self.fix_time = self.sm.logMonoTime[source] * 1e-9
+      self.fix_time, self.fix_delay = self.sm.logMonoTime[source] * 1e-9, fix_delay(self.sm, source)
     # without a fresh fix the distance to the maneuver is frozen, so the instruction is not valid for steering on
     self.gps_ok = source is not None
     route = self.route
@@ -350,8 +351,9 @@ class RouteEngine:
     if not len(banner_step['bannerInstructions']) and self.step_idx == len(self.route) - 1:
       banner_step = self.route[max(self.step_idx - 1, 0)]
 
-    # Current instruction, for where the car is as it goes out: the fix may be a second old
-    fix_age = float(np.clip(time.monotonic() - self.fix_time, 0., MAX_FIX_AGE)) if self.fix_time is not None else 0.
+    # Current instruction, for where the car is as it goes out: the fix may be a second old as navd reads it, and the phone's
+    # was taken about a second before it was published, which counts too (fix_delay)
+    fix_age = float(np.clip(time.monotonic() - self.fix_time, 0., MAX_FIX_AGE)) + self.fix_delay if self.fix_time is not None else 0.
     maneuver_distance = distance_to_maneuver - self.last_speed * fix_age
     msg.navInstruction.maneuverDistance = maneuver_distance
     set_banner(msg.navInstruction, banner_step['bannerInstructions'], maneuver_distance)

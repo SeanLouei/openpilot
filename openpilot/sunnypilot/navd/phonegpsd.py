@@ -27,22 +27,24 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.navigation.helpers import PHONE_MAX_DELAY
 from openpilot.sunnypilot.navd.navweb import WIFI_INTERFACE, wifi_address
 
 DEFAULT_PORT = 11123  # GPS2IP's socket mode
 ROUTE_FILE = '/proc/net/route'
 RTF_UP, RTF_GATEWAY = 0x1, 0x2  # a route's flags there
 
-# Data is taken only from the phone: the Wi-Fi's default gateway, which on the iPhone's hotspot is the phone itself, or
-# PhoneGpsHost. Another device on the same network can't feed a position.
+# Data comes only over a TCP connection phonegpsd makes to the phone: the Wi-Fi's default gateway, which on the iPhone's
+# hotspot is the phone itself, or PhoneGpsHost. It never listens and takes no UDP, whose sender any device on the network
+# can fake with a single packet. Another device on the hotspot could still pose as the phone (ARP spoofing), as it could
+# for the navigation page: the hotspot is for trusted devices only.
 LOOKUP_PERIOD = 2.  # s between reads of the params, the Wi-Fi's gateway and the comma's address on it, which change as Wi-Fi reconnects
 CONNECT_TIMEOUT = 3.  # s
 RETRY_DELAYS = (1., 2., 4., 8.)  # s before each new attempt to connect after a failure, the last one repeating
 STABLE_TIME = 10.  # s connected, after which a lost connection is retried from the first delay again
 SILENCE_TIMEOUT = 10.  # s connected without data, after which the connection is taken for lost
 MAX_LINE = 256  # bytes of a line still without its end: NMEA's are at most 82, so a longer one is garbage
-MAX_READ = 65536  # bytes read from each source per step, so that a flood can't hold up the loop
-MAX_DATAGRAM = 2048
+MAX_READ = 65536  # bytes read per step, so that a flood can't hold up the loop
 FAILURES = {errno.ECONNREFUSED: 'refused', errno.ENETUNREACH: 'unreachable', errno.EHOSTUNREACH: 'unreachable', errno.EHOSTDOWN: 'unreachable',
             errno.ETIMEDOUT: 'timeout', errno.ECONNRESET: 'closed', errno.EPIPE: 'closed'}
 
@@ -68,14 +70,21 @@ GGA_MEMORY = 3.  # s a GGA's HDOP, satellites and altitude stand for an RMC whos
 VTG_WINDOW = .5  # s between an RMC and the VTG that gives its missing speed or course
 FLAG_FIX, FLAG_GGA = 1, 2  # gpsLocation flags: a fix (as the u-blox's gnssFixOK), and the HDOP, satellites and altitude its own epoch's
 
-# The phone's clock and the comma's can differ, by any amount when the comma has had no network time yet. So the fix's own
-# time is used only to tell old data, held up and sent at once, from new, comparing it with when it arrived, on the
-# comma's monotonic clock, and never to say how old a fix is: a fix is as old as it is since it arrived, as navd counts from
-# the message's logMonoTime. A clock difference never moves a position along the route.
-CLOCK_AGREEMENT = 1.  # s; the fix's own time goes out as unixTimestampMillis only this close to the comma's clock, else the arrival's
+# A fix reaches the comma a while after the phone took it, about a second, in which the car drove on. The phone's clock and
+# the comma's can differ, by any amount when the comma has had no network time yet. While they agree, the fix goes out with
+# its own time as unixTimestampMillis, and navd counts its age from then (fix_delay): the comma's clock as it arrived less
+# that time. Otherwise it goes out with the time it arrived, from which navd counts its age, and its own time only tells old
+# data, held up and sent at once, from new, comparing it with when it arrived on the comma's monotonic clock: a clock
+# difference never moves a position along the route, but the time on the way isn't allowed for then.
+CLOCK_AGREEMENT = 1.  # s a fix's time may be ahead of the comma's clock as it arrives, with the two still taken to agree
+# A fix taken longer ago than PHONE_MAX_DELAY on the comma's clock is too old to use: an app iOS holds back in the
+# background, or the phone's clock some seconds off. Longer ago than this, it tells the two clocks apart: no phone takes
+# that long to send a fix.
+CLOCK_DIFFERENCE = 10.  # s
 # A fix that arrives later than the phone's fastest lately was held up on the way: where it was taken, the car no longer is.
-# The phone sends a fix about every second, and when it sends on a timer, a fix is up to a second old as it leaves.
-MAX_LATE = 1.  # s
+# The phone sends a fix about every second, and when it sends on a timer, a fix is up to a second old as it leaves, and the
+# network's jitter comes on top.
+MAX_LATE = 1.5  # s
 DRIFT = 1e-3  # s per s that the fastest lately may rise by, as the two clocks drift apart (at most about 1e-4)
 LATE_RESTART = 10  # late fixes in a row, arriving as fixes do: the phone's clock went back, and the fixes start over
 RESTART_TIME = 5.  # s without a published fix, after which two fixes in a row must agree before one goes out again
@@ -88,7 +97,7 @@ EARTH_RADIUS = 6371000.  # m
 STATUS_WINDOW = 3.  # s of what came in that the status tells
 STATUS_PERIOD = 1.  # s between writes of the status, at least
 # What came in, the most telling first: the status names the first heard within STATUS_WINDOW
-DATA_STATES = ('fixes', 'starting', 'inaccurate', 'late', 'jump', 'incomplete', 'no_fix', 'no_rmc', 'unreadable')
+DATA_STATES = ('fixes', 'starting', 'inaccurate', 'delayed', 'late', 'jump', 'incomplete', 'no_fix', 'no_rmc', 'unreadable')
 
 
 @dataclass
@@ -294,8 +303,8 @@ def host_param(params) -> str | None:
 
 class PhoneFixes:
   """Fixes from the phone's NMEA lines, each one checked before it goes out: an epoch's sentences joined, a fix only once,
-  never one older than the last, nor one held up on the way, jumping farther than the car could drive, or without the
-  speed and course that navd's timing and course rules need."""
+  never one older than the last, nor one held up on the way or taken too long ago, jumping farther than the car could
+  drive, or without the speed and course that navd's timing and course rules need."""
 
   def __init__(self):
     self.pending: Fix | None = None  # the newest RMC with a fix since the last take
@@ -307,6 +316,7 @@ class PhoneFixes:
     self.baseline_time = 0.
     self.late = 0  # late fixes in a row
     self.course: float | None = None  # deg; the moving car's last
+    self.clocks_agree: bool | None = None  # whether the last fix out went with its own time, the phone's clock agreeing with the comma's
     self.heard: dict[str, float] = {}  # when each of DATA_STATES, and any RMC or other sentence, last came in
 
   def add(self, line: bytes, received: float, wall: float) -> None:
@@ -381,7 +391,7 @@ class PhoneFixes:
     self.late = 0
 
   def check(self, fix: Fix) -> str | None:
-    """None for a fix to publish, else why not: old, late, jump, or starting while the first two fixes don't agree yet."""
+    """None for a fix to publish, else why not: old, delayed, late, jump, or starting while the first two fixes don't agree yet."""
     last = self.published
     if last is not None and fix.time <= last.time:
       if fix.time >= last.time - CLOCK_STEP:
@@ -391,6 +401,9 @@ class PhoneFixes:
     elif last is not None and fix.time - last.time > fix.received - last.received + MAX_LATE:
       self.restart()  # its time ran ahead of the time it took to come: the phone's clock jumped, or this time is wrong
       last = None
+    # on the comma's clock, taken longer ago than navd allows for, however steadily the fixes come so late
+    if PHONE_MAX_DELAY < fix.wall - fix.time <= CLOCK_DIFFERENCE:
+      return 'delayed'
     offset = fix.received - fix.time
     if self.baseline is not None:
       self.baseline, self.baseline_time = min(self.baseline + DRIFT * (fix.received - self.baseline_time), offset), fix.received
@@ -430,7 +443,9 @@ class PhoneFixes:
     gps.horizontalAccuracy, gps.verticalAccuracy = accuracy, VDOP_RATIO * accuracy
     gps.satelliteCount = fix.satellites or 0
     gps.vNED = [fix.speed * math.cos(math.radians(course)), fix.speed * math.sin(math.radians(course)), 0.]
-    gps.unixTimestampMillis = round(1000 * (fix.time if abs(fix.time - fix.wall) <= CLOCK_AGREEMENT else fix.wall))
+    # its own time while the two clocks agree, which navd counts the fix's age from, else the time it arrived
+    self.clocks_agree = -CLOCK_AGREEMENT <= fix.wall - fix.time <= PHONE_MAX_DELAY
+    gps.unixTimestampMillis = round(1000 * (fix.time if self.clocks_agree else fix.wall))
     return msg
 
   def data_state(self, now: float) -> str | None:
@@ -442,14 +457,13 @@ class PhoneFixes:
 
 
 class PhoneGps:
-  """phonegpsd: a TCP connection to the phone and a UDP socket on the comma's Wi-Fi address, both on PhoneGpsPort, taking
-  data only from the phone, and publishing each fix that passes as it arrives. Its state goes to PhoneGpsStatus for the
-  navigation page."""
+  """phonegpsd: a TCP connection to the phone on PhoneGpsPort, publishing each fix that passes as it arrives. Its state goes
+  to PhoneGpsStatus for the navigation page."""
 
   def __init__(self, params, pm, route_file: str = ROUTE_FILE, wifi=wifi_address):
     self.params, self.pm, self.route_file, self.wifi = params, pm, route_file, wifi
     self.fixes = PhoneFixes()
-    self.phone: str | None = None  # the only address data is taken from
+    self.phone: str | None = None  # the address phonegpsd connects to
     self.address: str | None = None  # the comma's own on Wi-Fi
     self.port = DEFAULT_PORT
     self.lookup_time = -math.inf
@@ -462,10 +476,6 @@ class PhoneGps:
     self.retry_time = 0.
     self.retries = 0  # failed attempts to connect, in a row
     self.problem: str | None = None  # why the last attempt failed, or the last connection ended
-    self.udp: socket.socket | None = None
-    self.udp_heard = -math.inf
-    self.ignored = False  # a datagram from another address was logged
-    self.udp_failed: tuple[str, int] | None = None  # (address, port) a UDP socket couldn't be bound to, logged once
     self.status: dict | None = None
     self.status_time = -math.inf
 
@@ -480,29 +490,11 @@ class PhoneGps:
       route = ''
     address = self.wifi()
     phone = None if address is None else host or default_gateway(route)
-    if self.udp is not None and (address, port) != (self.address, self.port):
-      self.udp.close()
-      self.udp = None
-    if self.udp is None and address is not None:
-      self.udp = self.open_udp(address, port)
     if (phone, address, port) != (self.phone, self.address, self.port):
       cloudlog.warning(f"phonegpsd: the phone is {phone} port {port}, the comma {address}")
       self.close_tcp()
       self.phone, self.address, self.port = phone, address, port
       self.retry_time, self.retries, self.problem = now, 0, None
-
-  def open_udp(self, address: str, port: int) -> socket.socket | None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-      sock.setblocking(False)
-      sock.bind((address, port))  # the Wi-Fi's address only: never the cellular link's
-    except OSError as e:
-      if self.udp_failed != (address, port):
-        cloudlog.warning(f"phonegpsd: no UDP on {address} port {port}: {e}")
-        self.udp_failed = (address, port)
-      sock.close()
-      return None
-    return sock
 
   def close_tcp(self) -> None:
     if self.tcp is not None:
@@ -561,28 +553,10 @@ class PhoneGps:
       for line in lines:
         self.fixes.add(line, now, wall)
 
-  def read_udp(self, now: float, wall: float) -> None:
-    assert self.udp is not None
-    for _ in range(MAX_READ // MAX_DATAGRAM):
-      try:
-        data, sender = self.udp.recvfrom(MAX_DATAGRAM)
-      except OSError:  # nothing more to read, also BlockingIOError
-        return
-      if sender[0] != self.phone:  # only the phone's: another device on the network can't feed a position
-        if not self.ignored:
-          cloudlog.warning(f"phonegpsd: ignoring UDP from {sender[0]}, not the phone {self.phone}")
-          self.ignored = True
-        continue
-      self.udp_heard = now
-      for line in re.split(rb'[\r\n]', data):  # each datagram stands alone: a line cut off in it ends there
-        self.fixes.add(line, now, wall)
-
-  def link(self, now: float) -> str:
+  def link(self) -> str:
     """How the comma is linked to the phone, for the status."""
     if self.connected:
       return 'connected'
-    if now - self.udp_heard < STATUS_WINDOW:
-      return 'udp'
     if self.address is None:
       return 'no_wifi'
     if self.phone is None:
@@ -590,7 +564,7 @@ class PhoneGps:
     return self.problem or 'connecting'
 
   def write_status(self, now: float) -> None:
-    status = {'host': self.phone, 'port': self.port, 'link': self.link(now), 'data': self.fixes.data_state(now)}
+    status = {'host': self.phone, 'port': self.port, 'link': self.link(), 'data': self.fixes.data_state(now), 'clock': self.fixes.clocks_agree}
     if status != self.status and now - self.status_time >= STATUS_PERIOD:
       self.status, self.status_time = status, now
       try:
@@ -608,9 +582,9 @@ class PhoneGps:
     connecting = self.tcp is not None and not self.connected
     deadlines = [self.lookup_time, self.connect_deadline if connecting else math.inf,
                  self.retry_time if self.tcp is None and self.phone is not None else math.inf]
-    readers = [sock for sock in (self.tcp if self.connected else None, self.udp) if sock is not None]
+    readers = [self.tcp] if self.connected else []
     readable, writable, _ = select.select(readers, [self.tcp] if connecting else [], [], min(timeout, max(min(deadlines) - now, 0.)))
-    now, wall = time.monotonic(), time.time()  # noqa: TID251  the comma's clock, only to tell whether the phone's agrees
+    now, wall = time.monotonic(), time.time()  # noqa: TID251  the comma's clock, against the phone's: how long ago a fix was taken
     if connecting:
       assert self.tcp is not None
       error = self.tcp.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) if writable else None
@@ -625,8 +599,6 @@ class PhoneGps:
         self.read_tcp(now, wall)
       elif now - self.tcp_heard > SILENCE_TIMEOUT:  # gone without closing, as when the phone leaves
         self.lost(now, 'silent')
-    if self.udp is not None and self.udp in readable:
-      self.read_udp(now, wall)
     message = self.fixes.take(now)
     if message is not None:
       self.pm.send('gpsLocation', message)
@@ -634,9 +606,6 @@ class PhoneGps:
 
   def close(self) -> None:
     self.close_tcp()
-    if self.udp is not None:
-      self.udp.close()
-      self.udp = None
 
 
 def main() -> None:

@@ -325,19 +325,27 @@ navigation can use your iPhone's GPS instead. It's off by default.
 3. Settings → Models → turn on **phone GPS (alpha)** (it needs navigation (alpha); it's also in the sunnylink app under
    Steering → Navigation). While the car is on, the comma 4 connects to the phone.
 4. Check it on the navigation page, under GPS details: the **Phone GPS** line says whether the comma is connected to the
-   phone, how old the phone's last fix is, how accurate, and how many satellites the app reports, and the line after it
-   which GPS navigation uses. If the phone refuses the port, the app isn't sharing in socket mode on 11123; if its data
-   can't be read, set the iPhone to 24-hour time (GPS2IP writes a broken time otherwise).
+   phone, how old the phone's last fix is, how long before it arrived it was taken, how accurate, and how many satellites
+   the app reports, and the line after it which GPS navigation uses. If the phone refuses the port, the app isn't sharing
+   in socket mode on 11123; if its data can't be read, set the iPhone to 24-hour time (GPS2IP writes a broken time
+   otherwise).
 
 Its limits:
 
 - The app must keep running. If iOS stops it, or the comma leaves the hotspot, the phone's fixes stop, and within 2
-  seconds navigation goes back to the comma's own GPS, then to the phone again once its fixes come back.
-- The phone's fixes reach the comma about a second after they were taken, which the slowdown and turn timing allow for. A
-  fix that arrives later than that, jumps farther than the car could drive, is worse than about 50 m (165 ft), or has no
-  speed or course is not used.
+  seconds navigation goes back to the comma's own GPS, then to the phone again once its fixes come back. When one of the
+  phone's fixes isn't used, navigation may take the comma's own GPS for a moment too, until the phone's next.
+- The phone's fixes reach the comma about a second after they were taken, while the car drives on. As long as the
+  iPhone's clock agrees with the comma's (the iPhone's time set automatically, and the comma online through the hotspot),
+  navigation counts each fix's age from when it was taken, so the slowdown and turn timing allow for that second, and a fix
+  taken more than 2 seconds before it arrived is not used. If the two clocks differ, the GPS details say so: navigation then
+  can't tell that second, and turn commands may come about that much late, some 15 m (50 ft) at 35 mph.
+- Not used either: a fix that arrives more than 1.5 seconds later than the phone's fastest lately (held up on the way),
+  jumps farther than the car could drive, is worse than about 50 m (165 ft), or has no speed or course.
 - A phone in a pocket or a bag hears less: put it where it sees the sky, such as in a dashboard mount.
-- The comma takes data only from the phone (the hotspot's gateway), never from another device on the hotspot.
+- The comma connects to the phone (the hotspot's gateway) and takes its data only over that connection. Another device on
+  the hotspot could still pose as the phone on the network: keep the hotspot to your own devices, as for the navigation
+  page.
 - Only on a comma 4, beside its own u-blox GPS.
 
 ## Tesla notes
@@ -503,18 +511,23 @@ Its limits:
 - `openpilot/sunnypilot/navd/phonegpsd.py`: phone GPS (process `phonegpsd`), run while the car is on with navigation,
   `PhoneGps` and a u-blox (`ublox_available()`, so never beside qcomgpsd, which publishes `gpsLocation` too). It connects
   over TCP to `PhoneGpsPort` (11123) on `wlan0`'s default gateway from `/proc/net/route`, the iPhone on its hotspot, or on
-  `PhoneGpsHost`, from `wlan0`'s address, retrying after 1, 2, 4 and then every 8 s, and takes UDP datagrams on `wlan0`'s
-  address from that address only. It reads NMEA 0183 from any talker, checksums verified, joining each epoch's RMC
-  (status, time, date, position, speed, course) with its GGA (quality, satellites, HDOP, altitude) and a VTG, and publishes
-  `gpsLocation` (source `iOS`, valid) once per fix, as it arrives, never an older one: `horizontalAccuracy` 5 m per unit of
-  HDOP (at least 3 m), `bearingAccuracyDeg` atan(0.7 m/s / speed), so that navd's course rules widen their thresholds for a
-  slow car (never 0 or 180, which navd takes at its word), and the moving car's last course below 1 m/s. The NMEA time
-  only tells late data: a fix arriving more than 1 s later than the phone's fastest lately, against the monotonic clock,
-  is dropped; it goes out as `unixTimestampMillis` only within 1 s of the comma's clock, else the arrival's. navd counts a
-  fix's age from `logMonoTime` (its arrival), clamped to 1.5 s, so a clock difference never moves a position. After 5 s
-  without a fix, two in a row must agree in time and place before one goes out. Not used: status V or a no-fix mode,
-  quality 0, an empty or (0, 0) position, HDOP over 10, no speed (or no course at 1 m/s and up), a jump beyond 1.5 times
-  the faster speed's travel plus 30 m. Its link and what comes in go to `PhoneGpsStatus` for navweb's Phone GPS line.
-  `latest_gps_source` takes a fresh phone fix over the u-blox's while it lasts, so the two never alternate.
+  `PhoneGpsHost`, from `wlan0`'s address, retrying after 1, 2, 4 and then every 8 s. It never listens and takes no UDP,
+  whose sender anyone on the network can fake. It reads NMEA 0183 from any talker, checksums verified, joining each
+  epoch's RMC (status, time, date, position, speed, course) with its GGA (quality, satellites, HDOP, altitude) and a VTG,
+  and publishes `gpsLocation` (source `iOS`, valid) once per fix, as it arrives, never an older one: `horizontalAccuracy`
+  5 m per unit of HDOP (at least 3 m), `bearingAccuracyDeg` atan(0.7 m/s / speed), so that navd's course rules widen their
+  thresholds for a slow car (never 0 or 180, which navd takes at its word), and the moving car's last course below 1 m/s.
+  While the phone's clock agrees with the comma's (a fix's NMEA time from 1 s after its arrival on the comma's clock to
+  `PHONE_MAX_DELAY`, 2 s, before it), the fix goes out with that time as `unixTimestampMillis`, and navd adds `fix_delay`
+  (`helpers.py`: the comma's clock at the arrival less that time) to the fix's age, counted from `logMonoTime` (its arrival)
+  and clamped to 1.5 s; one taken 2 to 10 s before it arrived is dropped (`delayed`). Otherwise the clocks differ: the fix
+  goes out with the arrival's time, a `fix_delay` of 0, so a clock difference never moves a position, and the navigation
+  page says so (`PhoneGpsStatus`'s `clock`). A fix arriving more than 1.5 s later than the phone's fastest lately, against
+  the monotonic clock, is dropped (`late`). After 5 s without a fix, two in a row must agree in time and place before one
+  goes out. Not used: status V or a no-fix mode, quality 0, an empty or (0, 0) position, HDOP over 10, no speed (or no
+  course at 1 m/s and up), a jump beyond 1.5 times the faster speed's travel plus 30 m. Its link, what comes in and
+  whether the clocks agree go to `PhoneGpsStatus` for navweb's Phone GPS line.
+  `latest_gps_source` takes a fresh phone fix over the u-blox's while it lasts, so the two don't alternate at every fix;
+  once the phone's last is 2 s old, as when the one after it was dropped, it takes the u-blox's until the phone's next.
 - Params: `NavTurnDesire`, `NavAutoTurn`, `NavAutoTurnFarSide` and `NavAutoTurnLane` (neither backed up), `NavExitDesire`,
   `MapboxToken` (not logged), `PhoneGps` (backed up), `PhoneGpsPort`, `PhoneGpsHost`, `PhoneGpsStatus` (phonegpsd's). Events: `navTurnSlowing`, `navTurnAcross`, `navTurnSignal`, `navTurnLane`.
