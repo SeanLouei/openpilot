@@ -20,7 +20,9 @@ by default; with them off, the car drives like plain sunnypilot.
   - with alpha longitudinal, which slows the car for the turn (see below): under 20 mph (32 km/h), and slow enough to get
     down to turning speed in time, counting the speed the car still gains while openpilot is speeding it up (pulling away
     from a light, or after the gas): openpilot takes a moment to stop speeding up. So signal before you pull away: a signal
-    given while the car is already pulling away close to the turn often means no turn;
+    given while the car is already pulling away close to the turn often means no turn. sunnypilot's *Acceleration Boost*
+    (on by default; sunnylink → Cruise) pulls away a little harder, which makes that more likely; it never overrides the
+    slowdown for a turn;
   - without alpha longitudinal, never while the car's own cruise control is on: it speeds back up toward its set speed
     (18 mph or more on a Tesla) as soon as the car ahead moves on, and would take the turn far too fast. With the cruise
     control off, and you driving the speed, the turn starts under about 12 mph (20 km/h) for a right turn, or 15 mph
@@ -35,8 +37,10 @@ by default; with them off, the car drives like plain sunnypilot.
   desire every 4 seconds while it still faces straight ahead (for a right turn, only while it is short of the intersection),
   so the model still knows about the turn when you go. Once the car has begun turning, it doesn't repeat it. After a long
   stop in the middle of a turn, the model may have forgotten the turn, so be ready to steer the rest yourself. A GPS error
-  can still end the repeating early while **Turning…** shows, so be ready to steer when you go. An automatic left turn is
-  never repeated while the car waits: see *Automatic left turns* below.
+  can still end the repeating early while **Turning…** shows, so be ready to steer when you go. With some driving models,
+  sunnypilot steers more gently below about 6 mph (9 km/h), so a turn begun from a stop can open wider than one taken
+  rolling: be ready to steer it tighter. An automatic left turn is never repeated while the car waits: see *Automatic left
+  turns* below.
 - **Lane changes:** while your blinker is on for the route's next turn, openpilot won't start an *automatic* (nudgeless)
   lane change, however much you slow down, until you switch the blinker off (also after a missed turn). That holds for any
   blinker toward the turn from about 20 seconds before it, even before it counts as the turn signal; one the other way, or
