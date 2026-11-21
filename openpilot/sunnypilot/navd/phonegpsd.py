@@ -96,11 +96,16 @@ JUMP_SPEED = 1.5  # times the faster of two fixes' speeds, that the car may have
 JUMP_MARGIN = 30.  # m besides, for the positions' own errors
 EARTH_RADIUS = 6371000.  # m
 STATUS_WINDOW = 3.  # s of what came in that the status tells
-# The phone's app can do more over the same connection than send fixes, and for both the comma answers on it. A WPL
+# The phone's app can do more over the same connection than send fixes, and for both the comma answers on it. A PCLDS
 # sentence is a destination: it becomes navigation's, as one set on the navigation page, and goes back to the app as it
 # came, which is the app's word that the comma has it. And the comma tells the app what it makes of the fixes, so that the
-# app can show whether navigation follows the phone. A phone app that knows neither sends no WPL and ignores what it is
+# app can show whether navigation follows the phone. A phone app that knows neither sends no such sentence and ignores what it is
 # sent. All this needs no connection from the phone to the comma, which iOS only allows an app once its user said so.
+DESTINATION = 'PCLDS'  # the app's own sentence for a destination: no other app's waypoint is ever taken for one
+# The car's speed stands in only for a fix that has its own accuracy, and a good one: a phone that lost the sky still
+# reports a position, from Wi-Fi or cell towers, and such a one has no speed either. Its missing speed kept it out before,
+# and still must, at a standstill above all, where nothing else tells it from a real fix.
+CAR_SPEED_MAX_HDOP = 4.  # 20 m
 TELL_PERIOD = 2.  # s between the lines telling the app what is made of its data, while that stays the same
 MAX_NAME = 200  # characters of a destination's name, as on the navigation page
 STATUS_PERIOD = 1.  # s between writes of the status, at least
@@ -148,10 +153,11 @@ def sentence(line: bytes) -> tuple[str, list[str]] | None:
     return None
   fields = text.split(',')
   address = fields[0]
-  # the talker, then the type; a proprietary sentence starts with P
-  if not text.isprintable() or len(address) != 5 or not (address.isalpha() and address.isupper()) or address.startswith('P'):
+  if not text.isprintable() or len(address) != 5 or not (address.isalpha() and address.isupper()):
     return None
-  return address[2:], fields[1:]
+  if address.startswith('P'):  # a proprietary sentence: only the app's own, for a destination, means anything here
+    return (address, fields[1:]) if address == DESTINATION else None
+  return address[2:], fields[1:]  # the talker, then the type
 
 
 def number(text: str) -> float | None:
@@ -256,8 +262,8 @@ def parse_vtg(fields: list[str]) -> tuple[float | None, float | None] | None:
   return speed, course
 
 
-def parse_wpl(fields: list[str]) -> dict | None:
-  """$--WPL,lat,N/S,lon,E/W,name: a destination from the phone's app, as navigation keeps one, else None. The name comes
+def parse_destination(fields: list[str]) -> dict | None:
+  """$PCLDS,lat,N/S,lon,E/W,name: a destination from the phone's app, as navigation keeps one, else None. The name comes
   percent-encoded, since a sentence's fields can hold no comma."""
   if len(fields) < 5:
     return None
@@ -378,8 +384,8 @@ class PhoneFixes:
       self.heard['nmea'] = received
       vtg = parse_vtg(fields)
       self.vtg = None if vtg is None else (*vtg, received)
-    elif kind == 'WPL':  # a destination from the phone's app: no fix, and no word on whether the phone has one
-      destination = parse_wpl(fields)
+    elif kind == DESTINATION:  # from the phone's app: no fix, and no word on whether the phone has one
+      destination = parse_destination(fields)
       if destination is None:
         self.heard['unreadable'] = received
       else:
@@ -415,7 +421,8 @@ class PhoneFixes:
       fix.course = self.vtg[1] if fix.course is None else fix.course
     # A phone gives no speed for a car that stands still, and some fixes none at all. The car's own speed, off its
     # wheels, then stands in: it is what the car drives, and what navd counts its travel since the fix by.
-    if fix.speed is None and self.car_speed is not None:
+    # Only for a fix with its own, good accuracy: without a speed and without that, it is no satellite fix (CAR_SPEED_MAX_HDOP).
+    if fix.speed is None and self.car_speed is not None and fix.joined and fix.hdop is not None and fix.hdop <= CAR_SPEED_MAX_HDOP:
       fix.speed = self.car_speed
     # navd counts the car's travel since a fix by its speed, and its course rules need the course of a moving car
     if fix.speed is None or (fix.course is None and fix.speed >= COURSE_MIN_SPEED):
@@ -627,11 +634,14 @@ class PhoneGps:
     if self.tcp is None or not self.connected:
       return
     try:
-      self.tcp.send(data)
+      sent = self.tcp.send(data)
     except (BlockingIOError, InterruptedError):
-      pass  # the phone isn't reading: it does without
+      return  # the phone isn't reading: it does without this line
     except OSError as e:
       self.lost(time.monotonic(), FAILURES.get(e.errno or 0, 'closed'))
+      return
+    if sent != len(data):  # half a line would garble the next: the connection starts over, and the app asks again
+      self.lost(time.monotonic(), 'closed')
 
   def set_destination(self, destination: dict, sentence: bytes) -> None:
     """Makes a destination from the phone's app navigation's, as the navigation page does, and sends its sentence back as

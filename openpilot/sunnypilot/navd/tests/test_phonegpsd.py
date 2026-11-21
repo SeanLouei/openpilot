@@ -31,7 +31,7 @@ from openpilot.sunnypilot.navd import phonegpsd
 from openpilot.sunnypilot.navd.navweb import NavWeb
 from openpilot.sunnypilot.navd.phonegpsd import (CLOCK_AGREEMENT, CLOCK_DIFFERENCE, KNOTS, LATE_RESTART, MIN_ACCURACY, NOMINAL_ERROR, SPEED_ERROR,
                                                  VDOP_RATIO, Gga, PhoneFixes, PhoneGps, default_gateway, host_param, parse_gga, parse_rmc, parse_vtg,
-                                                 parse_wpl, port_param, sentence)
+                                                 parse_destination, port_param, sentence)
 from openpilot.sunnypilot.navd.tests.test_navd import ROUTE, route_engine
 from openpilot.sunnypilot.navd.tests.test_navweb import RUNNING, T, FakeParams, manager_state, page_state, position, receive, submaster
 from openpilot.sunnypilot.sunnylink.tools.compile_settings_ui import DEFAULT_OUT
@@ -408,15 +408,41 @@ class TestCarSpeed(OpenpilotTestCase):
     assert gps.car_speed() == 0.
     assert PhoneGps(Params(), MagicMock(), route_file='/nonexistent', wifi=lambda: None).car_speed() is None
 
+  def test_only_a_fix_with_its_own_good_accuracy_takes_the_car_s_speed(self):
+    # The car stands at a light under a roof: the phone has lost the sky and reports where Wi-Fi puts it, 45 m ahead,
+    # without a speed. Its missing speed must keep it out for as long as it lasts, also after the real fixes are forgotten.
+    fixes = PhoneFixes()
+    fixes.car_speed = 0.
+    assert take(fixes, self.lines(0, 100, speed=0., course=None), R0, T0 + .1) is None
+    assert take(fixes, self.lines(1, 100, speed=0., course=None), R0 + 1, T0 + 1.1) is not None
+    for second in range(2, 14):
+      assert take(fixes, self.lines(second, 145, speed=None, course=None, hdop='9'), R0 + second, T0 + second + .1) is None, second
+    assert fixes.heard['incomplete'] == R0 + 13
+    # nor does one whose accuracy is only the last epoch's, or not known at all
+    lone = PhoneFixes()
+    lone.car_speed = 0.
+    for second in range(4):
+      rmc = self.lines(second, 100, speed=None, course=None)[1:]
+      assert take(lone, rmc, R0 + second, T0 + second + .1) is None
+    assert lone.heard['incomplete'] == R0 + 3
+    # 20 m is the line
+    edge = PhoneFixes()
+    edge.car_speed = 0.
+    assert take(edge, self.lines(0, 100, speed=None, course=None, hdop='4.0'), R0, T0 + .1) is None
+    assert take(edge, self.lines(1, 100, speed=None, course=None, hdop='4.0'), R0 + 1, T0 + 1.1) is not None
+    assert take(edge, self.lines(2, 100, speed=None, course=None, hdop='4.1'), R0 + 2, T0 + 2.1) is None
+
   def test_a_destination_s_sentence(self):
-    place = parse_wpl(['5919.758000', 'N', '01804.116000', 'E', 'Caf%C3%A9%20X%2C%20Street%201'])
+    assert sentence(nmea('PCLDS,5919.758000,N,01804.116000,E,X').strip())[0] == 'PCLDS'
+    assert sentence(nmea('PGRMZ,246,f,3').strip()) is None and sentence(nmea('PCLST,fixes').strip()) is None
+    place = parse_destination(['5919.758000', 'N', '01804.116000', 'E', 'Caf%C3%A9%20X%2C%20Street%201'])
     assert place is not None and place['place_name'] == 'Café X, Street 1'
     assert abs(place['latitude'] - 59.3293) < 1e-6 and abs(place['longitude'] - 18.0686) < 1e-6
-    assert parse_wpl(['3330.000000', 'S', '07015.000000', 'W', '']) == {'latitude': -33.5, 'longitude': -70.25, 'place_name': ''}
-    assert parse_wpl(['5919.758000', 'N', '01804.116000', 'E', 'x' * 500])['place_name'] == 'x' * 200
+    assert parse_destination(['3330.000000', 'S', '07015.000000', 'W', '']) == {'latitude': -33.5, 'longitude': -70.25, 'place_name': ''}
+    assert parse_destination(['5919.758000', 'N', '01804.116000', 'E', 'x' * 500])['place_name'] == 'x' * 200
     for wrong in (['5919.758000', 'N', '01804.116000', 'E'], ['', '', '', '', 'Nowhere'], ['0000.000000', 'N', '00000.000000', 'E', 'Null'],
                   ['9919.758000', 'N', '01804.116000', 'E', 'North of the pole'], ['5919.758000', 'X', '01804.116000', 'E', 'No hemisphere']):
-      assert parse_wpl(wrong) is None, wrong
+      assert parse_destination(wrong) is None, wrong
 
 
 class TestClockDifference(OpenpilotTestCase):
@@ -658,22 +684,51 @@ class TestSources(OpenpilotTestCase):
     # the comma says what it makes of the data: nothing yet
     self.run_until(gps, lambda: gps.told is not None)
     assert connection.recv(4096) == b'$PCLST,none*' + f'{reduce(xor, b"PCLST,none", 0):02X}'.encode() + b'\r\n'
-    # a destination: it becomes navigation's, and comes back as it was sent
-    sentence = nmea('GPWPL,5919.758000,N,01804.116000,E,Sergels%20torg%2C%20Stockholm')
+    def heard(until) -> list[bytes]:
+      """the lines the comma sent, up to the first that until() is true of"""
+      lines, data = [], b''
+      while not (lines and until(lines[-1])):
+        while b'\r\n' not in data:
+          gps.step(.02)
+          try:
+            data += connection.recv(4096)
+          except TimeoutError:
+            pass
+        line, _, data = data.partition(b'\r\n')
+        lines.append(line)
+      return lines
+
+    connection.settimeout(.05)
+    # a destination: it becomes navigation's, and comes back as it was sent, between the comma's words on the data
+    sentence = nmea('PCLDS,5919.758000,N,01804.116000,E,Sergels%20torg%2C%20Stockholm')
     connection.sendall(sentence)
-    self.run_until(gps, lambda: gps.params.get('NavDestination') is not None)
+    lines = heard(lambda line: not line.startswith(b'$PCLST,'))
+    assert lines[-1] == sentence.rstrip()
     destination = gps.params.get('NavDestination')
-    assert destination['place_name'] == 'Sergels torg, Stockholm'
-    assert abs(destination['latitude'] - 59.3293) < 1e-6 and abs(destination['longitude'] - 18.0686) < 1e-6
-    assert connection.recv(4096) == sentence
+    assert destination == {'latitude': 59.3293, 'longitude': 18.0686, 'place_name': 'Sergels torg, Stockholm'}
     assert not self.published(gps)  # a destination is no fix
-    # one that can't be read changes nothing and gets no answer of its own
-    connection.sendall(nmea('GPWPL,0000.000000,N,00000.000000,E,Nowhere') + nmea('GPWPL,9919.758000,N,01804.116000,E,Wrong'))
+    # one that can't be read, and another app's waypoint, change nothing and get no answer
+    connection.sendall(nmea('PCLDS,0000.000000,N,00000.000000,E,Nowhere') + nmea('PCLDS,9919.758000,N,01804.116000,E,Wrong')
+                       + nmea('GPWPL,5800.000000,N,01200.000000,E,WAYPOINT1') + nmea('ECWPL,5800.000000,N,01200.000000,E,WAYPOINT2'))
     self.send_fixes(gps, connection.sendall)
     assert gps.params.get('NavDestination') == destination
-    self.run_until(gps, lambda: gps.told == 'fixes')
-    told = connection.recv(4096)
-    assert b'$GPWPL' not in told and told.rstrip().split(b'\r\n')[-1].startswith(b'$PCLST,fixes*')
+    lines = heard(lambda line: line.startswith(b'$PCLST,fixes*'))
+    assert all(line.startswith(b'$PCLST,') for line in lines)
+
+  def test_half_a_line_to_the_phone_starts_the_connection_over(self):
+    server = self.server()
+    gps = self.phone_gps(server.getsockname()[1])
+    self.run_until(gps, lambda: gps.connected)
+    connection, _ = server.accept()
+    self.addCleanup(connection.close)
+    with patch.object(gps, 'tcp', MagicMock(send=MagicMock(return_value=3), close=MagicMock())):
+      gps.reply(b'$PCLST,fixes*00\r\n')
+    assert not gps.connected and gps.problem == 'closed'
+    # a phone that isn't reading costs only the line
+    self.run_until(gps, lambda: gps.connected)
+    with patch.object(gps, 'tcp', MagicMock(send=MagicMock(side_effect=BlockingIOError), close=MagicMock())):
+      gps.reply(b'$PCLST,fixes*00\r\n')
+      assert gps.connected
 
   def test_tcp_only_to_the_gateway(self):
     # never listening for a connection: the phone is only ever the address phonegpsd connects to
