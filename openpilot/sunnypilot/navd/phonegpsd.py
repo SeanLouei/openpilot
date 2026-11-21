@@ -22,13 +22,14 @@ from dataclasses import dataclass
 from functools import reduce
 from ipaddress import IPv4Address
 from operator import xor
+from urllib.parse import unquote
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.navigation.helpers import PHONE_MAX_DELAY
-from openpilot.sunnypilot.navd.navweb import WIFI_INTERFACE, wifi_address
+from openpilot.sunnypilot.navd.navweb import WIFI_INTERFACE, valid_coordinates, wifi_address
 
 DEFAULT_PORT = 11123  # GPS2IP's socket mode
 ROUTE_FILE = '/proc/net/route'
@@ -95,6 +96,13 @@ JUMP_SPEED = 1.5  # times the faster of two fixes' speeds, that the car may have
 JUMP_MARGIN = 30.  # m besides, for the positions' own errors
 EARTH_RADIUS = 6371000.  # m
 STATUS_WINDOW = 3.  # s of what came in that the status tells
+# The phone's app can do more over the same connection than send fixes, and for both the comma answers on it. A WPL
+# sentence is a destination: it becomes navigation's, as one set on the navigation page, and goes back to the app as it
+# came, which is the app's word that the comma has it. And the comma tells the app what it makes of the fixes, so that the
+# app can show whether navigation follows the phone. A phone app that knows neither sends no WPL and ignores what it is
+# sent. All this needs no connection from the phone to the comma, which iOS only allows an app once its user said so.
+TELL_PERIOD = 2.  # s between the lines telling the app what is made of its data, while that stays the same
+MAX_NAME = 200  # characters of a destination's name, as on the navigation page
 STATUS_PERIOD = 1.  # s between writes of the status, at least
 # What came in, the most telling first: the status names the first heard within STATUS_WINDOW
 DATA_STATES = ('fixes', 'starting', 'inaccurate', 'delayed', 'late', 'jump', 'incomplete', 'no_fix', 'no_rmc', 'unreadable')
@@ -248,6 +256,24 @@ def parse_vtg(fields: list[str]) -> tuple[float | None, float | None] | None:
   return speed, course
 
 
+def parse_wpl(fields: list[str]) -> dict | None:
+  """$--WPL,lat,N/S,lon,E/W,name: a destination from the phone's app, as navigation keeps one, else None. The name comes
+  percent-encoded, since a sentence's fields can hold no comma."""
+  if len(fields) < 5:
+    return None
+  where = position(fields[0:4])
+  if isinstance(where, str) or not valid_coordinates(*where):
+    return None
+  name = ' '.join(unquote(fields[4]).split())[:MAX_NAME]
+  # to a centimeter: the digits beyond are the arithmetic's, not the place's
+  return {'latitude': round(where[0], 7), 'longitude': round(where[1], 7), 'place_name': name if name.isprintable() else ''}
+
+
+def outgoing(body: str) -> bytes:
+  """A sentence for the phone's app, with its checksum and line end."""
+  return f'${body}*{reduce(xor, body.encode(), 0):02X}\r\n'.encode()
+
+
 def distance(a: Fix, b: Fix) -> float:
   """m between two fixes, close together."""
   east = (b.longitude - a.longitude + 180) % 360 - 180
@@ -318,6 +344,8 @@ class PhoneFixes:
     self.course: float | None = None  # deg; the moving car's last
     self.clocks_agree: bool | None = None  # whether the last fix out went with its own time, the phone's clock agreeing with the comma's
     self.heard: dict[str, float] = {}  # when each of DATA_STATES, and any RMC or other sentence, last came in
+    self.car_speed: float | None = None  # m/s; the car's own speed now, where known: it stands in where a fix has none
+    self.destination: tuple[dict, bytes] | None = None  # the newest destination from the phone's app, with its sentence, until taken
 
   def add(self, line: bytes, received: float, wall: float) -> None:
     """A line that arrived at monotonic time received, which was wall on the comma's clock."""
@@ -350,6 +378,12 @@ class PhoneFixes:
       self.heard['nmea'] = received
       vtg = parse_vtg(fields)
       self.vtg = None if vtg is None else (*vtg, received)
+    elif kind == 'WPL':  # a destination from the phone's app: no fix, and no word on whether the phone has one
+      destination = parse_wpl(fields)
+      if destination is None:
+        self.heard['unreadable'] = received
+      else:
+        self.destination = (destination, line[line.rfind(b'$'):])
     else:  # GSA, GSV, GLL and the like say nothing that RMC and GGA don't
       self.heard['nmea'] = received
 
@@ -379,6 +413,10 @@ class PhoneFixes:
     if self.vtg is not None and abs(fix.received - self.vtg[2]) <= VTG_WINDOW:
       fix.speed = self.vtg[0] if fix.speed is None else fix.speed
       fix.course = self.vtg[1] if fix.course is None else fix.course
+    # A phone gives no speed for a car that stands still, and some fixes none at all. The car's own speed, off its
+    # wheels, then stands in: it is what the car drives, and what navd counts its travel since the fix by.
+    if fix.speed is None and self.car_speed is not None:
+      fix.speed = self.car_speed
     # navd counts the car's travel since a fix by its speed, and its course rules need the course of a moving car
     if fix.speed is None or (fix.course is None and fix.speed >= COURSE_MIN_SPEED):
       return 'incomplete'
@@ -460,8 +498,8 @@ class PhoneGps:
   """phonegpsd: a TCP connection to the phone on PhoneGpsPort, publishing each fix that passes as it arrives. Its state goes
   to PhoneGpsStatus for the navigation page."""
 
-  def __init__(self, params, pm, route_file: str = ROUTE_FILE, wifi=wifi_address):
-    self.params, self.pm, self.route_file, self.wifi = params, pm, route_file, wifi
+  def __init__(self, params, pm, route_file: str = ROUTE_FILE, wifi=wifi_address, sm=None):
+    self.params, self.pm, self.route_file, self.wifi, self.sm = params, pm, route_file, wifi, sm
     self.fixes = PhoneFixes()
     self.phone: str | None = None  # the address phonegpsd connects to
     self.address: str | None = None  # the comma's own on Wi-Fi
@@ -478,6 +516,8 @@ class PhoneGps:
     self.problem: str | None = None  # why the last attempt failed, or the last connection ended
     self.status: dict | None = None
     self.status_time = -math.inf
+    self.told: str | None = None  # what the app was last told of its data
+    self.told_time = -math.inf
 
   def lookup(self, now: float) -> None:
     """Where the phone is: PhoneGpsHost, else the Wi-Fi's default gateway, while the comma has an address on Wi-Fi."""
@@ -572,6 +612,50 @@ class PhoneGps:
       except Exception:
         cloudlog.exception("phonegpsd.status_failed")
 
+  def car_speed(self) -> float | None:
+    """The car's speed now (m/s), else None: with no carState lately, or none to read."""
+    if self.sm is None:
+      return None
+    self.sm.update(0)
+    if not (self.sm.alive['carState'] and self.sm.valid['carState']):
+      return None
+    speed = float(self.sm['carState'].vEgo)
+    return max(speed, 0.) if math.isfinite(speed) else None
+
+  def reply(self, data: bytes) -> None:
+    """Sends the phone a line over the connection. Its app reads these; another app ignores them."""
+    if self.tcp is None or not self.connected:
+      return
+    try:
+      self.tcp.send(data)
+    except (BlockingIOError, InterruptedError):
+      pass  # the phone isn't reading: it does without
+    except OSError as e:
+      self.lost(time.monotonic(), FAILURES.get(e.errno or 0, 'closed'))
+
+  def set_destination(self, destination: dict, sentence: bytes) -> None:
+    """Makes a destination from the phone's app navigation's, as the navigation page does, and sends its sentence back as
+    it came: the app's word that the comma has it."""
+    try:
+      if self.params.get("NavDestination") != destination:
+        self.params.put("NavDestination", destination, block=True)
+    except Exception:
+      cloudlog.exception("phonegpsd.destination_failed")
+      return
+    cloudlog.warning("phonegpsd: a destination from the phone")  # not where: that stays out of the logs
+    self.reply(sentence + b'\r\n')
+
+  def tell(self, now: float) -> None:
+    """Tells the phone's app what is made of its data, as one of DATA_STATES or none: when that changes, and every
+    TELL_PERIOD besides."""
+    if not self.connected:
+      self.told = None
+      return
+    state = self.fixes.data_state(now) or 'none'
+    if state != self.told or now - self.told_time >= TELL_PERIOD:
+      self.told, self.told_time = state, now
+      self.reply(outgoing(f'PCLST,{state}'))
+
   def step(self, timeout: float = 1.) -> None:
     """Waits for data up to timeout, reads it, and publishes the fix it brings, if any."""
     now = time.monotonic()
@@ -599,9 +683,14 @@ class PhoneGps:
         self.read_tcp(now, wall)
       elif now - self.tcp_heard > SILENCE_TIMEOUT:  # gone without closing, as when the phone leaves
         self.lost(now, 'silent')
+    self.fixes.car_speed = self.car_speed()
     message = self.fixes.take(now)
     if message is not None:
       self.pm.send('gpsLocation', message)
+    if self.fixes.destination is not None:
+      (destination, sentence), self.fixes.destination = self.fixes.destination, None
+      self.set_destination(destination, sentence)
+    self.tell(now)
     self.write_status(now)
 
   def close(self) -> None:
@@ -610,7 +699,7 @@ class PhoneGps:
 
 def main() -> None:
   params = Params()
-  phone = PhoneGps(params, messaging.PubMaster(['gpsLocation']))
+  phone = PhoneGps(params, messaging.PubMaster(['gpsLocation']), sm=messaging.SubMaster(['carState']))
   try:
     while True:
       phone.step()
