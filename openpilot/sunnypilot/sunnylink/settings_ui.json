@@ -650,6 +650,33 @@
               ]
             },
             {
+              "key": "NavAutoTurnFarAnyRoad",
+              "widget": "toggle",
+              "title": "Left Turns on Any Road (Alpha)",
+              "description": "Needs Automatic Left Turns. Also turns left on its own (right where traffic keeps left) where there is no raised median or curb beside the car, as on an ordinary two-way road, straight across the oncoming lane. Everything else Automatic Left Turns asks for still holds, and where the route's lane guidance gives the turn to only some of the lanes, the car still waits for your blinker. Change it while parked.",
+              "details": "With this on, nothing tells the car that it is in the leftmost lane: on a road with two lanes your way and no lane guidance in the map, it turns left from whichever lane it is in, across the lane beside it. A car in that blind spot holds the turn back, one coming up fast from behind does not. The car does not see oncoming traffic, turn arrows, red lights or stop signs, and does not judge gaps: Turning Across Traffic chimes at least 2 seconds before it steers across, and it is on you to brake for oncoming traffic. On a Tesla, braking turns steering off as well as speed control, so finish the turn yourself. The posted limit must still be known and 45 mph (72 km/h) or less, driver monitoring must not be warning, the turn must not be a sharp one or at the end of the road, and after a stop near the turn it is left to you. Turning without signaling is illegal in most places and gives others no warning: signal yourself where you can. This setting is not restored from a sunnylink backup.",
+              "enablement": [
+                {
+                  "type": "offroad_only"
+                },
+                {
+                  "type": "param",
+                  "key": "NavigationEnabled",
+                  "equals": true
+                },
+                {
+                  "type": "param",
+                  "key": "NavAutoTurn",
+                  "equals": true
+                },
+                {
+                  "type": "param",
+                  "key": "NavAutoTurnFarSide",
+                  "equals": true
+                }
+              ]
+            },
+            {
               "key": "NavExitDesire",
               "widget": "toggle",
               "title": "Navigation Exit Desires (Alpha)",

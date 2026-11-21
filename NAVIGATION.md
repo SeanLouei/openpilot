@@ -72,6 +72,8 @@ by default; with them off, the car drives like plain sunnypilot.
   keeps right) wait for your blinker unless *auto left turns (alpha)* is on, and even then most of them do: see
   *Automatic left turns* below.
 
+**Left turns on any road (alpha)** is a further switch, off unless you turn it on, and it needs auto left turns. With it the car also turns left by itself where there is no raised median or curb beside it, as on an ordinary two-way road, straight across the oncoming lane. Everything else auto left turns asks for still holds: a known posted limit of 45 mph (72 km/h) or less, no sharp turn or T junction, driver monitoring quiet, no car in that blind spot, and never after a stop near the turn. Where the map gives the turn to only some of the lanes, the car still waits for your blinker. The car cannot see oncoming traffic and, with this on, cannot tell which lane it is in: "Turning Across Traffic" chimes at least 2 seconds before it steers across, and braking for oncoming traffic is on you.
+
   The curb-lane check can't see a bike lane behind a curb or posts, and it may take a narrow painted bike lane for the curb
   lane, so **before every automatic turn, check for cyclists on the side you're turning to**, or signal.
 - **Automatic turn lanes** (*auto turn lanes (alpha)*): for a right turn (left where traffic keeps left), from the curb

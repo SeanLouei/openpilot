@@ -312,6 +312,13 @@ def far_turn_lane(lanes, left: bool) -> bool:
   return bool(lane.active) and direction in side
 
 
+def any_lane_turns(lanes) -> bool:
+  """Whether, as far as the route's lane guidance tells, the car's lane does not matter for the turn: there is no guidance,
+  as for a road with one lane each way, or every lane may make the turn. Where only some may, guidance never tells which
+  one the car is in."""
+  return all(bool(lane.active) for lane in lanes)
+
+
 def road_view(model) -> RoadView:
   """The model message's road edges and lane lines, for the turn lane test. It never raises: modeld calls it outside
   DesireHelper's guard."""
@@ -631,6 +638,8 @@ class NavDesireController:
     self.turn_enabled = False
     self.auto_enabled = False
     self.far_enabled = False
+    self.far_open = False  # automatic far side turns also without a curb or median beside the car, on any road
+    self.open_road = False  # ...and this maneuver's lane guidance lets them: every lane may make the turn
     self.lane_enabled = False
     self.exit_enabled = False
     self.standstill = True  # the car stood still on the last frame; modeld starts with the drive, from parked
@@ -711,6 +720,9 @@ class NavDesireController:
     # automatic route turns are switched on while driving with them already set; they go off at once
     far = self.auto_enabled and self.params.get_bool("NavAutoTurnFarSide")
     self.far_enabled = far and (self.far_enabled or self.standstill)
+    # and those without a curb or median beside the car only with them, switched on the same way
+    far_open = self.far_enabled and self.params.get_bool("NavAutoTurnFarAnyRoad")
+    self.far_open = far_open and (self.far_open or self.standstill)
     # so do automatic turn lanes, which are for near side turns only
     lane = self.auto_enabled and self.params.get_bool("NavAutoTurnLane")
     self.lane_enabled = lane and (self.lane_enabled or self.standstill)
@@ -764,7 +776,11 @@ class NavDesireController:
                                 for d, outer in zip(self.outer_lane_distance, nav.outer_lanes, strict=True)]
     # a car in the blind spot beside the curb means a lane there after all, so the curb counts again once it is gone
     blindspots = (carstate.leftBlindspot, carstate.rightBlindspot)
-    curbs = [far and not lane_changing and not blindspot for far, blindspot in zip(nav.far_lanes, blindspots, strict=True)]
+    # With automatic far side turns on any road, the lane's run counts without a curb beside it too, where the route's lane
+    # guidance lets every lane make the turn: 1.5 s and 10 m without a lane change or a car in that blind spot. The car
+    # then crosses whatever lies to that side of its lane; every other condition of an automatic far side turn stays.
+    self.open_road = bool(self.far_open and nav.instruction is not None and any_lane_turns(nav.instruction.lanes))
+    curbs = [(far or self.open_road) and not lane_changing and not blindspot for far, blindspot in zip(nav.far_lanes, blindspots, strict=True)]
     self.far_lane_time = [t + DT_MDL if curb else 0. for t, curb in zip(self.far_lane_time, curbs, strict=True)]
     self.far_lane_distance = [d + v_ego * DT_MDL if curb else 0. for d, curb in zip(self.far_lane_distance, curbs, strict=True)]
     self.dm_quiet = 0. if nav.driver_alert else self.dm_quiet + DT_MDL
@@ -1054,7 +1070,7 @@ class NavDesireController:
     the slowdown will impose, before the latest start, FAR_TURN_MIN_LEAD before the steering point."""
     side = 0 if left else 1
     blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
-    if (self.auto_off or blindspot or carstate.leftBlinker or carstate.rightBlinker or not nav.far_lanes[side]
+    if (self.auto_off or blindspot or carstate.leftBlinker or carstate.rightBlinker or not (nav.far_lanes[side] or self.open_road)
         or not self._far_gates(carstate, nav, v_ego, left) or not self._can_make_turn(carstate, nav, v_ego, left, AUTO_TURN_MAX_SPEED)):
       return False
     distance = self.tracker.nearest

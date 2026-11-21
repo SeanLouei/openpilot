@@ -129,6 +129,14 @@ class ModelsLayoutMici(NavScroller):
                                                               "oncoming traffic, arrows or red lights: watch and brake (on a Tesla, braking " +
                                                               "turns steering off: finish the turn yourself). Turn it on while parked; with auto " +
                                                               "route turns switched on while driving, it comes on at the next stop."))
+    self.nav_far_open_toggle = BigParamControl(tr("left turns on any road (alpha)"), "NavAutoTurnFarAnyRoad",
+                                               description=tr("Needs auto left turns. Also turns left on its own (right where traffic keeps " +
+                                                              "left) with no median or curb beside the car, as on a two-way road: straight " +
+                                                              "across the oncoming lane. It can't see oncoming traffic and can't tell which " +
+                                                              "lane it is in: watch every turn and brake for oncoming traffic (on a Tesla, " +
+                                                              "braking turns steering off: finish the turn yourself). Where the route's lane " +
+                                                              "guidance gives the turn to only some lanes, it still waits for your blinker. " +
+                                                              "Turn it on while parked."))
     self.nav_turn_lane_toggle = BigParamControl(tr("auto turn lanes (alpha)"), "NavAutoTurnLane",
                                                 description=tr("Needs auto route turns. Right turns only (left where traffic keeps left): " +
                                                                "from the curb lane, moves by itself into a turn lane that opens beside it " +
@@ -154,6 +162,7 @@ class ModelsLayoutMici(NavScroller):
 
     self.main_items = [self.current_model_info, self.select_model_btn, self.cancel_download_btn, self.refresh_btn, self.clear_cache_btn,
                        self.blendful_toggle, self.nav_turn_toggle, self.nav_auto_turn_toggle, self.nav_far_turn_toggle, self.nav_turn_lane_toggle,
+                       self.nav_far_open_toggle,
                        self.nav_exit_toggle, self.phone_gps_toggle]
     self._scroller.add_widgets(self.main_items)
 
@@ -270,6 +279,7 @@ class ModelsLayoutMici(NavScroller):
     self.nav_turn_toggle.refresh()
     self.nav_auto_turn_toggle.refresh()
     self.nav_far_turn_toggle.refresh()
+    self.nav_far_open_toggle.refresh()
     self.nav_turn_lane_toggle.refresh()
     self.nav_exit_toggle.refresh()
     self.phone_gps_toggle.refresh()
@@ -302,6 +312,13 @@ class ModelsLayoutMici(NavScroller):
     far_value = "" if navigation and auto_turns else tr("needs navigation") if not navigation else tr("needs auto route turns")
     if self.nav_far_turn_toggle.value != far_value:
       self.nav_far_turn_toggle.set_value(far_value)
+    # left turns on any road need automatic left turns, and are switched the same way
+    open_checked = far_checked and ui_state.params.get_bool("NavAutoTurnFarAnyRoad")
+    self.nav_far_open_toggle.set_checked(open_checked)
+    self.nav_far_open_toggle.set_enabled(far_checked and (ui_state.is_offroad() or open_checked))
+    open_value = "" if far_checked else tr("needs auto left turns")
+    if self.nav_far_open_toggle.value != open_value:
+      self.nav_far_open_toggle.set_value(open_value)
     lane_checked = navigation and auto_turns and ui_state.params.get_bool("NavAutoTurnLane")
     self.nav_turn_lane_toggle.set_checked(lane_checked)
     self.nav_turn_lane_toggle.set_enabled(navigation and auto_turns and (ui_state.is_offroad() or lane_checked))

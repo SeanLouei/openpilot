@@ -22,7 +22,7 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import AUTO_FAR_LIMIT_DISTANCE, FAR_LANE_DISTANCE, FAR_PROMPT_DEBOUNCE, \
   FAR_SIGNAL_LEAD, FAR_TURN_MIN_LEAD, NAV_TURN_DECEL, NAV_TURN_MAX_DECEL, NAV_TURN_REFRESH_LEAD, NAV_TURN_SPEED, NAV_TURN_STEER_DISTANCE, \
-  NAV_TURN_TRIGGER_TIME, NavDesireController, NavInputs, far_lanes, far_turn_lane, nav_inputs, posted_speed_limit, time_to_steer
+  NAV_TURN_TRIGGER_TIME, NavDesireController, NavInputs, any_lane_turns, far_lanes, far_turn_lane, nav_inputs, posted_speed_limit, time_to_steer
 from openpilot.sunnypilot.selfdrive.controls.lib.tests.test_nav_desire import TURN_DESIRES, TURN_DIRECTIONS, FakeSubMaster, car_state, \
   closed_loop, in_history, nudge, pulses, slowed_trigger_distance
 
@@ -887,3 +887,79 @@ class TestFarNavInputsReplay(OpenpilotTestCase):
       d -= 4.5 * DT_MDL
     edges = pulses(frames)
     assert len(edges) == 1 and NAV_TURN_STEER_DISTANCE < edges[0] <= 45. - FAR_LANE_DISTANCE + 1e-6
+
+
+class TestFarAnyRoad(OpenpilotTestCase):
+  """Automatic far side turns on any road: the setting that lets the turn start with no curb or median beside the car."""
+
+  def open_controller(self, **settings):
+    c = far_controller(**settings)
+    c.far_open = True
+    return c
+
+  def test_turns_on_a_two_way_road(self):
+    # no curb and no lane guidance: one pulse, on time, announced, never a prompt
+    frames = run(self.open_controller(), 60., 4.5, 14., lanes=(), far_lanes=(False, False))
+    edges = pulses(frames)
+    assert len(edges) == 1 and abs(edges[0] - slowed_trigger_distance(4.5)) <= 4.5 * DT_MDL + 1e-6
+    assert not any(f[2] for f in frames)
+    assert all(f[3] for f in frames if NAV_TURN_STEER_DISTANCE < f[1] <= edges[0])  # Turning Across Traffic while it holds the turn
+
+  def test_off_unless_switched_on(self):
+    frames = run(far_controller(), 60., 4.5, 13., lanes=(), far_lanes=(False, False))
+    assert not pulses(frames) and any(f[2] for f in frames)  # as before: it asks for the blinker
+
+  def test_every_lane_turning_counts_as_any_lane(self):
+    both = guidance((('left',), 'left'), (('left', 'straight'), 'left'))
+    assert len(pulses(run(self.open_controller(), 60., 4.5, 14., lanes=both, far_lanes=(False, False)))) == 1
+
+  @parameterized.expand([
+    # (name, car state, route inputs): none of these starts by itself, and each asks for the blinker
+    ('lane guidance gives the turn to one lane of three', {}, {'lanes': BAY}),
+    ('lane guidance puts the turn in another lane', {}, {'lanes': guidance((('straight',), None), (('left',), 'left'))}),
+    ('sharp left', {}, {'modifier': 'sharp left'}),
+    ('end of road: a T junction', {}, {'maneuver_type': 'end of road'}),
+    ('posted limit unknown', {}, {'speed_limit': 0.}),
+    ('posted 50 mph', {}, {'speed_limit': MPH50}),
+    ('driver monitoring warning', {}, {'driver_alert': True}),
+    ('a car in the blind spot', {'leftBlindspot': True}, {}),
+  ])
+  def test_still_waits_for_the_blinker(self, _name, car_fields, inputs):
+    inputs = {'lanes': ()} | inputs
+    frames = run(self.open_controller(), 60., 4.5, 13., carstate=car_state(vEgo=4.5, **car_fields), far_lanes=(False, False), **inputs)
+    assert not pulses(frames) and any(f[2] for f in frames)
+
+  def test_a_car_in_the_blind_spot_restarts_the_run(self):
+    # it leaves too late for 1.5 s and 10 m without it before the latest start: no turn by itself
+    def carstate(distance):
+      return car_state(vEgo=4.5, leftBlindspot=distance > 22.)
+    frames = run(self.open_controller(), 60., 4.5, 13., carstate=carstate, lanes=(), far_lanes=(False, False))
+    assert not pulses(frames)
+
+  def test_the_setting_needs_far_turns_and_a_standstill(self):
+    params = Params()
+    c = NavDesireController()  # made with the car standing and the settings off
+    c.standstill = False
+    for key in ('NavAutoTurn', 'NavAutoTurnFarSide', 'NavAutoTurnFarAnyRoad'):
+      params.put_bool(key, True)
+    c.read_params()
+    assert not c.far_enabled and not c.far_open  # switched on while driving: not until the car stands
+    c.standstill = True
+    c.read_params()
+    assert c.far_enabled and c.far_open
+    c.standstill = False
+    c.read_params()
+    assert c.far_open  # and stays on
+    params.put_bool('NavAutoTurnFarSide', False)
+    c.read_params()
+    assert not c.far_open  # off at once with automatic far side turns
+    params.put_bool('NavAutoTurnFarSide', True)
+    params.put_bool('NavAutoTurnFarAnyRoad', False)
+    c.standstill = True
+    c.read_params()
+    assert c.far_enabled and not c.far_open
+
+  def test_any_lane_turns(self):
+    assert any_lane_turns(far_instruction(lanes=()).lanes)
+    assert any_lane_turns(far_instruction(lanes=guidance((('left',), 'left'), (('left', 'straight'), 'left'))).lanes)
+    assert not any_lane_turns(far_instruction(lanes=BAY).lanes)
