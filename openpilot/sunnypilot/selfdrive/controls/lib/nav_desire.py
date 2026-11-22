@@ -211,22 +211,30 @@ NAV_KEEP_AMBIGUOUS_SPLIT_SCALE = 0.6
 NAV_KEEP_SMALL_SPLIT_MAX_OTHER_LANES = 2
 
 # Automatic exits (NavAutoExit): the keep desire toward an exit or fork on the near side goes out without the driver's nudge,
-# only from the outermost lane on that side. On a highway the road edge lies beyond the shoulder, so that lane is told by a
-# sure road edge within half a lane and a shoulder of the car and no lane line beyond the car's own, for EXIT_LANE_TIME and
-# EXIT_LANE_DISTANCE with no lane change and no car in that blind spot. A deceleration lane opening beside the car before
-# the exit hides that edge, so the lane stays confirmed for EXIT_MEMORY after the edge was last seen there, unless the car
-# changes lanes, the steering goes off or the driver steers away from that side. A lane that joined the road farther back,
-# and was there all along, is forgotten by then.
+# only from the outermost lane on that side, as the model sees it right then. On a highway the road edge lies beyond the
+# shoulder, so that lane is told by the car's own lane line on that side, surely seen, a sure road edge at most a shoulder
+# beyond it, and no lane line beyond that: from the lane beside, a whole lane lies between the line and the edge. The model
+# must have seen that for EXIT_LANE_TIME and EXIT_LANE_DISTANCE with no lane change and no car in that blind spot, and still
+# see it, but for EXIT_SEEN_TIME of misreading. A lane that joins or opens beside the car, a deceleration lane too, ends
+# that, so the exit then waits for the nudge.
 EXIT_EDGE_MIN = 1.0  # m from the car's center; nearer, the edge would be under the car, a bad reading
-EXIT_EDGE_DISTANCE = 4.8  # m: half a lane and a 3 m shoulder; from the lane beside, without a shoulder, the edge is 5.2 m away
-EXIT_EDGE_STD = 0.5  # m the model may be unsure of the edge's position
+EXIT_EDGE_DISTANCE = 4.5  # m from the car's center, at most: half a lane and a shoulder
+EXIT_SHOULDER = 2.5  # m the edge may lie beyond the car's own lane line, at most
+EXIT_EDGE_STD = 0.3  # m the model may be unsure of the edge's position
+EXIT_OWN_LINE_PROB = 0.5  # the car's own lane line on that side: surely seen
+EXIT_BEYOND_PROB = 0.1  # a lane line beyond it: surely not
 EXIT_LANE_TIME = 2.0  # s
 EXIT_LANE_DISTANCE = 50.  # m
-EXIT_MEMORY = 300.  # m, longer than a deceleration lane
-# The model takes a desire as a pulse and forgets it after about 5 s, so an automatic keep desire goes out again every
-# EXIT_REFRESH_TIME, until EXIT_REFRESH_LEAD before the split: one after it could carry on to the next split.
+EXIT_SEEN_TIME = 0.5  # s
+# The model takes a desire as a pulse and keeps it for about EXIT_PULSE_MEMORY. The automatic keep's first pulse goes out
+# EXIT_START_LEAD or more before the split, never later, and again every EXIT_REFRESH_TIME while all holds, until
+# EXIT_REFRESH_LEAD before the split: one after it could carry on to the next split. Once anything holds it back, or the
+# car is no longer seen in the outermost lane, no further pulse goes out for that split, while Taking Exit stays for as
+# long as the model may still have the last one.
+EXIT_START_LEAD = 3.0  # s
 EXIT_REFRESH_TIME = 2.0  # s
 EXIT_REFRESH_LEAD = 1.5  # s
+EXIT_PULSE_MEMORY = 5.0  # s
 
 # Mapbox maneuver types that are turns at an intersection with a left or right modifier; 'continue' stays on its road
 TURN_TYPES = ('turn', 'end of road', 'on ramp', 'continue')
@@ -304,17 +312,24 @@ def outer_lanes(model) -> tuple[bool, bool]:
 
 
 def exit_lanes(model) -> tuple[bool, bool]:
-  """Whether the model sees the car in a highway's outermost lane on each side: a sure road edge on that side, beyond the
-  car's lane but within a shoulder of it, and no lane line beyond the car's own. outer_lanes, for a road with a shoulder."""
-  stds, probs, edges = model.roadEdgeStds, model.laneLineProbs, model.roadEdges
-  if len(stds) < 2 or len(probs) < 4 or len(edges) < 2 or not len(edges[0].y) or not len(edges[1].y):
+  """Whether the model sees the car in a highway's outermost lane on each side: the car's own lane line on that side surely
+  seen, a sure road edge beyond it by at most a shoulder, and no lane line beyond the car's own. It never raises: modeld
+  calls it outside DesireHelper's guard."""
+  try:
+    stds, probs, edges, lines = model.roadEdgeStds, model.laneLineProbs, model.roadEdges, model.laneLines
+    if len(stds) < 2 or len(probs) < 4 or len(edges) < 2 or len(lines) < 4:
+      return False, False
+
+    def outermost(side: int, own_line: int, outer_line: int, sign: float) -> bool:
+      if not len(edges[side].y) or not len(lines[own_line].y):
+        return False
+      edge, line, std = sign * float(edges[side].y[0]), sign * float(lines[own_line].y[0]), float(stds[side])
+      return bool(EXIT_EDGE_MIN < edge < EXIT_EDGE_DISTANCE and 0. <= std < EXIT_EDGE_STD and 0. < line < edge <= line + EXIT_SHOULDER
+                  and probs[own_line] > EXIT_OWN_LINE_PROB and probs[outer_line] < EXIT_BEYOND_PROB)  # NaN fails every comparison
+
+    return outermost(0, 1, 0, -1.), outermost(1, 2, 3, 1.)
+  except Exception:
     return False, False
-
-  def outermost(side: int, outer_line: int, sign: float) -> bool:
-    distance, std = sign * float(edges[side].y[0]), float(stds[side])  # NaN fails every comparison
-    return bool(EXIT_EDGE_MIN < distance < EXIT_EDGE_DISTANCE and 0. <= std < EXIT_EDGE_STD and probs[outer_line] < NEARSIDE_PROB)
-
-  return outermost(0, 0, -1.), outermost(1, 3, 1.)
 
 
 def far_lanes(model) -> tuple[bool, bool]:
@@ -691,14 +706,17 @@ class NavDesireController:
     self.far_lane_distance = [0., 0.]
     self.dm_quiet = math.inf  # s since driver monitoring last warned
     # automatic exits: s and m the model has seen the car in a highway's outermost lane on its (left, right), with no lane
-    # change and no car in that blind spot; whether that lane is confirmed; m driven since its edge was last seen there
+    # change and no car in that blind spot; whether it still sees it there, confirmed; s since it last did
     self.exit_lane_time = [0., 0.]
     self.exit_lane_distance = [0., 0.]
     self.exit_confirmed = [False, False]
-    self.exit_gone = [0., 0.]
-    self.exit_maneuver: int | None = None  # the maneuver whose automatic keep desire began at exit_frame, for its repeats
+    self.exit_unseen = [0., 0.]
+    # the maneuver whose automatic keep began at exit_frame; the frame of its last pulse; whether the frame before dropped it
+    self.exit_maneuver: int | None = None
     self.exit_frame = 0
-    self.exit_off_maneuver: int | None = None  # the maneuver the driver called the automatic keep off for
+    self.exit_edge_frame = 0
+    self.exit_dropped = False
+    self.exit_off_maneuver: int | None = None  # the maneuver whose automatic keep was held back or called off: no more pulses
     self.road_limit = 0.  # m/s the highest posted limit within AUTO_FAR_LIMIT_DISTANCE of the current maneuver, 0 unknown
     self.was_lane_changing = False
     self.lane_change_end: int | None = None  # the frame the last lane change ended
@@ -771,7 +789,9 @@ class NavDesireController:
     lane = self.auto_enabled and self.params.get_bool("NavAutoTurnLane")
     self.lane_enabled = lane and (self.lane_enabled or self.standstill)
     self.exit_enabled = self.params.get_bool("NavExitDesire")
-    self.auto_exit_enabled = self.exit_enabled and self.params.get_bool("NavAutoExit")
+    # automatic exits come on only as the drive starts or while the car stands still, also when exit desires are switched
+    # on while driving with them already set; they go off at once
+    self.auto_exit_enabled = self.exit_enabled and self.params.get_bool("NavAutoExit") and (self.auto_exit_enabled or self.standstill)
 
   def update_params(self) -> None:
     if self.param_read_counter % 50 == 0:
@@ -975,6 +995,9 @@ class NavDesireController:
     if (self.exit_enabled and self.turning is None and nav.instruction is not None and self.tracker.maneuver is not None and lateral_active
         and self.tracker.maneuver[0] in SPLIT_TYPES and self.tracker.maneuver[1] in LEFT_DIRECTIONS + RIGHT_DIRECTIONS):
       self._update_keep(carstate, nav, v_ego, self.tracker.distance)
+    # Taking Exit, for as long as the model may still have the automatic keep's last pulse, up to the split
+    self.auto_exit = bool(self.exit_maneuver == self.maneuver_id and self.tracker.distance >= 0.
+                          and (self.frame - self.exit_edge_frame) * DT_MDL < EXIT_PULSE_MEMORY)
 
   def _time_to_steer(self, nav: NavInputs, distance: float, v_ego: float, to: float = NAV_TURN_STEER_DISTANCE) -> float:
     return time_to_steer(distance, v_ego, nav.long_active and self.slowing, to)
@@ -1245,8 +1268,9 @@ class NavDesireController:
 
   def _watch_exit_lanes(self, carstate, lateral_active: bool, nav: NavInputs, lane_changing: bool, v_ego: float) -> None:
     """Whether the car is confirmed in a highway's outermost lane on each side, for automatic exits: by EXIT_LANE_TIME and
-    EXIT_LANE_DISTANCE of exit_lanes with no lane change and no car in that blind spot, for as long as the edge was seen there
-    within EXIT_MEMORY and the car changed no lane, the steering stayed on and the driver did not steer away from that side."""
+    EXIT_LANE_DISTANCE of exit_lanes with no lane change and no car in that blind spot, for as long as the model keeps seeing
+    it there, but for EXIT_SEEN_TIME of misreading, the car changes no lane, the steering stays on and the driver does not
+    steer away from that side."""
     for side, left in enumerate((True, False)):
       blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
       seen = nav.exit_lanes[side] and not lane_changing and not blindspot
@@ -1254,9 +1278,9 @@ class NavDesireController:
       self.exit_lane_distance[side] = self.exit_lane_distance[side] + v_ego * DT_MDL if seen else 0.
       if self.exit_lane_time[side] >= EXIT_LANE_TIME - 1e-6 and self.exit_lane_distance[side] >= EXIT_LANE_DISTANCE - 1e-6:
         self.exit_confirmed[side] = True
-      self.exit_gone[side] = 0. if nav.exit_lanes[side] else self.exit_gone[side] + v_ego * DT_MDL
+      self.exit_unseen[side] = 0. if nav.exit_lanes[side] else self.exit_unseen[side] + DT_MDL
       away = carstate.steeringPressed and (carstate.steeringTorque < 0. if left else carstate.steeringTorque > 0.)  # positive is left
-      if lane_changing or not lateral_active or away or self.exit_gone[side] > EXIT_MEMORY:
+      if lane_changing or not lateral_active or away or self.exit_unseen[side] > EXIT_SEEN_TIME + 1e-6:
         self.exit_confirmed[side] = False
 
   def _update_keep(self, carstate, nav: NavInputs, v_ego: float, distance: float) -> None:
@@ -1286,22 +1310,31 @@ class NavDesireController:
     away = carstate.steeringPressed and (carstate.steeringTorque < 0 if left else carstate.steeringTorque > 0)
     if opposite_blinker or away:
       self.exit_off_maneuver = self.maneuver_id  # the driver goes another way: no automatic keep at this split
-    # Automatic exits: with no nudge, from the outermost lane on the near side only, which the route's lane guidance has
-    # take the split; with openpilot in control of the speed, no blinker on, driver monitoring quiet, and not called off
-    automatic = bool(self.auto_exit_enabled and left != nav.right_hand_traffic and nav.long_active and not nav.driver_alert
-                     and self.exit_confirmed[0 if left else 1] and far_turn_lane(lanes, left) and self.exit_off_maneuver != self.maneuver_id
-                     and not (carstate.leftBlinker or carstate.rightBlinker))
+    # Automatic exits: with no nudge, from the outermost lane on the near side only, while the model sees the car there,
+    # where the route's lane guidance has that lane take the split; with openpilot in control of the speed, no blinker on,
+    # driver monitoring quiet, no car in that blind spot, and not called off. It starts only EXIT_START_LEAD or more before
+    # the split, and anything holding it back once it started ends it for this split: no late pulse.
+    ready = bool(self.auto_exit_enabled and left != nav.right_hand_traffic and nav.long_active and not nav.driver_alert
+                 and self.exit_confirmed[0 if left else 1] and far_turn_lane(lanes, left) and self.exit_off_maneuver != self.maneuver_id
+                 and not (carstate.leftBlinker or carstate.rightBlinker) and not blindspot)
+    started = self.exit_maneuver == self.maneuver_id
+    if not started and ready and distance >= v_ego * EXIT_START_LEAD:
+      self.exit_maneuver, self.exit_frame, self.exit_edge_frame, self.exit_dropped = self.maneuver_id, self.frame, self.frame, False
+      started = True
+    elif started and not ready:
+      self.exit_off_maneuver = self.maneuver_id
+    automatic = started and ready
     if (nudge or automatic) and not opposite_blinker and not blindspot:
       self.keep_desire = log.Desire.keepLeft if left else log.Desire.keepRight
       if automatic and not nudge:
-        self.auto_exit = True
         self._repeat_exit(v_ego, distance)
 
   def _repeat_exit(self, v_ego: float, distance: float) -> None:
     """The automatic keep desire goes out again every EXIT_REFRESH_TIME after it began for this split, until
     EXIT_REFRESH_LEAD before the split: one frame without it makes the next a new pulse."""
-    if self.exit_maneuver != self.maneuver_id:
-      self.exit_maneuver, self.exit_frame = self.maneuver_id, self.frame
     elapsed = self.frame - self.exit_frame
     if elapsed > 0 and elapsed % round(EXIT_REFRESH_TIME / DT_MDL) == 0 and distance > v_ego * EXIT_REFRESH_LEAD:
       self.keep_desire = log.Desire.none
+      self.exit_dropped = True
+    elif self.exit_dropped:
+      self.exit_dropped, self.exit_edge_frame = False, self.frame

@@ -22,8 +22,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper, LaneChangeState
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeMode
-from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import EXIT_LANE_TIME, EXIT_MEMORY, EXIT_REFRESH_LEAD, EXIT_REFRESH_TIME, \
-  NAV_KEEP_DISTANCE_V, NAV_KEEP_SPEED_BP, exit_lanes
+from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import EXIT_LANE_TIME, EXIT_PULSE_MEMORY, EXIT_REFRESH_LEAD, \
+  EXIT_REFRESH_TIME, EXIT_SEEN_TIME, EXIT_START_LEAD, NAV_KEEP_DISTANCE_V, NAV_KEEP_SPEED_BP, exit_lanes
 from openpilot.sunnypilot.selfdrive.controls.lib.nav_desire import NAV_AGREE_DISTANCE, NAV_INSTRUCTION_GRACE, NAV_INSTRUCTION_MAX_AGE, \
   NAV_MAX_PULL_IN, NAV_NEAR_DISTANCE, NAV_PUSH_DEADBAND, NAV_RESEED_DISTANCE, NAV_TURN_CRAWL_SPEED, NAV_TURN_DECEL, NAV_TURN_HOLD, NAV_TURN_LINED_UP, \
   NAV_TURN_MARGIN, NAV_TURN_MAX_DECEL, NAV_TURN_NEAR_CRAWL_DISTANCE, NAV_TURN_REPULSE_TIME, NAV_TURN_SPEED, NAV_TURN_STEER_DISTANCE, \
@@ -1596,6 +1596,10 @@ def exit_controller():
   return c
 
 
+def window(v):
+  return float(np.interp(v, NAV_KEEP_SPEED_BP, NAV_KEEP_DISTANCE_V))
+
+
 def approach(c, start, v, seconds, inputs=exit_nav, carstate=None, lane_changing=None, **kwargs):
   """Drive toward the split from `start` meters at v. carstate(distance) gives the car's state, lane_changing(distance)
   whether a lane change is under way. Returns each frame's (keep desire, distance, Taking Exit)."""
@@ -1608,38 +1612,55 @@ def approach(c, start, v, seconds, inputs=exit_nav, carstate=None, lane_changing
   return frames
 
 
+def seen_until(until, since=math.inf):
+  """Route inputs with the car seen in the rightmost lane from `since` down to `until` meters before the split."""
+  return lambda distance: exit_nav(distance, exit_lanes=(False, until < distance <= since))
+
+
 def keep_pulses(frames, desire=log.Desire.keepRight):
   """The distances at which the keep desire rises: each a new command to the model."""
   return [f[1] for f, prev in zip(frames, [(log.Desire.none,), *frames[:-1]], strict=True) if f[0] == desire and prev[0] != desire]
 
 
+def exit_model(edge_y=(-9., 3.75), edge_stds=(0.2, 0.2), line_y=(-5.25, -1.75, 1.75, 5.25), line_probs=(0.9, 0.9, 0.9, 0.02)):
+  """A model message for the car in a highway's rightmost lane, 3.5 m wide, with a 2 m shoulder."""
+  return SimpleNamespace(roadEdgeStds=list(edge_stds), laneLineProbs=list(line_probs), roadEdges=[SimpleNamespace(y=[y]) for y in edge_y],
+                         laneLines=[SimpleNamespace(y=[y]) for y in line_y])
+
+
 class TestAutoExits(OpenpilotTestCase):
   def test_exit_lanes(self):
-    shoulder = model(edge_stds=(0.3, 0.3), line_probs=(0.9, 0.9, 0.9, 0.05), edge_y=(-9., 4.3))
-    assert exit_lanes(shoulder) == (False, True)
-    assert exit_lanes(model(edge_stds=(0.3, 0.3), line_probs=(0.05, 0.9, 0.9, 0.9), edge_y=(-4.3, 9.))) == (True, False)
-    for name, fields in [('the edge of the lane beside, no shoulder', {'edge_y': (-9., 5.3)}),
-                         ('a lane line beyond the car\'s own', {'line_probs': (0.9, 0.9, 0.9, 0.5)}),
-                         ('an unsure edge', {'edge_stds': (0.3, 0.6)}),
+    assert exit_lanes(exit_model()) == (False, True)
+    assert exit_lanes(exit_model(edge_y=(-3.75, 9.), line_probs=(0.02, 0.9, 0.9, 0.9))) == (True, False)
+    assert exit_lanes(exit_model(edge_y=(-9., 4.25)))[1]  # a 2.5 m shoulder
+    for name, fields in [('a shoulder over 2.5 m', {'edge_y': (-9., 4.35)}),
+                         # the lane beside the rightmost one, 3 m wide with no shoulder, its edge line missed: a whole lane
+                         # between the car's line and the edge
+                         ('the lane beside, on a narrow road', {'edge_y': (-9., 4.6), 'line_y': (-4.6, -1.6, 1.6, 4.6)}),
+                         ('a lane line beyond the car\'s own', {'line_probs': (0.9, 0.9, 0.9, 0.15)}),
+                         ('the car\'s own line unsure', {'line_probs': (0.9, 0.9, 0.3, 0.02)}),
+                         ('an unsure edge', {'edge_stds': (0.2, 0.35)}),
+                         ('the edge inside the car\'s line', {'edge_y': (-9., 1.5)}),
                          ('the edge under the car', {'edge_y': (-9., 0.5)}),
                          ('the edge on the other side', {'edge_y': (-9., -2.)}),
-                         ('no edge', {'edge_y': (-9., float('nan'))})]:
-      assert not exit_lanes(model(**({'edge_stds': (0.3, 0.3), 'line_probs': (0.9, 0.9, 0.9, 0.05), 'edge_y': (-9., 4.3)} | fields)))[1], name
-    assert exit_lanes(SimpleNamespace(roadEdgeStds=[], laneLineProbs=[], roadEdges=[])) == (False, False)
+                         ('no edge', {'edge_y': (-9., math.nan)}),
+                         ('no line', {'line_y': (-5.25, -1.75, math.nan, 5.25)})]:
+      assert not exit_lanes(exit_model(**fields))[1], name
+    assert exit_lanes(SimpleNamespace(roadEdgeStds=[], laneLineProbs=[], roadEdges=[], laneLines=[])) == (False, False)
+    assert exit_lanes(SimpleNamespace()) == (False, False)  # never raises
 
   def test_takes_the_exit_from_the_rightmost_lane(self):
     v = 25.
-    window = float(np.interp(v, NAV_KEEP_SPEED_BP, NAV_KEEP_DISTANCE_V))
     frames = approach(exit_controller(), 400., v, 17.)
     edges = keep_pulses(frames)
     # the first as the split comes within the keep distance, then again every EXIT_REFRESH_TIME, none in the last
     # EXIT_REFRESH_LEAD before it
-    assert abs(edges[0] - window) <= v * DT_MDL + 1e-6, edges
+    assert abs(edges[0] - window(v)) <= v * DT_MDL + 1e-6, edges
     assert len(edges) >= 2 and all(abs(a - b - v * EXIT_REFRESH_TIME) <= v * DT_MDL + 1e-6 for a, b in zip(edges, edges[1:], strict=False))
     assert all(distance > v * EXIT_REFRESH_LEAD for distance in edges[1:])
     # Taking Exit from the first to the split, and the desire never before the window or past the split
     assert all(f[2] for f in frames if 0. <= f[1] <= edges[0])
-    assert not any(f[0] != log.Desire.none or f[2] for f in frames if f[1] > window + v * DT_MDL or f[1] < 0.)
+    assert not any(f[0] != log.Desire.none or f[2] for f in frames if f[1] > window(v) + v * DT_MDL or f[1] < 0.)
 
   def test_off_without_the_setting(self):
     frames = approach(controller(), 400., 25., 17.)
@@ -1649,29 +1670,32 @@ class TestAutoExits(OpenpilotTestCase):
     c.update(car(vEgo=25., **nudge()), True, exit_nav(100.))
     assert c.keep_desire == log.Desire.keepRight and not c.auto_exit
 
-  def test_needs_the_rightmost_lane_for_2_s(self):
+  def test_needs_the_rightmost_lane_now(self):
     v = 25.
-    # never seen there, or only for the last 1.5 s before the keep distance and not after: no automatic keep
-    assert not keep_pulses(approach(exit_controller(), 400., v, 17., exit_lanes=(False, False)))
-    window = float(np.interp(v, NAV_KEEP_SPEED_BP, NAV_KEEP_DISTANCE_V))
-    def seen(distance):
-      return exit_nav(distance, exit_lanes=(False, window < distance <= window + 1.5 * v))
-    assert not keep_pulses(approach(exit_controller(), 400., v, 17., inputs=lambda d: seen(d)))
-    # seen for EXIT_LANE_TIME before it: it keeps right
-    def long_enough(distance):
-      return exit_nav(distance, exit_lanes=(False, window < distance <= window + (EXIT_LANE_TIME + .1) * v))
-    assert keep_pulses(approach(exit_controller(), 400., v, 17., inputs=lambda d: long_enough(d)))
+    assert not keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(math.inf)))  # never seen there
+    # seen there until just before the keep distance, longer ago than a misreading: no automatic keep; within one, it keeps
+    assert not keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(window(v) + (EXIT_SEEN_TIME + .1) * v)))
+    assert keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(window(v) + (EXIT_SEEN_TIME - .1) * v)))
+    # seen for EXIT_LANE_TIME, and still: it keeps right
+    assert keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(-1., window(v) + (EXIT_LANE_TIME + .1) * v)))
+    # seen for EXIT_LANE_TIME only once less than EXIT_START_LEAD is left: too late to start
+    late = (EXIT_START_LEAD - .2 + EXIT_LANE_TIME) * v
+    assert not keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(-1., late)))
 
-  def test_through_a_deceleration_lane(self):
+  def test_a_lane_beside_the_car_leaves_the_exit_to_the_nudge(self):
     v = 25.
-    # the lane opening beside the car 250 m before the split hides the edge from there: still the rightmost lane
-    def opened(distance):
-      return exit_nav(distance, exit_lanes=(False, distance > 250.))
-    assert keep_pulses(approach(exit_controller(), 600., v, 25., inputs=lambda d: opened(d)))
-    # a lane that joined the road and was beside the car for longer than EXIT_MEMORY: no longer the rightmost lane
-    def joined(distance):
-      return exit_nav(distance, exit_lanes=(False, distance > 140. + EXIT_MEMORY + 10.))
-    assert not keep_pulses(approach(exit_controller(), 800., v, 33., inputs=lambda d: joined(d)))
+    # a deceleration lane, or a lane that joined, open beside the car 250 or 150 m before the split: no automatic keep
+    for opened in (250., 150.):
+      frames = approach(exit_controller(), 600., v, 25., inputs=seen_until(opened))
+      assert not keep_pulses(frames) and not any(f[2] for f in frames), opened
+    # one opening 100 m before it, after the automatic keep began: no further pulse from there, and Taking Exit for as long
+    # as the model may still have the last one
+    frames = approach(exit_controller(), 400., v, 17., inputs=seen_until(100.))
+    edges = keep_pulses(frames)
+    assert edges and min(edges) > 100. - EXIT_LANE_TIME * v
+    assert all(f[0] == log.Desire.none for f in frames if f[1] <= 100. - v * DT_MDL * 11)  # past the half second's misreading
+    shown = [f[1] for f in frames if f[2]]
+    assert min(shown) >= max(min(edges) - v * EXIT_PULSE_MEMORY - v * DT_MDL, 0.)
 
   @parameterized.expand([
     # (name, car state, route inputs)
@@ -1690,6 +1714,22 @@ class TestAutoExits(OpenpilotTestCase):
     frames = approach(exit_controller(), 400., 25., 17., carstate=lambda d: car(vEgo=25., **car_fields), **inputs)
     assert all(f[0] == log.Desire.none and not f[2] for f in frames)
 
+  @parameterized.expand([
+    # (name, from, to: meters before the split the hold lasts, car state, route inputs)
+    ('the gas, lifted near the split', 100., 20., {}, {'long_active': False}),
+    ('a car in the right blind spot, gone near the split', 60., 12., {'rightBlindspot': True}, {}),
+    ('three flashes of the right blinker', 100., 25., {'rightBlinker': True}, {}),
+    ('driver monitoring warning', 90., 40., {}, {'driver_alert': True}),
+  ])
+  def test_no_pulse_after_a_hold(self, _name, start, end, car_fields, inputs):
+    v = 25.
+    def held(distance):
+      return end < distance <= start
+    frames = approach(exit_controller(), 400., v, 17., carstate=lambda d: car(vEgo=v, **(car_fields if held(d) else {})),
+                      inputs=lambda d: exit_nav(d, **(inputs if held(d) else {})))
+    edges = keep_pulses(frames)
+    assert edges and all(distance > start for distance in edges), edges
+
   def test_near_side_where_traffic_keeps_left(self):
     lanes = (lane('slightLeft', active_direction='slightLeft'), lane('straight'), lane('straight'))
     frames = approach(exit_controller(), 400., 25., 17., lanes=lanes, modifier='slight left', right_hand_traffic=False, exit_lanes=(True, False))
@@ -1700,7 +1740,7 @@ class TestAutoExits(OpenpilotTestCase):
     def carstate(distance):
       return car(vEgo=v, **(nudge(right=False) if 100. < distance <= 105. else {}))
     frames = approach(exit_controller(), 400., v, 17., carstate=carstate)
-    assert not any(f[0] != log.Desire.none or f[2] for f in frames if f[1] <= 100.)
+    assert not any(f[0] != log.Desire.none for f in frames if f[1] <= 100.)
     assert not keep_pulses(frames[:1] + [f for f in frames if f[1] <= 100.])
 
   def test_a_lane_change_forgets_the_lane(self):
@@ -1709,23 +1749,42 @@ class TestAutoExits(OpenpilotTestCase):
     frames = approach(exit_controller(), 400., v, 17., lane_changing=lambda d: 200. < d <= 202.)
     edges = keep_pulses(frames)
     assert edges and edges[0] <= 200. - EXIT_LANE_TIME * v + v * DT_MDL
-    # the next exit's run is no longer there either, without the edge seen again
+    # the next exit's run is no longer there either, without the lane seen again
     c = exit_controller()
     approach(c, 400., v, 4.)
     c.update(car(vEgo=v), True, exit_nav(300.), lane_changing=True)
     assert not keep_pulses(approach(c, 290., v, 12., exit_lanes=(False, False)))
+
+  def test_switched_on_only_at_a_standstill(self):
+    params = Params()
+    for key, value in [('NavExitDesire', False), ('NavAutoExit', True)]:
+      params.put_bool(key, value)
+    c = NavDesireController()
+    c.update(car(vEgo=25.), True, exit_nav(400.))  # driving
+    params.put_bool('NavExitDesire', True)
+    c.read_params()
+    assert c.exit_enabled and not c.auto_exit_enabled  # exit desires switched on while driving: automatic exits wait
+    c.update(car(vEgo=0., standstill=True), True, None)
+    c.read_params()
+    assert c.auto_exit_enabled
+    c.update(car(vEgo=25.), True, exit_nav(400.))
+    c.read_params()
+    assert c.auto_exit_enabled  # and stay on
+    params.put_bool('NavAutoExit', False)
+    c.read_params()
+    assert not c.auto_exit_enabled  # off at once
 
   def test_through_desire_helper(self):
     params = Params()
     for key, value in [('NavTurnDesire', False), ('NavExitDesire', True), ('NavAutoExit', True), ('NavAutoTurn', False)]:
       params.put_bool(key, value)
     dh = DesireHelper()
-    desires = [run_once(dh, car(vEgo=25.), exit_nav(100.)) for _ in range(round(3. / DT_MDL))]
+    desires = [run_once(dh, car(vEgo=25.), exit_nav(110.)) for _ in range(round(3. / DT_MDL))]
     assert log.Desire.keepRight in desires and dh.nav_desire.auto_exit
     # the setting needs exit desires
     params.put_bool('NavExitDesire', False)
     dh = DesireHelper()
-    assert all(run_once(dh, car(vEgo=25.), exit_nav(100.)) == log.Desire.none for _ in range(round(3. / DT_MDL)))
+    assert all(run_once(dh, car(vEgo=25.), exit_nav(110.)) == log.Desire.none for _ in range(round(3. / DT_MDL)))
 
   def test_wiring(self):
     def source(module: str) -> str:

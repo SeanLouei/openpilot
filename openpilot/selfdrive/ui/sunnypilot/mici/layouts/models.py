@@ -155,11 +155,14 @@ class ModelsLayoutMici(NavScroller):
     self.nav_auto_exit_toggle = BigParamControl(tr("auto exits (alpha)"), "NavAutoExit",
                                                 description=tr("Needs nav exit desires and openpilot longitudinal. Takes a route exit " +
                                                                "or fork on the right (left where traffic keeps left) by itself, with no " +
-                                                               "nudge, once the car has been in the rightmost lane for 2 seconds, and " +
-                                                               "shows Taking Exit. Getting into that lane is up to you: it never changes " +
-                                                               "lanes to reach the exit. Your blinker, steering left or a car in the right " +
-                                                               "blind spot holds it back. It doesn't slow for the ramp by itself: watch " +
-                                                               "the speed. Turn it on while parked."))
+                                                               "nudge, when the camera has seen the car in the outermost lane for 2 seconds " +
+                                                               "and 50 m and still does, and shows Taking Exit. It never changes lanes to " +
+                                                               "reach an exit, and where a lane opens beside you before the exit it waits " +
+                                                               "for your nudge. Either blinker, the gas, steering away from the exit, a car " +
+                                                               "in that blind spot or a driver monitoring warning stops it for that exit, " +
+                                                               "but once Taking Exit shows the car may still take the exit for a few " +
+                                                               "seconds: steer to stay on the road. It doesn't slow for the ramp: watch the " +
+                                                               "speed. Turn it on while parked."))
     self.phone_gps_toggle = BigParamControl(tr("phone GPS (alpha)"), "PhoneGps",
                                             description=tr("Navigation uses your iPhone's GPS in place of the comma's own, which " +
                                                            "hears little in some cars, and the comma's whenever the phone's stops. " +

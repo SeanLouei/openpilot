@@ -82,13 +82,14 @@ by default; with them off, the car drives like plain sunnypilot.
 - **Exits and forks (alpha):** near a route exit or fork that has lane guidance, a light steering nudge toward it gives a
   "keep left/right" desire. Above 20 mph with your blinker on, a nudge changes lanes instead, the same as without navigation.
 - **Automatic exits (alpha):** a further switch, off unless you turn it on, needing exit desires and openpilot longitudinal.
-  For an exit or fork on the right (left where traffic keeps left), the car keeps right by itself, with no nudge, once the
-  model has seen it in the rightmost lane for 2 seconds and 50 m, and **Taking Exit** shows and chimes. Only where the
-  route's lane guidance has the rightmost lane take the exit. It never changes lanes to reach an exit: getting into the
-  rightmost lane is up to you. Either blinker, a car in the right blind spot, the gas or a driver monitoring warning holds
-  it back; signaling left or steering left calls it off for that exit. It does not slow for the ramp by itself, so watch the
-  speed. On a highway with a shoulder wider than about 3 m the car may not be seen as in the rightmost lane, and the exit
-  then waits for your nudge.
+  For an exit or fork on the right (left where traffic keeps left), the car keeps right by itself, with no nudge, when the
+  camera has seen it in the outermost lane for 2 seconds and 50 m and still does, at least 3 seconds before the exit, and
+  **Taking Exit** shows and chimes. Only where the route's lane guidance has that lane take the exit. It never changes lanes
+  to reach an exit: getting into the outermost lane is up to you, and where a lane opens beside the car before the exit,
+  or the shoulder is wider than about 2.5 m, it waits for your nudge. Either blinker, the gas, steering away from the exit,
+  a car in that blind spot or a driver monitoring warning stops it for that exit; the driving model still keeps the last
+  command for about 5 seconds, so once Taking Exit shows, steer to stay on the road. It does not slow for the ramp, so
+  watch the speed. Switched on while driving, it waits until the car next stands still.
 
 **Calling a turn off:** do it before **Turning…** shows. How depends on the kind of turn:
 - **An automatic turn** (no blinker): press the gas, switch on the other blinker, or disengage. The turn and its slowdown
