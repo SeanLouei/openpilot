@@ -900,7 +900,8 @@ class TestSettings(OpenpilotTestCase):
     for words in ('iPhone app', 'GPS2IP', 'socket mode on port 11123', 'background', "the comma on the iPhone's hotspot"):
       assert words in text, words
     names = [ast.unparse(element) for element in assigned(tree, 'self.main_items').elts]
-    assert names[names.index('self.nav_exit_toggle') + 1] == 'self.phone_gps_toggle'
+    exit_at = names.index('self.nav_exit_toggle')  # then automatic exits, which need it, then phone GPS
+    assert names[exit_at + 1:exit_at + 3] == ['self.nav_auto_exit_toggle', 'self.phone_gps_toggle']
     # shown as off and greyed without navigation, with the reason; the param written only by the driver's tap
     update = ast.unparse(method(tree, 'ModelsLayoutMici', '_update_state'))
     assert "self.phone_gps_toggle.set_checked(navigation and ui_state.params.get_bool('PhoneGps'))" in update
@@ -916,7 +917,8 @@ class TestSettings(OpenpilotTestCase):
       schema = json.load(f)
     section = next(section for panel in schema['panels'] if panel['id'] == 'steering' for section in panel['sections'] if section['id'] == 'navigation')
     keys = [item['key'] for item in section['items']]
-    assert keys[keys.index('NavExitDesire') + 1] == 'PhoneGps'
+    exit_at = keys.index('NavExitDesire')  # then automatic exits, which need it, then phone GPS
+    assert keys[exit_at + 1:exit_at + 3] == ['NavAutoExit', 'PhoneGps']
     item = section['items'][keys.index('PhoneGps')]
     assert item['widget'] == 'toggle' and item['title'] == 'Phone GPS (Alpha)'
     assert item['enablement'] == [{'type': 'param', 'key': 'NavigationEnabled', 'equals': True}]

@@ -365,6 +365,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     navTurnAcross @27;
     navTurnSignal @28;
     navTurnLane @29;
+    navExit @30;
   }
 }
 
@@ -483,6 +484,7 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   navTurnSpeed @10 :Float32;  # m/s the route's turn limits the speed to, 0 without one
   navTurnAcross @11 :NavTurnAcross;  # an automatic route turn across oncoming traffic, or its prompt to signal
   navTurnLane @12 :Bool;  # the route's own lane change into a turn lane is under way
+  navExit @13 :Bool;  # the route's own keep desire toward an exit or fork is on, with no nudge
 
   enum TurnDirection {
     none @0;

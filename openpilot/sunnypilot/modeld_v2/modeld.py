@@ -514,6 +514,7 @@ def main(demo=False):
       mdv2sp_send.modelDataV2SP.navTurnSpeed = DH.nav_desire.speed_limit
       mdv2sp_send.modelDataV2SP.navTurnAcross = 'turning' if DH.nav_desire.turn_across else 'signal' if DH.nav_desire.signal_prompt else 'none'
       mdv2sp_send.modelDataV2SP.navTurnLane = DH.turn_lane_change is not None
+      mdv2sp_send.modelDataV2SP.navExit = DH.nav_desire.auto_exit
       mdv2sp_send.modelDataV2SP.blendfulCurvature = blendful.curvature
       mdv2sp_send.modelDataV2SP.blendfulTrust = float(blendful.trust)
       mdv2sp_send.modelDataV2SP.modelCurvature = float(blendful.model_curvature)

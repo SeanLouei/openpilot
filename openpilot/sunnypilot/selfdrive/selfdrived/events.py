@@ -242,6 +242,14 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # for a few seconds after, while that warning may still show. Low priority, as the other route alerts: driver
   # monitoring's later warnings show over it, and its first one, of the same priority, shows over it when it comes during
   # the move, as the newer alert, but makes no sound then: soundd is already on that sound.
+  EventNameSP.navExit: {
+    ET.WARNING: Alert(
+      "Taking Exit",
+      "Steer to stay on this road",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, log.SelfdriveState.AudibleAlert.preAlert, .1),
+  },
+
   EventNameSP.navTurnLane: {
     ET.WARNING: Alert(
       "Moving to Turn Lane",

@@ -385,6 +385,9 @@ class SelfdriveD:
       self.events_sp.add(custom.OnroadEventSP.EventName.laneTurnRight)
     if nav_turn_across == NavTurnAcross.signal:
       self.events_sp.add(custom.OnroadEventSP.EventName.navTurnSignal)
+    # the route's own keep toward an exit or fork, which no blinker announces
+    if self.sm['modelDataV2SP'].navExit:
+      self.events_sp.add(custom.OnroadEventSP.EventName.navExit)
     # both show over Slowing for Route Turn, of the same priority, also over one plannerd raises after them, pulling away
     # from a stop: the newer alert would show, and that one only says the car slows. So does Moving to Turn Lane, which
     # the slowdown may start during: plannerd holds its alert back until the move is over, so this drops only one it

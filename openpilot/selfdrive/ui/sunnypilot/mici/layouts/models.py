@@ -152,6 +152,14 @@ class ModelsLayoutMici(NavScroller):
                                            description=tr("Near a route exit or fork with lane guidance, a light steering nudge toward it has the car " +
                                                           "keep to that side of the split. Above 20 mph with your blinker on, a nudge " +
                                                           "changes lanes instead."))
+    self.nav_auto_exit_toggle = BigParamControl(tr("auto exits (alpha)"), "NavAutoExit",
+                                                description=tr("Needs nav exit desires and openpilot longitudinal. Takes a route exit " +
+                                                               "or fork on the right (left where traffic keeps left) by itself, with no " +
+                                                               "nudge, once the car has been in the rightmost lane for 2 seconds, and " +
+                                                               "shows Taking Exit. Getting into that lane is up to you: it never changes " +
+                                                               "lanes to reach the exit. Your blinker, steering left or a car in the right " +
+                                                               "blind spot holds it back. It doesn't slow for the ramp by itself: watch " +
+                                                               "the speed. Turn it on while parked."))
     self.phone_gps_toggle = BigParamControl(tr("phone GPS (alpha)"), "PhoneGps",
                                             description=tr("Navigation uses your iPhone's GPS in place of the comma's own, which " +
                                                            "hears little in some cars, and the comma's whenever the phone's stops. " +
@@ -163,7 +171,7 @@ class ModelsLayoutMici(NavScroller):
     self.main_items = [self.current_model_info, self.select_model_btn, self.cancel_download_btn, self.refresh_btn, self.clear_cache_btn,
                        self.blendful_toggle, self.nav_turn_toggle, self.nav_auto_turn_toggle, self.nav_far_turn_toggle, self.nav_turn_lane_toggle,
                        self.nav_far_open_toggle,
-                       self.nav_exit_toggle, self.phone_gps_toggle]
+                       self.nav_exit_toggle, self.nav_auto_exit_toggle, self.phone_gps_toggle]
     self._scroller.add_widgets(self.main_items)
 
   @property
@@ -282,6 +290,7 @@ class ModelsLayoutMici(NavScroller):
     self.nav_far_open_toggle.refresh()
     self.nav_turn_lane_toggle.refresh()
     self.nav_exit_toggle.refresh()
+    self.nav_auto_exit_toggle.refresh()
     self.phone_gps_toggle.refresh()
 
   def _update_state(self):
@@ -324,6 +333,14 @@ class ModelsLayoutMici(NavScroller):
     self.nav_turn_lane_toggle.set_enabled(navigation and auto_turns and (ui_state.is_offroad() or lane_checked))
     if self.nav_turn_lane_toggle.value != far_value:
       self.nav_turn_lane_toggle.set_value(far_value)
+    # automatic exits work only with navigation and exit desires on, and show as off without them, whatever the param says
+    exits = navigation and ui_state.params.get_bool("NavExitDesire")
+    exit_checked = exits and ui_state.params.get_bool("NavAutoExit")
+    self.nav_auto_exit_toggle.set_checked(exit_checked)
+    self.nav_auto_exit_toggle.set_enabled(exits and (ui_state.is_offroad() or exit_checked))
+    exit_value = "" if exits else tr("needs navigation") if not navigation else tr("needs nav exit desires")
+    if self.nav_auto_exit_toggle.value != exit_value:
+      self.nav_auto_exit_toggle.set_value(exit_value)
     # phone GPS works only with navigation on, and shows as off without it, whatever the param says
     self.phone_gps_toggle.set_checked(navigation and ui_state.params.get_bool("PhoneGps"))
     self.phone_gps_toggle.set_enabled(navigation)
