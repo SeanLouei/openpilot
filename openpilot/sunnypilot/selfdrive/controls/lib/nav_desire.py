@@ -753,6 +753,9 @@ class NavDesireController:
     self.turn_direction = TurnDirection.none
     self.route_turn_signal = False
     self.keep_desire = log.Desire.none
+    # a started automatic keep is over for its split, as after an error: it never pulses again afterwards
+    if self.exit_maneuver == self.maneuver_id:
+      self.exit_off_maneuver = self.maneuver_id
     self.auto_exit = False  # the route's own keep desire toward an exit or fork is on, with no nudge: Taking Exit
     self.speed_limit = 0.  # m/s the route turn limits the speed to, 0 for none
     self.slowing = False  # the current maneuver's slowdown is on

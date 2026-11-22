@@ -1790,6 +1790,15 @@ class TestAutoExits(OpenpilotTestCase):
     edges = keep_pulses(frames)
     assert edges and all(distance > 60. for distance in edges), edges
 
+  def test_a_reset_ends_it(self):
+    # as after an error DesireHelper caught: the keep started for this split never pulses again
+    v = 25.
+    c = exit_controller()
+    first = approach(c, 400., v, (400. - 100.) / v)
+    assert keep_pulses(first)
+    c.reset()
+    assert not keep_pulses([(log.Desire.none, 101., False), *approach(c, 100., v, 4.)])
+
   def test_near_side_where_traffic_keeps_left(self):
     lanes = (lane('slightLeft', active_direction='slightLeft'), lane('straight'), lane('straight'))
     frames = approach(exit_controller(), 400., 25., 17., lanes=lanes, modifier='slight left', right_hand_traffic=False, exit_lanes=(True, False))
