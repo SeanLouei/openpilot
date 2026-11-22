@@ -158,8 +158,9 @@ class ModelsLayoutMici(NavScroller):
                                                                "nudge, when the camera has seen the car in the outermost lane for 2 seconds " +
                                                                "and 50 m and still does, and shows Taking Exit. It never changes lanes to " +
                                                                "reach an exit, and where a lane opens beside you before the exit it waits " +
-                                                               "for your nudge. Either blinker, the gas, steering away from the exit, a car " +
-                                                               "in that blind spot or a driver monitoring warning stops it for that exit, " +
+                                                               "for your nudge. Near the exit, either blinker, the gas, steering away from " +
+                                                               "it, a car in that blind spot or a driver monitoring warning stops it for " +
+                                                               "that exit, " +
                                                                "but once Taking Exit shows the car may still take the exit for a few " +
                                                                "seconds: steer to stay on the road. It doesn't slow for the ramp: watch the " +
                                                                "speed. Turn it on while parked."))

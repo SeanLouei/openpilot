@@ -1600,13 +1600,15 @@ def window(v):
   return float(np.interp(v, NAV_KEEP_SPEED_BP, NAV_KEEP_DISTANCE_V))
 
 
-def approach(c, start, v, seconds, inputs=exit_nav, carstate=None, lane_changing=None, **kwargs):
+def approach(c, start, v, seconds, inputs=exit_nav, carstate=None, lane_changing=None, lateral=None, **kwargs):
   """Drive toward the split from `start` meters at v. carstate(distance) gives the car's state, lane_changing(distance)
-  whether a lane change is under way. Returns each frame's (keep desire, distance, Taking Exit)."""
+  whether a lane change is under way, lateral(distance) whether the steering is on. Returns each frame's (keep desire,
+  distance, Taking Exit)."""
   frames, distance = [], start
   for _ in range(round(seconds / DT_MDL)):
     carstate_now = carstate(distance) if carstate is not None else car(vEgo=v)
-    c.update(carstate_now, True, inputs(distance, **kwargs), lane_changing=lane_changing(distance) if lane_changing else False)
+    c.update(carstate_now, lateral(distance) if lateral else True, inputs(distance, **kwargs),
+             lane_changing=lane_changing(distance) if lane_changing else False)
     frames.append((c.keep_desire, distance, c.auto_exit))
     distance -= v * DT_MDL
   return frames
@@ -1673,9 +1675,9 @@ class TestAutoExits(OpenpilotTestCase):
   def test_needs_the_rightmost_lane_now(self):
     v = 25.
     assert not keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(math.inf)))  # never seen there
-    # seen there until just before the keep distance, longer ago than a misreading: no automatic keep; within one, it keeps
-    assert not keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(window(v) + (EXIT_SEEN_TIME + .1) * v)))
-    assert keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(window(v) + (EXIT_SEEN_TIME - .1) * v)))
+    # seen there until just before the keep distance, even within a misreading: no frame reads it there, so no pulse
+    for before in (EXIT_SEEN_TIME + .1, EXIT_SEEN_TIME - .1):
+      assert not keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(window(v) + before * v))), before
     # seen for EXIT_LANE_TIME, and still: it keeps right
     assert keep_pulses(approach(exit_controller(), 400., v, 17., inputs=seen_until(-1., window(v) + (EXIT_LANE_TIME + .1) * v)))
     # seen for EXIT_LANE_TIME only once less than EXIT_START_LEAD is left: too late to start
@@ -1729,6 +1731,64 @@ class TestAutoExits(OpenpilotTestCase):
                       inputs=lambda d: exit_nav(d, **(inputs if held(d) else {})))
     edges = keep_pulses(frames)
     assert edges and all(distance > start for distance in edges), edges
+
+  def test_holds_near_the_split_call_it_off_before_it_starts(self):
+    v = 25.
+    for name, car_fields, inputs in [('the gas', {}, {'long_active': False}), ('the right blinker', {'rightBlinker': True}, {}),
+                                     ('a car in the right blind spot', {'rightBlindspot': True}, {})]:
+      # from before the keep distance into it: no automatic keep at this split, also once it ends
+      def inside(distance):
+        return 110. < distance <= 200.
+      frames = approach(exit_controller(), 400., v, 17., carstate=lambda d, f=car_fields, h=inside: car(vEgo=v, **(f if h(d) else {})),
+                        inputs=lambda d, i=inputs, h=inside: exit_nav(d, **(i if h(d) else {})))
+      assert not keep_pulses(frames), name
+      # wholly before the keep distance: no matter
+      def before(distance):
+        return 200. < distance <= 300.
+      frames = approach(exit_controller(), 400., v, 17., carstate=lambda d, f=car_fields, h=before: car(vEgo=v, **(f if h(d) else {})),
+                        inputs=lambda d, i=inputs, h=before: exit_nav(d, **(i if h(d) else {})))
+      assert keep_pulses(frames) and abs(keep_pulses(frames)[0] - window(v)) <= v * DT_MDL + 1e-6, name
+
+  def test_pulses_only_on_frames_reading_the_lane(self):
+    v = 25.
+    def flicker(true_one_in, false_one_in):
+      """Readings below 200 m: the outermost lane on one frame in `true_one_in`, or all but one in `false_one_in`."""
+      count = {'n': 0}
+      def inputs(distance):
+        count['n'] += 1
+        reading = distance > 200. or (count['n'] % true_one_in == 0 if true_one_in else count['n'] % false_one_in != 0)
+        return exit_nav(distance, exit_lanes=(False, reading))
+      return inputs
+    # the model mostly no longer reads the car there: no pulse, whatever single frames say
+    assert not keep_pulses(approach(exit_controller(), 400., v, 17., inputs=flicker(8, None)))
+    # a misreading now and then: it still keeps right, each pulse on a frame reading the lane
+    record = []
+    reads = flicker(None, 8)
+    def recorded(distance):
+      nav = reads(distance)
+      record.append((distance, nav.exit_lanes[1]))
+      return nav
+    edges = keep_pulses(approach(exit_controller(), 400., v, 17., inputs=recorded))
+    readings = dict(record)
+    assert edges and all(readings[distance] for distance in edges)
+
+  def test_a_refresh_waits_for_a_frame_reading_the_lane(self):
+    v = 25.
+    # the planned pulse after the drop at 86.25 m would come at 85.0 m, where the model misreads for two frames
+    frames = approach(exit_controller(), 400., v, 17., inputs=lambda d: exit_nav(d, exit_lanes=(False, not 83. < d <= 85.5)))
+    assert keep_pulses(frames) == [136.25, 82.5]
+
+  @parameterized.expand([
+    # (name, route inputs, steering on) near the split, after the automatic keep started
+    ('a frame without the route', lambda d: None if 30.5 < d <= 31.5 else exit_nav(d), None),
+    ('the steering off a while', exit_nav, lambda d: not 35. < d <= 60.),
+    ('lane guidance without an active lane a while', lambda d: exit_nav(d, lanes=(lane('straight'), lane('straight'), lane('slightRight')))
+     if 33. < d <= 60. else exit_nav(d), None),
+  ])
+  def test_a_dropout_ends_it(self, _name, inputs, lateral):
+    frames = approach(exit_controller(), 400., 25., 17., inputs=inputs, lateral=lateral)
+    edges = keep_pulses(frames)
+    assert edges and all(distance > 60. for distance in edges), edges
 
   def test_near_side_where_traffic_keeps_left(self):
     lanes = (lane('slightLeft', active_direction='slightLeft'), lane('straight'), lane('straight'))

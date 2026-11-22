@@ -226,11 +226,19 @@ EXIT_BEYOND_PROB = 0.1  # a lane line beyond it: surely not
 EXIT_LANE_TIME = 2.0  # s
 EXIT_LANE_DISTANCE = 50.  # m
 EXIT_SEEN_TIME = 0.5  # s
+# Misreadings count as a leaky bucket: each frame without that reading adds one, each with it drains EXIT_MISREAD_DRAIN. The
+# automatic keep starts only with at most EXIT_START_MISREADS in it, and ends for the split above EXIT_END_MISREADS: a model
+# that mostly no longer reads the car in the outermost lane, whatever single frames say, ends it. Every pulse goes out on a
+# frame with that reading.
+EXIT_MISREAD_DRAIN = 0.25
+EXIT_MISREAD_CAP = 8.
+EXIT_START_MISREADS = 1.
+EXIT_END_MISREADS = 4.
 # The model takes a desire as a pulse and keeps it for about EXIT_PULSE_MEMORY. The automatic keep's first pulse goes out
 # EXIT_START_LEAD or more before the split, never later, and again every EXIT_REFRESH_TIME while all holds, until
-# EXIT_REFRESH_LEAD before the split: one after it could carry on to the next split. Once anything holds it back, or the
-# car is no longer seen in the outermost lane, no further pulse goes out for that split, while Taking Exit stays for as
-# long as the model may still have the last one.
+# EXIT_REFRESH_LEAD before the split: one after it could carry on to the next split. Anything holding it back near the split,
+# the car no longer seen in the outermost lane, or a frame that does not carry it on (the route or the steering dropping
+# out) ends it for that split: no further pulse, while Taking Exit stays for as long as the model may still have the last.
 EXIT_START_LEAD = 3.0  # s
 EXIT_REFRESH_TIME = 2.0  # s
 EXIT_REFRESH_LEAD = 1.5  # s
@@ -711,6 +719,8 @@ class NavDesireController:
     self.exit_lane_distance = [0., 0.]
     self.exit_confirmed = [False, False]
     self.exit_unseen = [0., 0.]
+    self.exit_misread = [0., 0.]  # the misreadings' leaky bucket on its (left, right)
+    self.exit_carried = False  # this frame carried the started automatic keep on: sent it, or held its pulse back as planned
     # the maneuver whose automatic keep began at exit_frame; the frame of its last pulse; whether the frame before dropped it
     self.exit_maneuver: int | None = None
     self.exit_frame = 0
@@ -827,6 +837,7 @@ class NavDesireController:
     self.turn_direction = TurnDirection.none
     self.keep_desire = log.Desire.none
     self.auto_exit = False
+    self.exit_carried = False
     self.turn_lane = None
     side = blinker_side(carstate)
     if side != self.blinker:
@@ -995,6 +1006,10 @@ class NavDesireController:
     if (self.exit_enabled and self.turning is None and nav.instruction is not None and self.tracker.maneuver is not None and lateral_active
         and self.tracker.maneuver[0] in SPLIT_TYPES and self.tracker.maneuver[1] in LEFT_DIRECTIONS + RIGHT_DIRECTIONS):
       self._update_keep(carstate, nav, v_ego, self.tracker.distance)
+    # a started automatic keep that this frame did not carry on, as when the route, the lane guidance or the steering dropped
+    # out, is over for this split: it never pulses again afterwards
+    if self.exit_maneuver == self.maneuver_id and not self.exit_carried:
+      self.exit_off_maneuver = self.maneuver_id
     # Taking Exit, for as long as the model may still have the automatic keep's last pulse, up to the split
     self.auto_exit = bool(self.exit_maneuver == self.maneuver_id and self.tracker.distance >= 0.
                           and (self.frame - self.exit_edge_frame) * DT_MDL < EXIT_PULSE_MEMORY)
@@ -1273,7 +1288,9 @@ class NavDesireController:
     steer away from that side."""
     for side, left in enumerate((True, False)):
       blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
-      seen = nav.exit_lanes[side] and not lane_changing and not blindspot
+      seen = nav.exit_lanes[side] and not lane_changing and not blindspot and lateral_active
+      reading = nav.exit_lanes[side]
+      self.exit_misread[side] = max(self.exit_misread[side] - EXIT_MISREAD_DRAIN, 0.) if reading else min(self.exit_misread[side] + 1., EXIT_MISREAD_CAP)
       self.exit_lane_time[side] = self.exit_lane_time[side] + DT_MDL if seen else 0.
       self.exit_lane_distance[side] = self.exit_lane_distance[side] + v_ego * DT_MDL if seen else 0.
       if self.exit_lane_time[side] >= EXIT_LANE_TIME - 1e-6 and self.exit_lane_distance[side] >= EXIT_LANE_DISTANCE - 1e-6:
@@ -1308,33 +1325,42 @@ class NavDesireController:
     blindspot = carstate.leftBlindspot if left else carstate.rightBlindspot
     nudge = carstate.steeringPressed and (carstate.steeringTorque > 0 if left else carstate.steeringTorque < 0)
     away = carstate.steeringPressed and (carstate.steeringTorque < 0 if left else carstate.steeringTorque > 0)
-    if opposite_blinker or away:
-      self.exit_off_maneuver = self.maneuver_id  # the driver goes another way: no automatic keep at this split
     # Automatic exits: with no nudge, from the outermost lane on the near side only, while the model sees the car there,
-    # where the route's lane guidance has that lane take the split; with openpilot in control of the speed, no blinker on,
-    # driver monitoring quiet, no car in that blind spot, and not called off. It starts only EXIT_START_LEAD or more before
-    # the split, and anything holding it back once it started ends it for this split: no late pulse.
-    ready = bool(self.auto_exit_enabled and left != nav.right_hand_traffic and nav.long_active and not nav.driver_alert
-                 and self.exit_confirmed[0 if left else 1] and far_turn_lane(lanes, left) and self.exit_off_maneuver != self.maneuver_id
-                 and not (carstate.leftBlinker or carstate.rightBlinker) and not blindspot)
+    # where the route's lane guidance has that lane take the split. Near the split (within the keep distance), either
+    # blinker, the gas or the car's own cruise control, driver monitoring warning, a car in that blind spot or the driver
+    # steering away from that side calls it off for this split, started or not. It starts only EXIT_START_LEAD or more before
+    # the split, on a frame reading the car in the outermost lane with few misreadings lately, and ends for this split once
+    # the misreadings pile up: no late pulse.
+    side = 0 if left else 1
+    reading = nav.exit_lanes[side]
+    if (opposite_blinker or away or carstate.leftBlinker or carstate.rightBlinker or not nav.long_active or nav.driver_alert or blindspot):
+      self.exit_off_maneuver = self.maneuver_id
+    ready = bool(self.auto_exit_enabled and left != nav.right_hand_traffic and self.exit_confirmed[side] and far_turn_lane(lanes, left)
+                 and self.exit_off_maneuver != self.maneuver_id)
     started = self.exit_maneuver == self.maneuver_id
-    if not started and ready and distance >= v_ego * EXIT_START_LEAD:
+    if (not started and ready and reading and self.exit_misread[side] <= EXIT_START_MISREADS + 1e-6
+        and distance >= v_ego * EXIT_START_LEAD):
       self.exit_maneuver, self.exit_frame, self.exit_edge_frame, self.exit_dropped = self.maneuver_id, self.frame, self.frame, False
       started = True
-    elif started and not ready:
+    elif started and (not ready or self.exit_misread[side] > EXIT_END_MISREADS + 1e-6):
       self.exit_off_maneuver = self.maneuver_id
-    automatic = started and ready
+    automatic = started and self.exit_off_maneuver != self.maneuver_id
     if (nudge or automatic) and not opposite_blinker and not blindspot:
       self.keep_desire = log.Desire.keepLeft if left else log.Desire.keepRight
+      self.exit_carried = automatic
       if automatic and not nudge:
-        self._repeat_exit(v_ego, distance)
+        self._repeat_exit(v_ego, distance, reading)
 
-  def _repeat_exit(self, v_ego: float, distance: float) -> None:
+  def _repeat_exit(self, v_ego: float, distance: float, reading: bool) -> None:
     """The automatic keep desire goes out again every EXIT_REFRESH_TIME after it began for this split, until
-    EXIT_REFRESH_LEAD before the split: one frame without it makes the next a new pulse."""
+    EXIT_REFRESH_LEAD before the split: one frame without it makes the next a new pulse, which waits for a frame reading
+    the car in the outermost lane, and never comes later than EXIT_REFRESH_LEAD before the split."""
     elapsed = self.frame - self.exit_frame
     if elapsed > 0 and elapsed % round(EXIT_REFRESH_TIME / DT_MDL) == 0 and distance > v_ego * EXIT_REFRESH_LEAD:
       self.keep_desire = log.Desire.none
       self.exit_dropped = True
     elif self.exit_dropped:
-      self.exit_dropped, self.exit_edge_frame = False, self.frame
+      if reading and distance > v_ego * EXIT_REFRESH_LEAD:
+        self.exit_dropped, self.exit_edge_frame = False, self.frame
+      else:
+        self.keep_desire = log.Desire.none

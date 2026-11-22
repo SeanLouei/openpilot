@@ -86,8 +86,8 @@ by default; with them off, the car drives like plain sunnypilot.
   camera has seen it in the outermost lane for 2 seconds and 50 m and still does, at least 3 seconds before the exit, and
   **Taking Exit** shows and chimes. Only where the route's lane guidance has that lane take the exit. It never changes lanes
   to reach an exit: getting into the outermost lane is up to you, and where a lane opens beside the car before the exit,
-  or the shoulder is wider than about 2.5 m, it waits for your nudge. Either blinker, the gas, steering away from the exit,
-  a car in that blind spot or a driver monitoring warning stops it for that exit; the driving model still keeps the last
+  or the shoulder is wider than about 2.5 m, it waits for your nudge. Near the exit, either blinker, the gas, steering away
+  from it, a car in that blind spot or a driver monitoring warning stops it for that exit; the driving model still keeps the last
   command for about 5 seconds, so once Taking Exit shows, steer to stay on the road. It does not slow for the ramp, so
   watch the speed. Switched on while driving, it waits until the car next stands still.
 
